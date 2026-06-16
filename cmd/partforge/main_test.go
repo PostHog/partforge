@@ -112,7 +112,7 @@ func TestApplyConfigDefaults(t *testing.T) {
 	fs := flag.NewFlagSet("upload-freeze", flag.ContinueOnError)
 	bucket := fs.String("bucket", "", "")
 	prefix := fs.String("prefix", "partforge", "")
-	region := fs.String("aws-region", "us-east-1", "")
+	region := fs.String("aws-region", "", "")
 	if err := fs.Parse(nil); err != nil {
 		t.Fatal(err)
 	}

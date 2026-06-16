@@ -41,7 +41,6 @@ Top-level config keys apply to every command. Command-specific keys under `comma
 
 ```json
 {
-  "aws_region": "us-east-1",
   "s3_endpoint": "http://localhost:4566",
   "dynamodb_endpoint": "http://localhost:4566",
   "state_table": "partforge",
@@ -61,6 +60,8 @@ Top-level config keys apply to every command. Command-specific keys under `comma
 ```
 
 Config keys may use either flag-style names such as `aws-region` or JSON-style names such as `aws_region`.
+
+The DynamoDB region is resolved in order: `-aws-region`, JSON config, AWS environment/shared config, EC2 IMDS, then `us-east-1`.
 
 ClickHouse connection settings are resolved in order: CLI flags, JSON config, `/etc/clickhouse-client/config.xml`, then built-in defaults.
 

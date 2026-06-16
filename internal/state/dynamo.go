@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -25,6 +26,7 @@ const (
 
 	readyIndexName = "gsi1"
 	timeFormat     = "2006-01-02T15:04:05.000000000Z"
+	defaultRegion  = "us-east-1"
 )
 
 type Status string
@@ -98,10 +100,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	if strings.TrimSpace(cfg.Table) == "" {
 		return nil, errors.New("state table is required")
 	}
-	awsCfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(cfg.Region),
-		config.WithRetryMaxAttempts(1),
-	)
+	awsCfg, err := loadAWSConfig(ctx, cfg.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +110,45 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		}
 	})
 	return &Store{client: client, table: cfg.Table}, nil
+}
+
+func loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	loadOptions := []func(*config.LoadOptions) error{
+		config.WithRetryMaxAttempts(1),
+	}
+	if strings.TrimSpace(region) != "" {
+		loadOptions = append(loadOptions, config.WithRegion(strings.TrimSpace(region)))
+	}
+	awsCfg, err := config.LoadDefaultConfig(ctx, loadOptions...)
+	if err != nil {
+		return aws.Config{}, err
+	}
+	if strings.TrimSpace(region) == "" && awsCfg.Region == "" {
+		awsCfg.Region = resolveDynamoRegion(ctx, awsCfg, defaultRegion, imdsRegion)
+	}
+	return awsCfg, nil
+}
+
+func resolveDynamoRegion(ctx context.Context, awsCfg aws.Config, fallback string, getRegion func(context.Context, aws.Config) (string, error)) string {
+	if strings.TrimSpace(awsCfg.Region) != "" {
+		return strings.TrimSpace(awsCfg.Region)
+	}
+	region, err := getRegion(ctx, awsCfg)
+	if err != nil || strings.TrimSpace(region) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(region)
+}
+
+func imdsRegion(ctx context.Context, awsCfg aws.Config) (string, error) {
+	imdsCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	out, err := imds.NewFromConfig(awsCfg).GetRegion(imdsCtx, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.Region, nil
 }
 
 func NewPart(jobID, partID, bucket, sourceKey, finishedKey string, now time.Time) Part {
