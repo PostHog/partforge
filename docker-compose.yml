@@ -7,7 +7,7 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
-      SERVICES: s3,sqs
+      SERVICES: s3,dynamodb
     ports:
       - "4566:4566"
     volumes:
@@ -33,6 +33,5 @@ services:
       AWS_DEFAULT_REGION: us-east-1
     command:
       - worker
-      - -queue-url=http://localstack:4566/000000000000/partforge
       - -s3-endpoint=http://localstack:4566
-      - -sqs-endpoint=http://localstack:4566
+      - -dynamodb-endpoint=http://localstack:4566

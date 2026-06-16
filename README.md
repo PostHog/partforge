@@ -5,9 +5,9 @@ Distributed ClickHouse MergeTree part rewriting for large schema migrations.
 The intended flow is:
 
 1. Run `ALTER TABLE db.table FREEZE WITH NAME 'name'` on a ClickHouse node.
-2. Run `partforge upload-freeze` against that node. It packages every frozen part with a manifest, uploads source artifacts to S3, and sends SQS work messages.
-3. Run `partforge worker` in a container that also contains `clickhouse-server`. The worker starts ClickHouse locally, attaches one source part, runs the provided `INSERT INTO ... SELECT ...`, detaches produced destination parts, and uploads finished artifacts.
-4. Run `partforge import-finished` near the destination ClickHouse node. It downloads finished artifacts one at a time, copies each produced part into the destination table's `detached` directory, and runs `ALTER TABLE ... ATTACH PART`. ClickHouse assigns the final active part names.
+2. Run `partforge upload-freeze` on a host that can read the ClickHouse disk paths reported by `system.disks`. It writes a `manifest.json` into each frozen part directory, uploads the raw part directory to S3 with `s5cmd`, and registers `READY` part records in DynamoDB.
+3. Run `partforge worker` in a container that also contains `clickhouse-server` and `s5cmd`. The worker starts ClickHouse locally, downloads one raw source part directory, attaches it, runs the provided `INSERT INTO ... SELECT ...`, detaches produced destination parts, and uploads raw finished part directories.
+4. Run `partforge import-finished` near the destination ClickHouse node. It reads `FINISHED` part records from DynamoDB, downloads finished artifacts one at a time, copies each produced part into the destination table's `detached` directory, and runs `ALTER TABLE ... ATTACH PART`. ClickHouse assigns the final active part names.
 
 This is a part-level rewrite tool, not a generic distributed SQL engine. The insert-select must be valid when executed independently for each source part. Row-local schema migrations, casts, computed columns, filters, changed codecs, changed sort keys, and changed partitioning fit this model. Global transforms such as `GROUP BY`, `DISTINCT`, windows, and `ORDER BY ... LIMIT` do not.
 
@@ -20,19 +20,50 @@ docker compose up -d localstack
 LocalStack creates:
 
 - S3 bucket: `partforge`
-- SQS queue: `partforge`
+- DynamoDB table: `partforge`
 
 Use these endpoint flags for local runs:
 
 ```sh
 -s3-endpoint=http://localhost:4566
--sqs-endpoint=http://localhost:4566
--queue-url=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/partforge
+-dynamodb-endpoint=http://localhost:4566
 ```
+
+The DynamoDB state table defaults to `partforge`. Use `-state-table` only to override it.
+
+`partforge` uses `s5cmd` for S3 directory transfers. The worker image includes `s5cmd`; local binary runs need `s5cmd` available on `PATH` or passed with `-s5cmd-binary`.
+
+## Config
+
+Every command reads defaults from `/etc/partforge/config.json` when that file exists. Use `-config=/path/to/config.json` to override the location. CLI flags always take precedence over config values.
+
+Top-level config keys apply to every command. Command-specific keys under `commands` override top-level keys for that command:
+
+```json
+{
+  "aws_region": "us-east-1",
+  "s3_endpoint": "http://localhost:4566",
+  "dynamodb_endpoint": "http://localhost:4566",
+  "state_table": "partforge",
+  "bucket": "partforge",
+  "prefix": "partforge",
+  "s5cmd_binary": "s5cmd",
+  "commands": {
+    "worker": {
+      "metrics_addr": ":2112"
+    },
+    "import-finished": {
+      "clickhouse_url": "http://clickhouse:8123"
+    }
+  }
+}
+```
+
+Config keys may use either flag-style names such as `aws-region` or JSON-style names such as `aws_region`.
 
 ## Worker Container
 
-The worker image is a single Ubuntu-based container with ClickHouse packages installed and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker starts `clickhouse server` as a child process before consuming SQS messages. The default ClickHouse version is `26.3.10.60`.
+The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
 
 ```sh
 docker compose build worker
@@ -62,6 +93,52 @@ Core worker metrics:
 
 The read/write counters are updated live while the `INSERT SELECT` is running by polling ClickHouse `system.processes` for the rewrite query id. Source and destination active part gauges are measured from `system.parts` while those parts are attached in the worker.
 
+## Admin
+
+List job IDs from the DynamoDB state table:
+
+```sh
+partforge list-jobs
+```
+
+Show progress, status counts, and failed part errors for one job:
+
+```sh
+partforge job-status \
+  -job-id=job-123
+```
+
+Use `-json` on either command for machine-readable output. Use `job-status -parts` to include one row per part. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+
+Retry one failed part:
+
+```sh
+partforge retry-failed \
+  -job-id=job-123 \
+  -part-id=part-abc
+```
+
+Retry every failed part in a job:
+
+```sh
+partforge retry-failed \
+  -job-id=job-123 \
+  -all
+```
+
+Failed rewrite parts are moved back to `READY`. Failed import parts are moved back to `FINISHED`, so `import-finished` retries the import stage instead of re-running the worker. `retry-failed` uses conditional updates and requires `dynamodb:UpdateItem`.
+
+Force every part in a job back to `READY`, including parts that already succeeded:
+
+```sh
+partforge retry-failed \
+  -job-id=job-123 \
+  -all \
+  -force
+```
+
+Use `-all -force` only when the whole job should be rewritten from the worker stage.
+
 ## Example
 
 ```sh
@@ -74,9 +151,8 @@ partforge upload-freeze \
   -destination-schema-file=dest.sql \
   -insert-select-file=insert.sql \
   -bucket=partforge \
-  -queue-url=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/partforge \
   -s3-endpoint=http://localhost:4566 \
-  -sqs-endpoint=http://localhost:4566
+  -dynamodb-endpoint=http://localhost:4566
 ```
 
 The destination schema file should contain a full `CREATE TABLE` statement. The insert file should contain a full statement such as:
@@ -89,5 +165,9 @@ FROM src_db.events
 ```
 
 `Replicated*MergeTree` engines are normalized to their non-replicated `*MergeTree` equivalents inside the worker.
+
+`upload-freeze` discovers every ClickHouse disk from `system.disks`, scans each local disk's `shadow/<freeze>` directory, and includes the disk name in the part identity. S3-backed ClickHouse disks are rejected for now.
+
+Part state is stored in DynamoDB. Workers claim work with conditional updates from `READY` to `IN_PROGRESS`; handled processing errors are written as `FAILED`; successful rewrites become `FINISHED`; and `import-finished` transitions parts through `IMPORTING` to `IMPORTED`. If a worker process dies outside handled code, the part remains visible as `IN_PROGRESS` for manual inspection or reset.
 
 `import-finished` requires the destination table to be empty by default. This is intentional: attaching the same finished artifacts twice would duplicate data, and there is no exact transaction spanning S3 and ClickHouse. Use `-require-empty=false` only when importing into a table that you have verified manually.

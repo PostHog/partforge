@@ -10,46 +10,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/partforge/partforge/internal/archive"
-	"github.com/partforge/partforge/internal/awsio"
+	"github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/ddl"
 	"github.com/partforge/partforge/internal/fileutil"
 	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/metrics"
+	"github.com/partforge/partforge/internal/s3copy"
 )
 
 type Processor struct {
-	AWS          *awsio.Clients
+	S3Copy       s3copy.Copier
 	ClickHouse   chhttp.Client
 	WorkDir      string
 	MergeTimeout time.Duration
 	Metrics      metrics.Recorder
 }
 
-func (p Processor) ProcessQueueMessage(ctx context.Context, queueURL string, envelope awsio.QueueEnvelope) error {
-	msg, err := manifest.UnmarshalQueueMessage(envelope.Body)
-	if err != nil {
-		return fmt.Errorf("parse queue message: %w", err)
+type WorkItem struct {
+	Bucket      string
+	SourceKey   string
+	FinishedKey string
+	JobID       string
+	PartID      string
+}
+
+type activePart struct {
+	Name        string
+	PartitionID string
+	Path        string
+}
+
+func (p Processor) ProcessPart(ctx context.Context, item WorkItem) error {
+	if item.Bucket == "" || item.SourceKey == "" || item.FinishedKey == "" || item.JobID == "" || item.PartID == "" {
+		return fmt.Errorf("work item is missing bucket, source_key, finished_key, job_id, or part_id")
 	}
-	if msg.Bucket == "" || msg.Key == "" || msg.FinishedKey == "" || msg.JobID == "" || msg.PartID == "" {
-		return fmt.Errorf("queue message is missing bucket, key, finished_key, job_id, or part_id")
-	}
-	if err := validateSafeSegment(msg.JobID); err != nil {
+	if err := validateSafeSegment(item.JobID); err != nil {
 		return err
 	}
-	if err := validateSafeSegment(msg.PartID); err != nil {
+	if err := validateSafeSegment(item.PartID); err != nil {
 		return err
 	}
 
-	if exists, err := p.AWS.ObjectExists(ctx, msg.Bucket, msg.FinishedKey); err != nil {
-		return fmt.Errorf("check finished artifact %s: %w", msg.FinishedKey, err)
-	} else if exists {
-		slog.Info("finished artifact already exists; deleting duplicate queue message", "key", msg.FinishedKey)
-		return p.AWS.DeleteQueueMessage(ctx, queueURL, envelope.ReceiptHandle)
-	}
-
-	root := filepath.Join(defaultWorkDir(p.WorkDir), msg.JobID, msg.PartID)
+	root := filepath.Join(defaultWorkDir(p.WorkDir), item.JobID, item.PartID)
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
@@ -58,59 +61,43 @@ func (p Processor) ProcessQueueMessage(ctx context.Context, queueURL string, env
 		return err
 	}
 
-	sourceArchive := filepath.Join(root, "source.tar.gz")
-	if err := p.AWS.DownloadToFile(ctx, msg.Bucket, msg.Key, sourceArchive); err != nil {
-		return fmt.Errorf("download source artifact %s: %w", msg.Key, err)
+	sourceRoot := filepath.Join(root, "source")
+	if err := p.S3Copy.DownloadPrefix(ctx, item.Bucket, item.SourceKey, sourceRoot); err != nil {
+		return fmt.Errorf("download source artifact %s: %w", item.SourceKey, err)
 	}
 
-	extractRoot := filepath.Join(root, "source")
-	f, err := os.Open(sourceArchive)
+	m, err := artifact.ReadManifest(sourceRoot)
 	if err != nil {
-		return err
+		return fmt.Errorf("read source manifest: %w", err)
 	}
-	m, extractErr := archive.Extract(f, extractRoot)
-	closeErr := f.Close()
-	if extractErr != nil {
-		return fmt.Errorf("extract source artifact: %w", extractErr)
+	if m.JobID != item.JobID || m.PartID != item.PartID {
+		return fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if m.JobID != msg.JobID || m.PartID != msg.PartID {
-		return fmt.Errorf("queue message references %s/%s but manifest contains %s/%s", msg.JobID, msg.PartID, m.JobID, m.PartID)
-	}
-	if m.S3.Bucket != msg.Bucket || m.S3.SourceKey != msg.Key || m.S3.FinishedKey != msg.FinishedKey {
-		return fmt.Errorf("queue message S3 reference does not match manifest")
+	if m.S3.Bucket != item.Bucket || m.S3.SourceKey != item.SourceKey || m.S3.FinishedKey != item.FinishedKey {
+		return fmt.Errorf("work item S3 reference does not match manifest")
 	}
 
-	if exists, err := p.AWS.ObjectExists(ctx, m.S3.Bucket, m.S3.FinishedKey); err != nil {
-		return fmt.Errorf("check finished artifact %s: %w", m.S3.FinishedKey, err)
-	} else if exists {
-		slog.Info("finished artifact already exists; deleting duplicate queue message", "key", m.S3.FinishedKey)
-		return p.AWS.DeleteQueueMessage(ctx, queueURL, envelope.ReceiptHandle)
+	if err := artifact.RemoveManifest(sourceRoot); err != nil {
+		return err
 	}
 
 	recorder := p.recorder()
 	recorder.ForgeStarted(m)
-	finishedArchive := filepath.Join(root, "finished.tar.gz")
-	if err := p.rewriteArchive(ctx, m, extractRoot, finishedArchive); err != nil {
+	finishedRoot := filepath.Join(root, "finished")
+	if err := p.rewritePart(ctx, m, sourceRoot, finishedRoot); err != nil {
 		recorder.ForgeFailed(m)
 		return err
 	}
-	if err := p.AWS.PutFile(ctx, m.S3.Bucket, m.S3.FinishedKey, finishedArchive); err != nil {
+	if err := p.S3Copy.UploadDir(ctx, finishedRoot, m.S3.Bucket, m.S3.FinishedKey); err != nil {
 		recorder.ForgeFailed(m)
 		return fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
-	}
-	if err := p.AWS.DeleteQueueMessage(ctx, queueURL, envelope.ReceiptHandle); err != nil {
-		recorder.ForgeFailed(m)
-		return fmt.Errorf("delete processed queue message: %w", err)
 	}
 	recorder.ForgeCompleted(m)
 	slog.Info("processed part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey)
 	return nil
 }
 
-func (p Processor) rewriteArchive(ctx context.Context, m manifest.Manifest, extractRoot, finishedArchive string) error {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) error {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
 		return fmt.Errorf("source and destination table names must differ inside the worker")
 	}
@@ -157,7 +144,7 @@ func (p Processor) rewriteArchive(ctx context.Context, m manifest.Manifest, extr
 	if err := os.MkdirAll(sourceDetached, 0o755); err != nil {
 		return err
 	}
-	if err := fileutil.CopyDir(archive.SourcePartPath(extractRoot, m), filepath.Join(sourceDetached, m.Part.Name)); err != nil {
+	if err := fileutil.CopyDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
 		return fmt.Errorf("copy source part to detached: %w", err)
 	}
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
@@ -181,30 +168,27 @@ func (p Processor) rewriteArchive(ctx context.Context, m manifest.Manifest, extr
 	}
 	p.recorder().SetActivePartStats("destination", m, destStats)
 
-	destDataPath, err := p.tableDataPath(ctx, m.Dest.Database, m.Dest.Table)
+	activeParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return err
 	}
-	outputParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
-	if err != nil {
-		return err
-	}
-	for _, part := range outputParts {
+	outputParts := make([]manifest.OutputPart, 0, len(activeParts))
+	for _, part := range activeParts {
+		outputParts = append(outputParts, manifest.OutputPart{Name: part.Name, PartitionID: part.PartitionID})
 		if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" DETACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
 			return fmt.Errorf("detach destination part %s: %w", part.Name, err)
 		}
+		detachedPath, err := detachedPartPath(part.Path, part.Name)
+		if err != nil {
+			return err
+		}
+		if err := fileutil.CopyDir(detachedPath, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
+			return fmt.Errorf("copy finished part %s: %w", part.Name, err)
+		}
 	}
 
-	out, err := os.Create(finishedArchive)
-	if err != nil {
-		return err
-	}
-	writeErr := archive.WriteFinished(out, m, filepath.Join(destDataPath, "detached"), outputParts)
-	closeErr := out.Close()
-	if writeErr != nil {
-		return fmt.Errorf("write finished archive: %w", writeErr)
-	}
-	return closeErr
+	m.Output.Parts = outputParts
+	return artifact.WriteManifest(finishedRoot, m)
 }
 
 func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest) error {
@@ -270,21 +254,21 @@ func (p Processor) tableDataPath(ctx context.Context, database, table string) (s
 	return path, nil
 }
 
-func (p Processor) activeParts(ctx context.Context, database, table string) ([]manifest.OutputPart, error) {
-	query := "SELECT name, partition_id FROM system.parts WHERE database = " +
+func (p Processor) activeParts(ctx context.Context, database, table string) ([]activePart, error) {
+	query := "SELECT name, partition_id, path FROM system.parts WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
 		" AND active ORDER BY name FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := chhttp.FormatTSVStrings(out, 2)
+	rows, err := chhttp.FormatTSVStrings(out, 3)
 	if err != nil {
 		return nil, err
 	}
-	parts := make([]manifest.OutputPart, 0, len(rows))
+	parts := make([]activePart, 0, len(rows))
 	for _, row := range rows {
-		parts = append(parts, manifest.OutputPart{Name: row[0], PartitionID: row[1]})
+		parts = append(parts, activePart{Name: row[0], PartitionID: row[1], Path: row[2]})
 	}
 	return parts, nil
 }
@@ -413,6 +397,14 @@ func defaultWorkDir(workDir string) string {
 		return "/tmp/partforge"
 	}
 	return workDir
+}
+
+func detachedPartPath(activePath, partName string) (string, error) {
+	clean := filepath.Clean(activePath)
+	if filepath.Base(clean) != partName {
+		return "", fmt.Errorf("active part path %s does not end with part name %s", activePath, partName)
+	}
+	return filepath.Join(filepath.Dir(clean), "detached", partName), nil
 }
 
 func (p Processor) recorder() metrics.Recorder {

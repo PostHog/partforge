@@ -1,20 +1,94 @@
 package freeze
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+
+	"github.com/partforge/partforge/internal/chhttp"
 )
 
 type Part struct {
+	Disk         string
 	Name         string
 	Path         string
 	RelativePath string
 }
 
-func Scan(shadowDir, freezeName string) ([]Part, error) {
-	root := filepath.Join(shadowDir, freezeName)
+type Disk struct {
+	Name string
+	Path string
+	Type string
+}
+
+func LocalDisks(ctx context.Context, ch chhttp.Client) ([]Disk, error) {
+	out, err := ch.QueryString(ctx, "SELECT name, path, type FROM system.disks ORDER BY name FORMAT TSV")
+	if err != nil {
+		return nil, fmt.Errorf("query ClickHouse disks: %w", err)
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 3)
+	if err != nil {
+		return nil, err
+	}
+	var disks []Disk
+	for _, row := range rows {
+		disk := Disk{Name: row[0], Path: row[1], Type: row[2]}
+		if err := validateLocalDisk(disk); err != nil {
+			return nil, err
+		}
+		disks = append(disks, disk)
+	}
+	if len(disks) == 0 {
+		return nil, fmt.Errorf("ClickHouse reported no local disks")
+	}
+	return disks, nil
+}
+
+func validateLocalDisk(disk Disk) error {
+	diskType := strings.ToLower(strings.TrimSpace(disk.Type))
+	if strings.Contains(diskType, "s3") {
+		return fmt.Errorf("ClickHouse disk %q uses unsupported S3 storage", disk.Name)
+	}
+	if diskType != "local" {
+		return fmt.Errorf("ClickHouse disk %q has unsupported type %q", disk.Name, disk.Type)
+	}
+	if strings.TrimSpace(disk.Path) == "" {
+		return fmt.Errorf("ClickHouse disk %q has empty path", disk.Name)
+	}
+	return nil
+}
+
+func ScanDisks(disks []Disk, freezeName string) ([]Part, error) {
+	var parts []Part
+	var roots []string
+	for _, disk := range disks {
+		root := filepath.Join(disk.Path, "shadow", freezeName)
+		roots = append(roots, root)
+		diskParts, err := Scan(disk.Name, root)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, diskParts...)
+	}
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("no ClickHouse parts found under local disk freeze roots: %s", strings.Join(roots, ", "))
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		if parts[i].Disk != parts[j].Disk {
+			return parts[i].Disk < parts[j].Disk
+		}
+		return parts[i].RelativePath < parts[j].RelativePath
+	})
+	return parts, nil
+}
+
+func Scan(diskName, root string) ([]Part, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil, fmt.Errorf("stat freeze directory %s: %w", root, err)
@@ -42,6 +116,7 @@ func Scan(shadowDir, freezeName string) ([]Part, error) {
 			return err
 		}
 		parts = append(parts, Part{
+			Disk:         diskName,
 			Name:         filepath.Base(path),
 			Path:         path,
 			RelativePath: filepath.ToSlash(rel),

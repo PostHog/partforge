@@ -2,6 +2,7 @@ FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
+RUN go install github.com/peak/s5cmd/v2@v2.3.0
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/partforge ./cmd/partforge
 
@@ -22,7 +23,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/partforge /usr/local/bin/partforge
-RUN chmod 0755 /usr/local/bin/partforge
+COPY --from=build /go/bin/s5cmd /usr/local/bin/s5cmd
+RUN chmod 0755 /usr/local/bin/partforge /usr/local/bin/s5cmd
 USER clickhouse
 ENTRYPOINT ["/usr/local/bin/partforge"]
 CMD ["worker"]

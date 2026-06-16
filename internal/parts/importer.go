@@ -9,39 +9,48 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/partforge/partforge/internal/archive"
-	"github.com/partforge/partforge/internal/awsio"
+	artifactpkg "github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/fileutil"
-	"github.com/partforge/partforge/internal/manifest"
+	"github.com/partforge/partforge/internal/s3copy"
 )
 
 type Importer struct {
-	AWS        *awsio.Clients
+	S3Copy     s3copy.Copier
 	ClickHouse chhttp.Client
 	WorkDir    string
 }
 
+type FinishedArtifact struct {
+	Bucket string
+	Key    string
+	PartID string
+}
+
 type ImportJob struct {
-	Bucket       string
-	Prefix       string
-	JobID        string
-	Database     string
-	Table        string
-	RequireEmpty bool
+	Artifacts        []FinishedArtifact
+	JobID            string
+	Database         string
+	Table            string
+	RequireEmpty     bool
+	MarkImporting    func(context.Context, FinishedArtifact) error
+	MarkImported     func(context.Context, FinishedArtifact) error
+	MarkImportFailed func(context.Context, FinishedArtifact, error) error
 }
 
 func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
-	prefix := manifest.FinishedPrefix(job.Prefix, job.JobID)
-	keys, err := i.AWS.ListKeys(ctx, job.Bucket, prefix)
-	if err != nil {
-		return fmt.Errorf("list finished artifacts under %s: %w", prefix, err)
+	if len(job.Artifacts) == 0 {
+		return fmt.Errorf("no finished artifacts found for job %s", job.JobID)
 	}
-	keys = filterTarGz(keys)
-	if len(keys) == 0 {
-		return fmt.Errorf("no finished artifacts found under s3://%s/%s", job.Bucket, prefix)
+	artifacts := append([]FinishedArtifact(nil), job.Artifacts...)
+	sort.Slice(artifacts, func(i, j int) bool {
+		return artifacts[i].Key < artifacts[j].Key
+	})
+	for _, artifact := range artifacts {
+		if artifact.Bucket == "" || artifact.Key == "" || artifact.PartID == "" {
+			return fmt.Errorf("finished artifact is missing bucket, key, or part_id")
+		}
 	}
-	sort.Strings(keys)
 
 	dataPath, err := i.tableDataPath(ctx, job.Database, job.Table)
 	if err != nil {
@@ -70,45 +79,55 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 		return err
 	}
 
-	for idx, key := range keys {
-		if err := i.importArtifact(ctx, job, key, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx))); err != nil {
+	for idx, artifact := range artifacts {
+		if job.MarkImporting != nil {
+			if err := job.MarkImporting(ctx, artifact); err != nil {
+				return err
+			}
+		}
+		if err := i.importArtifact(ctx, job, artifact, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx))); err != nil {
+			if job.MarkImportFailed != nil {
+				if markErr := job.MarkImportFailed(ctx, artifact, err); markErr != nil {
+					return fmt.Errorf("import artifact s3://%s/%s: %w; additionally failed to mark import failed: %v", artifact.Bucket, artifact.Key, err, markErr)
+				}
+			}
 			return err
 		}
+		if job.MarkImported != nil {
+			if err := job.MarkImported(ctx, artifact); err != nil {
+				return err
+			}
+		}
 	}
-	slog.Info("import complete", "job_id", job.JobID, "artifacts", len(keys))
+	slog.Info("import complete", "job_id", job.JobID, "artifacts", len(artifacts))
 	return nil
 }
 
-func (i Importer) importArtifact(ctx context.Context, job ImportJob, key, detachedPath, workDir string) error {
+func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, workDir string) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
-	archivePath := filepath.Join(workDir, "finished.tar.gz")
-	if err := i.AWS.DownloadToFile(ctx, job.Bucket, key, archivePath); err != nil {
-		return fmt.Errorf("download finished artifact %s: %w", key, err)
+	extractRoot := filepath.Join(workDir, "finished")
+	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, artifact.Key, extractRoot); err != nil {
+		return fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
 
-	f, err := os.Open(archivePath)
+	m, err := artifactpkg.ReadManifest(extractRoot)
 	if err != nil {
-		return err
-	}
-	m, extractErr := archive.Extract(f, filepath.Join(workDir, "extract"))
-	closeErr := f.Close()
-	if extractErr != nil {
-		return fmt.Errorf("extract finished artifact %s: %w", key, extractErr)
-	}
-	if closeErr != nil {
-		return closeErr
+		return fmt.Errorf("read finished manifest s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
 	if m.JobID != job.JobID {
-		return fmt.Errorf("finished artifact %s belongs to job %s, expected %s", key, m.JobID, job.JobID)
+		return fmt.Errorf("finished artifact s3://%s/%s belongs to job %s, expected %s", artifact.Bucket, artifact.Key, m.JobID, job.JobID)
+	}
+	if m.PartID != artifact.PartID {
+		return fmt.Errorf("finished artifact s3://%s/%s belongs to part %s, expected %s", artifact.Bucket, artifact.Key, m.PartID, artifact.PartID)
 	}
 	if m.Dest.Database != job.Database || m.Dest.Table != job.Table {
-		return fmt.Errorf("finished artifact %s targets %s, expected %s", key, chhttp.TableSQL(m.Dest.Database, m.Dest.Table), chhttp.TableSQL(job.Database, job.Table))
+		return fmt.Errorf("finished artifact s3://%s/%s targets %s, expected %s", artifact.Bucket, artifact.Key, chhttp.TableSQL(m.Dest.Database, m.Dest.Table), chhttp.TableSQL(job.Database, job.Table))
 	}
 
 	for _, part := range m.Output.Parts {
-		src := archive.FinishedPartPath(filepath.Join(workDir, "extract"), part.Name)
+		src := artifactpkg.FinishedPartPath(extractRoot, part.Name)
 		dst := filepath.Join(detachedPath, part.Name)
 		if err := fileutil.CopyDir(src, dst); err != nil {
 			return fmt.Errorf("copy finished part %s to detached: %w", part.Name, err)
@@ -117,7 +136,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, key, detach
 			return fmt.Errorf("attach finished part %s: %w", part.Name, err)
 		}
 	}
-	slog.Info("imported artifact", "key", key, "parts", len(m.Output.Parts))
+	slog.Info("imported artifact", "bucket", artifact.Bucket, "key", artifact.Key, "parts", len(m.Output.Parts))
 	return nil
 }
 
@@ -144,16 +163,6 @@ func (i Importer) activePartCount(ctx context.Context, database, table string) (
 		return 0, err
 	}
 	return chhttp.ParseUInt(out)
-}
-
-func filterTarGz(keys []string) []string {
-	var filtered []string
-	for _, key := range keys {
-		if strings.HasSuffix(key, ".tar.gz") {
-			filtered = append(filtered, key)
-		}
-	}
-	return filtered
 }
 
 func defaultImportWorkDir(workDir string) string {

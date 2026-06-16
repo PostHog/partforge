@@ -3,7 +3,6 @@ package manifest
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"path"
 	"strings"
 	"time"
@@ -31,6 +30,7 @@ type TableRef struct {
 }
 
 type SourcePart struct {
+	Disk         string `json:"disk"`
 	Name         string `json:"name"`
 	RelativePath string `json:"relative_path"`
 }
@@ -56,20 +56,12 @@ type OutputPart struct {
 	PartitionID string `json:"partition_id"`
 }
 
-type QueueMessage struct {
-	Bucket      string `json:"bucket"`
-	Key         string `json:"key"`
-	FinishedKey string `json:"finished_key"`
-	JobID       string `json:"job_id"`
-	PartID      string `json:"part_id"`
-}
-
 func (m Manifest) Validate() error {
 	if m.Version != Version {
 		return Error("unsupported manifest version")
 	}
-	if m.JobID == "" || m.PartID == "" || m.Part.Name == "" {
-		return Error("manifest is missing job_id, part_id, or part.name")
+	if m.JobID == "" || m.PartID == "" || m.Part.Disk == "" || m.Part.Name == "" {
+		return Error("manifest is missing job_id, part_id, part.disk, or part.name")
 	}
 	if m.Source.Database == "" || m.Source.Table == "" || m.Dest.Database == "" || m.Dest.Table == "" {
 		return Error("manifest is missing source or destination table")
@@ -91,16 +83,16 @@ func DeriveJobID(database, table, freeze, sourceSchema, destinationSchema, inser
 	return "job-" + shortHash(database, table, freeze, sourceSchema, destinationSchema, insertSelect)
 }
 
-func DerivePartID(relativePath, name, sourceSchema, destinationSchema, insertSelect string) string {
-	return "part-" + shortHash(relativePath, name, sourceSchema, destinationSchema, insertSelect)
+func DerivePartID(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect string) string {
+	return "part-" + shortHash(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect)
 }
 
-func SourceArchiveKey(prefix, jobID, partID string) string {
-	return cleanKey(prefix, "jobs", jobID, "source", partID+".tar.gz")
+func SourcePartPrefix(prefix, jobID, partID string) string {
+	return cleanKey(prefix, "jobs", jobID, "source", partID)
 }
 
-func FinishedArchiveKey(prefix, jobID, partID string) string {
-	return cleanKey(prefix, "jobs", jobID, "finished", partID+".tar.gz")
+func FinishedPartPrefix(prefix, jobID, partID string) string {
+	return cleanKey(prefix, "jobs", jobID, "finished", partID)
 }
 
 func FinishedPrefix(prefix, jobID string) string {
@@ -109,17 +101,6 @@ func FinishedPrefix(prefix, jobID string) string {
 
 func ImportedMarkerKey(prefix, jobID, partID string) string {
 	return cleanKey(prefix, "jobs", jobID, "imported", partID+".json")
-}
-
-func MarshalQueueMessage(msg QueueMessage) (string, error) {
-	b, err := json.Marshal(msg)
-	return string(b), err
-}
-
-func UnmarshalQueueMessage(body string) (QueueMessage, error) {
-	var msg QueueMessage
-	err := json.Unmarshal([]byte(body), &msg)
-	return msg, err
 }
 
 func shortHash(values ...string) string {
