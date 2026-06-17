@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -127,6 +128,8 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		region                = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
 		s3Endpoint            = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
 		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers per upload process; <=0 auto-scales from upload-concurrency")
+		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source parts to upload concurrently; <=0 uses detected CPU count")
 		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -142,6 +145,10 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	if *database == "" || *table == "" || *freezeName == "" || *destinationDatabase == "" || *destinationTable == "" ||
 		*destinationSchemaFile == "" || *insertSelectFile == "" || *bucket == "" {
 		return errors.New("database, table, freeze, destination-database, destination-table, destination-schema-file, insert-select-file, and bucket are required")
+	}
+	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
+	if err != nil {
+		return err
 	}
 
 	startedAt := time.Now()
@@ -220,92 +227,62 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
-	copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
-
 	var uploadedBytes uint64
-	slog.Info("uploading frozen source parts", "stage", "upload_parts", "job_id", resolvedJobID, "parts_total", len(scannedParts))
+	uploadedParts := 0
+	effectiveConcurrency := min(resolvedUploadConcurrency, len(scannedParts))
+	resolvedS5cmdNumWorkers := resolveS5cmdNumWorkers(*s5cmdNumWorkers, effectiveConcurrency)
+	copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint, NumWorkers: resolvedS5cmdNumWorkers}
+	slog.Info(
+		"uploading frozen source parts",
+		"stage", "upload_parts",
+		"job_id", resolvedJobID,
+		"parts_total", len(scannedParts),
+		"upload_concurrency", *uploadConcurrency,
+		"resolved_upload_concurrency", resolvedUploadConcurrency,
+		"effective_upload_concurrency", effectiveConcurrency,
+		"s5cmd_numworkers", resolvedS5cmdNumWorkers,
+	)
+	tasks := make([]uploadPartTask, 0, len(scannedParts))
 	for idx, sourcePart := range scannedParts {
-		partID := manifest.DerivePartID(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, sourceSchema, destinationSchema, insertSelect)
-		sourceKey := manifest.SourcePartPrefix(*prefix, resolvedJobID, partID)
-		finishedKey := manifest.FinishedPartPrefix(*prefix, resolvedJobID, partID)
-		createdAt := time.Now().UTC()
-
-		m := manifest.Manifest{
-			Version:   manifest.Version,
-			JobID:     resolvedJobID,
-			PartID:    partID,
-			Freeze:    *freezeName,
-			Source:    manifest.TableRef{Database: *database, Table: *table},
-			Dest:      manifest.TableRef{Database: *destinationDatabase, Table: *destinationTable},
-			Part:      manifest.SourcePart{Disk: sourcePart.Disk, Name: sourcePart.Name, RelativePath: sourcePart.RelativePath},
-			SQL:       manifest.SQLBundle{SourceSchema: sourceSchema, DestinationSchema: destinationSchema, InsertSelect: insertSelect},
-			S3:        manifest.S3Refs{Bucket: *bucket, SourceKey: sourceKey, FinishedKey: finishedKey},
-			CreatedAt: createdAt,
-		}
-
-		if err := artifact.WriteManifest(sourcePart.Path, m); err != nil {
-			return fmt.Errorf("write source manifest for %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
-		}
-		partStats, err := fileutil.StatDir(sourcePart.Path)
-		if err != nil {
-			return fmt.Errorf("stat source part %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
-		}
-		slog.Info(
-			"uploading source part",
-			"stage", "upload_parts",
-			"job_id", resolvedJobID,
-			"part_index", idx+1,
-			"parts_total", len(scannedParts),
-			"part_id", partID,
-			"disk", sourcePart.Disk,
-			"part", sourcePart.RelativePath,
-			"files", partStats.Files,
-			"bytes", partStats.Bytes,
-			"source_key", sourceKey,
-		)
-		partUploadStartedAt := time.Now()
-		if err := copier.UploadDir(ctx, sourcePart.Path, *bucket, sourceKey); err != nil {
-			return fmt.Errorf("upload source part %s:%s to s3://%s/%s: %w", sourcePart.Disk, sourcePart.RelativePath, *bucket, sourceKey, err)
-		}
-		uploadElapsed := time.Since(partUploadStartedAt)
-		uploadedBytes += partStats.Bytes
-		uploadedParts := idx + 1
+		tasks = append(tasks, uploadPartTask{Index: idx + 1, SourcePart: sourcePart})
+	}
+	uploadParams := uploadFreezePartParams{
+		JobID:             resolvedJobID,
+		FreezeName:        *freezeName,
+		Source:            manifest.TableRef{Database: *database, Table: *table},
+		Dest:              manifest.TableRef{Database: *destinationDatabase, Table: *destinationTable},
+		SourceSchema:      sourceSchema,
+		DestinationSchema: destinationSchema,
+		InsertSelect:      insertSelect,
+		Bucket:            *bucket,
+		Prefix:            *prefix,
+		PartsTotal:        len(scannedParts),
+		StateStore:        stateStore,
+		Copier:            copier,
+	}
+	err = uploadPartsInParallel(ctx, tasks, effectiveConcurrency, func(ctx context.Context, workerID int, task uploadPartTask) (uploadPartResult, error) {
+		return uploadFreezePart(ctx, workerID, task, uploadParams)
+	}, func(result uploadPartResult) {
+		uploadedParts++
+		uploadedBytes += result.Bytes
 		elapsed := time.Since(startedAt)
 		slog.Info(
-			"uploaded source part",
+			"source part upload progress",
 			"stage", "upload_parts",
 			"job_id", resolvedJobID,
-			"part_index", uploadedParts,
+			"completed_parts", uploadedParts,
 			"parts_total", len(scannedParts),
-			"part_id", partID,
-			"disk", sourcePart.Disk,
-			"part", sourcePart.RelativePath,
-			"bytes", partStats.Bytes,
-			"upload_elapsed", uploadElapsed,
-			"part_bytes_per_second", ratePerSecond(partStats.Bytes, uploadElapsed),
-			"uploaded_parts", uploadedParts,
+			"part_index", result.Index,
+			"part_id", result.PartID,
+			"disk", result.SourcePart.Disk,
+			"part", result.SourcePart.RelativePath,
 			"uploaded_bytes", uploadedBytes,
 			"overall_parts_per_second", countRatePerSecond(uploadedParts, elapsed),
 			"overall_bytes_per_second", ratePerSecond(uploadedBytes, elapsed),
 		)
-
-		partState := state.NewPart(resolvedJobID, partID, *bucket, sourceKey, finishedKey, createdAt)
-		slog.Info("registering source part", "stage", "register_parts", "job_id", resolvedJobID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
-		if err := stateStore.CreatePart(ctx, partState); err != nil {
-			return fmt.Errorf("create state for %s: %w", sourceKey, err)
-		}
-		slog.Info(
-			"registered source part",
-			"stage", "register_parts",
-			"job_id", resolvedJobID,
-			"part_index", uploadedParts,
-			"parts_total", len(scannedParts),
-			"part_id", partID,
-			"disk", sourcePart.Disk,
-			"part", sourcePart.RelativePath,
-			"source_key", sourceKey,
-			"finished_key", finishedKey,
-		)
+	})
+	if err != nil {
+		return err
 	}
 
 	elapsed := time.Since(startedAt)
@@ -320,6 +297,234 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		"bytes_per_second", ratePerSecond(uploadedBytes, elapsed),
 	)
 	return nil
+}
+
+type uploadPartTask struct {
+	Index      int
+	SourcePart freeze.Part
+}
+
+type uploadPartResult struct {
+	Index         int
+	SourcePart    freeze.Part
+	PartID        string
+	SourceKey     string
+	FinishedKey   string
+	Files         uint64
+	Bytes         uint64
+	UploadElapsed time.Duration
+}
+
+type uploadFreezePartParams struct {
+	JobID             string
+	FreezeName        string
+	Source            manifest.TableRef
+	Dest              manifest.TableRef
+	SourceSchema      string
+	DestinationSchema string
+	InsertSelect      string
+	Bucket            string
+	Prefix            string
+	PartsTotal        int
+	StateStore        *state.Store
+	Copier            s3copy.Copier
+}
+
+type uploadPartFunc func(context.Context, int, uploadPartTask) (uploadPartResult, error)
+
+func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurrency int, upload uploadPartFunc, onResult func(uploadPartResult)) error {
+	if concurrency < 1 {
+		return errors.New("upload concurrency must be at least 1")
+	}
+	if upload == nil {
+		return errors.New("upload function is required")
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	if concurrency > len(tasks) {
+		concurrency = len(tasks)
+	}
+
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	taskCh := make(chan uploadPartTask)
+	resultCh := make(chan uploadPartResult)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	for workerID := 1; workerID <= concurrency; workerID++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskCh {
+				if uploadCtx.Err() != nil {
+					return
+				}
+				result, err := upload(uploadCtx, workerID, task)
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+				select {
+				case resultCh <- result:
+				case <-uploadCtx.Done():
+					return
+				}
+			}
+		}(workerID)
+	}
+
+	go func() {
+		defer close(taskCh)
+		for _, task := range tasks {
+			select {
+			case taskCh <- task:
+			case <-uploadCtx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	completed := 0
+	for completed < len(tasks) {
+		select {
+		case result, ok := <-resultCh:
+			if !ok {
+				select {
+				case err := <-errCh:
+					return err
+				default:
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return fmt.Errorf("part upload workers stopped after %d of %d parts", completed, len(tasks))
+			}
+			completed++
+			if onResult != nil {
+				onResult(result)
+			}
+		case err := <-errCh:
+			cancel()
+			for range resultCh {
+			}
+			return err
+		case <-ctx.Done():
+			cancel()
+			for range resultCh {
+			}
+			return ctx.Err()
+		}
+	}
+
+	cancel()
+	for range resultCh {
+	}
+	return nil
+}
+
+func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, params uploadFreezePartParams) (uploadPartResult, error) {
+	sourcePart := task.SourcePart
+	partID := manifest.DerivePartID(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect)
+	sourceKey := manifest.SourcePartPrefix(params.Prefix, params.JobID, partID)
+	finishedKey := manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID)
+	createdAt := time.Now().UTC()
+
+	m := manifest.Manifest{
+		Version:   manifest.Version,
+		JobID:     params.JobID,
+		PartID:    partID,
+		Freeze:    params.FreezeName,
+		Source:    params.Source,
+		Dest:      params.Dest,
+		Part:      manifest.SourcePart{Disk: sourcePart.Disk, Name: sourcePart.Name, RelativePath: sourcePart.RelativePath},
+		SQL:       manifest.SQLBundle{SourceSchema: params.SourceSchema, DestinationSchema: params.DestinationSchema, InsertSelect: params.InsertSelect},
+		S3:        manifest.S3Refs{Bucket: params.Bucket, SourceKey: sourceKey, FinishedKey: finishedKey},
+		CreatedAt: createdAt,
+	}
+
+	if err := artifact.WriteManifest(sourcePart.Path, m); err != nil {
+		return uploadPartResult{}, fmt.Errorf("write source manifest for %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
+	}
+	partStats, err := fileutil.StatDir(sourcePart.Path)
+	if err != nil {
+		return uploadPartResult{}, fmt.Errorf("stat source part %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
+	}
+
+	slog.Info(
+		"uploading source part",
+		"stage", "upload_parts",
+		"job_id", params.JobID,
+		"worker_id", workerID,
+		"part_index", task.Index,
+		"parts_total", params.PartsTotal,
+		"part_id", partID,
+		"disk", sourcePart.Disk,
+		"part", sourcePart.RelativePath,
+		"files", partStats.Files,
+		"bytes", partStats.Bytes,
+		"source_key", sourceKey,
+	)
+	uploadStartedAt := time.Now()
+	if err := params.Copier.UploadDir(ctx, sourcePart.Path, params.Bucket, sourceKey); err != nil {
+		return uploadPartResult{}, fmt.Errorf("upload source part %s:%s to s3://%s/%s: %w", sourcePart.Disk, sourcePart.RelativePath, params.Bucket, sourceKey, err)
+	}
+	uploadElapsed := time.Since(uploadStartedAt)
+	slog.Info(
+		"uploaded source part",
+		"stage", "upload_parts",
+		"job_id", params.JobID,
+		"worker_id", workerID,
+		"part_index", task.Index,
+		"parts_total", params.PartsTotal,
+		"part_id", partID,
+		"disk", sourcePart.Disk,
+		"part", sourcePart.RelativePath,
+		"bytes", partStats.Bytes,
+		"upload_elapsed", uploadElapsed,
+		"part_bytes_per_second", ratePerSecond(partStats.Bytes, uploadElapsed),
+	)
+
+	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
+	slog.Info("registering source part", "stage", "register_parts", "job_id", params.JobID, "worker_id", workerID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
+	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
+		return uploadPartResult{}, fmt.Errorf("create state for %s: %w", sourceKey, err)
+	}
+	slog.Info(
+		"registered source part",
+		"stage", "register_parts",
+		"job_id", params.JobID,
+		"worker_id", workerID,
+		"part_index", task.Index,
+		"parts_total", params.PartsTotal,
+		"part_id", partID,
+		"disk", sourcePart.Disk,
+		"part", sourcePart.RelativePath,
+		"source_key", sourceKey,
+		"finished_key", finishedKey,
+	)
+
+	return uploadPartResult{
+		Index:         task.Index,
+		SourcePart:    sourcePart,
+		PartID:        partID,
+		SourceKey:     sourceKey,
+		FinishedKey:   finishedKey,
+		Files:         partStats.Files,
+		Bytes:         partStats.Bytes,
+		UploadElapsed: uploadElapsed,
+	}, nil
 }
 
 func formatDiskPaths(disks []freeze.Disk) string {
@@ -362,6 +567,38 @@ func countRatePerSecond(count int, elapsed time.Duration) float64 {
 		return 0
 	}
 	return float64(count) / elapsed.Seconds()
+}
+
+func resolveUploadConcurrency(configured int) (int, error) {
+	if configured > 0 {
+		return configured, nil
+	}
+	limits, err := resources.DetectLimits()
+	if err != nil {
+		return 0, fmt.Errorf("detect upload concurrency: %w", err)
+	}
+	return uploadConcurrencyFromCPUs(limits.CPUs)
+}
+
+func uploadConcurrencyFromCPUs(cpus int) (int, error) {
+	if cpus < 1 {
+		return 0, fmt.Errorf("detected CPU count must be at least 1, got %d", cpus)
+	}
+	return cpus, nil
+}
+
+func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
+	if configured > 0 {
+		return configured
+	}
+	if uploadConcurrency < 1 {
+		uploadConcurrency = 1
+	}
+	workers := 256 / uploadConcurrency
+	if workers < 1 {
+		return 1
+	}
+	return workers
 }
 
 func runWorker(ctx context.Context, args []string) error {

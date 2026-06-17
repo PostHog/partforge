@@ -10,8 +10,9 @@ import (
 )
 
 type Copier struct {
-	Binary   string
-	Endpoint string
+	Binary     string
+	Endpoint   string
+	NumWorkers int
 }
 
 func (c Copier) UploadDir(ctx context.Context, localDir, bucket, prefix string) error {
@@ -33,18 +34,26 @@ func (c Copier) run(ctx context.Context, command string, args ...string) error {
 	if strings.TrimSpace(binary) == "" {
 		binary = "s5cmd"
 	}
-	fullArgs := []string{"--retry-count", "0"}
-	if c.Endpoint != "" {
-		fullArgs = append(fullArgs, "--endpoint-url", c.Endpoint)
-	}
-	fullArgs = append(fullArgs, command)
-	fullArgs = append(fullArgs, args...)
+	fullArgs := c.args(command, args...)
 	cmd := exec.CommandContext(ctx, binary, fullArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s failed: %w: %s", binary, strings.Join(fullArgs, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func (c Copier) args(command string, args ...string) []string {
+	fullArgs := []string{"--retry-count", "0"}
+	if c.NumWorkers > 0 {
+		fullArgs = append(fullArgs, "--numworkers", fmt.Sprintf("%d", c.NumWorkers))
+	}
+	if c.Endpoint != "" {
+		fullArgs = append(fullArgs, "--endpoint-url", c.Endpoint)
+	}
+	fullArgs = append(fullArgs, command)
+	fullArgs = append(fullArgs, args...)
+	return fullArgs
 }
 
 func requireDir(path string) error {

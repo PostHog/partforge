@@ -174,6 +174,8 @@ FROM src_db.events
 
 `upload-freeze` discovers every ClickHouse disk from `system.disks`, scans each local disk's `shadow/<freeze>` directory, and includes the disk name in the part identity. S3-backed ClickHouse disks are rejected for now.
 
+`upload-freeze` uploads multiple source parts concurrently with `-upload-concurrency` (default `0`, meaning the detected CPU count). Each upload runs its own `s5cmd` process. To avoid multiplying `s5cmd`'s default worker pool too aggressively, `-s5cmd-numworkers` defaults to auto-sizing from the effective upload concurrency. For example, with concurrency `8`, each process runs with `--numworkers 32`. Set `-s5cmd-numworkers` explicitly to tune per-process parallelism.
+
 Part state is stored in DynamoDB. Workers claim work with conditional updates from `READY` to `IN_PROGRESS`; handled processing errors are written as `FAILED`; successful rewrites become `FINISHED`; and `import-finished` transitions parts through `IMPORTING` to `IMPORTED`. If a worker process dies outside handled code, the part remains visible as `IN_PROGRESS` for manual inspection or reset.
 
 Source part artifacts keep stable S3 prefixes. Finished artifacts are written under per-attempt prefixes, and the `finished_key` in DynamoDB is updated only after a worker successfully uploads an attempt, so retries do not overwrite earlier output.

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/metrics"
 	"github.com/partforge/partforge/internal/rewrite"
 	"github.com/partforge/partforge/internal/state"
@@ -93,6 +99,104 @@ func TestStateProgress(t *testing.T) {
 	}
 	if progress.DestinationActivePartStats == nil || progress.DestinationActivePartStats.Bytes != 10 {
 		t.Fatalf("destination stats = %+v", progress.DestinationActivePartStats)
+	}
+}
+
+func TestUploadPartsInParallelProcessesEveryTask(t *testing.T) {
+	tasks := []uploadPartTask{
+		{Index: 1, SourcePart: freeze.Part{Name: "part-1"}},
+		{Index: 2, SourcePart: freeze.Part{Name: "part-2"}},
+		{Index: 3, SourcePart: freeze.Part{Name: "part-3"}},
+		{Index: 4, SourcePart: freeze.Part{Name: "part-4"}},
+		{Index: 5, SourcePart: freeze.Part{Name: "part-5"}},
+	}
+
+	var active int64
+	var maxActive int64
+	seen := map[int]bool{}
+	var seenMu sync.Mutex
+
+	err := uploadPartsInParallel(context.Background(), tasks, 2, func(ctx context.Context, workerID int, task uploadPartTask) (uploadPartResult, error) {
+		current := atomic.AddInt64(&active, 1)
+		for {
+			max := atomic.LoadInt64(&maxActive)
+			if current <= max || atomic.CompareAndSwapInt64(&maxActive, max, current) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		atomic.AddInt64(&active, -1)
+		return uploadPartResult{Index: task.Index, SourcePart: task.SourcePart}, nil
+	}, func(result uploadPartResult) {
+		seenMu.Lock()
+		defer seenMu.Unlock()
+		seen[result.Index] = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != len(tasks) {
+		t.Fatalf("processed %d tasks, want %d", len(seen), len(tasks))
+	}
+	if max := atomic.LoadInt64(&maxActive); max > 2 {
+		t.Fatalf("max active uploads = %d, want <= 2", max)
+	}
+}
+
+func TestUploadPartsInParallelCancelsOnError(t *testing.T) {
+	boom := errors.New("boom")
+	tasks := []uploadPartTask{
+		{Index: 1},
+		{Index: 2},
+		{Index: 3},
+	}
+
+	err := uploadPartsInParallel(context.Background(), tasks, 2, func(ctx context.Context, workerID int, task uploadPartTask) (uploadPartResult, error) {
+		if task.Index == 1 {
+			return uploadPartResult{}, boom
+		}
+		<-ctx.Done()
+		return uploadPartResult{}, ctx.Err()
+	}, nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("error = %v, want %v", err, boom)
+	}
+}
+
+func TestResolveS5cmdNumWorkers(t *testing.T) {
+	tests := []struct {
+		name              string
+		configured        int
+		uploadConcurrency int
+		want              int
+	}{
+		{name: "explicit", configured: 17, uploadConcurrency: 4, want: 17},
+		{name: "auto divides default workers", configured: 0, uploadConcurrency: 4, want: 64},
+		{name: "auto clamps concurrency", configured: 0, uploadConcurrency: 0, want: 256},
+		{name: "auto clamps workers", configured: 0, uploadConcurrency: 512, want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveS5cmdNumWorkers(tt.configured, tt.uploadConcurrency)
+			if got != tt.want {
+				t.Fatalf("workers = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUploadConcurrencyFromCPUs(t *testing.T) {
+	got, err := uploadConcurrencyFromCPUs(12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 12 {
+		t.Fatalf("concurrency = %d, want 12", got)
+	}
+
+	if _, err := uploadConcurrencyFromCPUs(0); err == nil {
+		t.Fatal("expected invalid CPU count error")
 	}
 }
 
