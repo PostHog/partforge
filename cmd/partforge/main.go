@@ -20,6 +20,7 @@ import (
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/chproc"
 	"github.com/partforge/partforge/internal/ddl"
+	"github.com/partforge/partforge/internal/fileutil"
 	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/metrics"
@@ -38,10 +39,17 @@ const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 var version = "dev"
 
 func main() {
+	configureLogger()
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func configureLogger() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 }
 
 func run() error {
@@ -136,6 +144,20 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return errors.New("database, table, freeze, destination-database, destination-table, destination-schema-file, insert-select-file, and bucket are required")
 	}
 
+	startedAt := time.Now()
+	sourceTable := chhttp.TableSQL(*database, *table)
+	destinationTableRef := chhttp.TableSQL(*destinationDatabase, *destinationTable)
+	slog.Info(
+		"upload-freeze started",
+		"stage", "start",
+		"source_table", sourceTable,
+		"destination_table", destinationTableRef,
+		"freeze", *freezeName,
+		"bucket", *bucket,
+		"prefix", *prefix,
+	)
+
+	slog.Info("reading SQL files", "stage", "read_sql_files", "destination_schema_file", *destinationSchemaFile, "insert_select_file", *insertSelectFile)
 	destinationSchema, err := readRequiredFile(*destinationSchemaFile)
 	if err != nil {
 		return err
@@ -144,38 +166,51 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("read SQL files", "stage", "read_sql_files", "destination_schema_bytes", len(destinationSchema), "insert_select_bytes", len(insertSelect))
 
 	ch := chhttp.Client{
 		URL:      *clickHouseURL,
 		User:     *clickHouseUser,
 		Password: *clickHousePassword,
 	}
-	sourceSchema, err := ch.QueryString(ctx, "SHOW CREATE TABLE "+chhttp.TableSQL(*database, *table)+" FORMAT TSVRaw")
+	slog.Info("loading source table schema", "stage", "load_source_schema", "source_table", sourceTable, "clickhouse_url", *clickHouseURL)
+	sourceSchema, err := ch.QueryString(ctx, "SHOW CREATE TABLE "+sourceTable+" FORMAT TSVRaw")
 	if err != nil {
 		return fmt.Errorf("show create source table: %w", err)
 	}
 	sourceSchema = strings.TrimSpace(sourceSchema)
+	slog.Info("loaded source table schema", "stage", "load_source_schema", "source_table", sourceTable, "source_schema_bytes", len(sourceSchema))
+
+	slog.Info("validating source and destination schemas", "stage", "validate_schemas")
 	if _, err := ddl.NormalizeCreateTable(sourceSchema); err != nil {
 		return fmt.Errorf("source schema is not supported by worker: %w", err)
 	}
 	if _, err := ddl.NormalizeCreateTable(destinationSchema); err != nil {
 		return fmt.Errorf("destination schema is not supported by worker: %w", err)
 	}
+	slog.Info("validated source and destination schemas", "stage", "validate_schemas")
 
+	slog.Info("discovering local ClickHouse disks", "stage", "discover_disks")
 	disks, err := freeze.LocalDisks(ctx, ch)
 	if err != nil {
 		return err
 	}
+	slog.Info("discovered local ClickHouse disks", "stage", "discover_disks", "disks", len(disks), "disk_paths", formatDiskPaths(disks))
+
+	slog.Info("scanning frozen parts", "stage", "scan_freeze", "freeze", *freezeName)
 	scannedParts, err := freeze.ScanDisks(disks, *freezeName)
 	if err != nil {
 		return err
 	}
+	slog.Info("found frozen parts", "stage", "scan_freeze", "parts", len(scannedParts), "parts_by_disk", formatPartCountsByDisk(disks, scannedParts))
 
 	resolvedJobID := *jobID
 	if resolvedJobID == "" {
 		resolvedJobID = manifest.DeriveJobID(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect)
 	}
+	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
 
+	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
 		Endpoint: *dynamoEndpoint,
@@ -184,9 +219,12 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
 
-	for _, sourcePart := range scannedParts {
+	var uploadedBytes uint64
+	slog.Info("uploading frozen source parts", "stage", "upload_parts", "job_id", resolvedJobID, "parts_total", len(scannedParts))
+	for idx, sourcePart := range scannedParts {
 		partID := manifest.DerivePartID(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, sourceSchema, destinationSchema, insertSelect)
 		sourceKey := manifest.SourcePartPrefix(*prefix, resolvedJobID, partID)
 		finishedKey := manifest.FinishedPartPrefix(*prefix, resolvedJobID, partID)
@@ -208,19 +246,122 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		if err := artifact.WriteManifest(sourcePart.Path, m); err != nil {
 			return fmt.Errorf("write source manifest for %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
 		}
+		partStats, err := fileutil.StatDir(sourcePart.Path)
+		if err != nil {
+			return fmt.Errorf("stat source part %s:%s: %w", sourcePart.Disk, sourcePart.RelativePath, err)
+		}
+		slog.Info(
+			"uploading source part",
+			"stage", "upload_parts",
+			"job_id", resolvedJobID,
+			"part_index", idx+1,
+			"parts_total", len(scannedParts),
+			"part_id", partID,
+			"disk", sourcePart.Disk,
+			"part", sourcePart.RelativePath,
+			"files", partStats.Files,
+			"bytes", partStats.Bytes,
+			"source_key", sourceKey,
+		)
+		partUploadStartedAt := time.Now()
 		if err := copier.UploadDir(ctx, sourcePart.Path, *bucket, sourceKey); err != nil {
 			return fmt.Errorf("upload source part %s:%s to s3://%s/%s: %w", sourcePart.Disk, sourcePart.RelativePath, *bucket, sourceKey, err)
 		}
+		uploadElapsed := time.Since(partUploadStartedAt)
+		uploadedBytes += partStats.Bytes
+		uploadedParts := idx + 1
+		elapsed := time.Since(startedAt)
+		slog.Info(
+			"uploaded source part",
+			"stage", "upload_parts",
+			"job_id", resolvedJobID,
+			"part_index", uploadedParts,
+			"parts_total", len(scannedParts),
+			"part_id", partID,
+			"disk", sourcePart.Disk,
+			"part", sourcePart.RelativePath,
+			"bytes", partStats.Bytes,
+			"upload_elapsed", uploadElapsed,
+			"part_bytes_per_second", ratePerSecond(partStats.Bytes, uploadElapsed),
+			"uploaded_parts", uploadedParts,
+			"uploaded_bytes", uploadedBytes,
+			"overall_parts_per_second", countRatePerSecond(uploadedParts, elapsed),
+			"overall_bytes_per_second", ratePerSecond(uploadedBytes, elapsed),
+		)
 
 		partState := state.NewPart(resolvedJobID, partID, *bucket, sourceKey, finishedKey, createdAt)
+		slog.Info("registering source part", "stage", "register_parts", "job_id", resolvedJobID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
 		if err := stateStore.CreatePart(ctx, partState); err != nil {
 			return fmt.Errorf("create state for %s: %w", sourceKey, err)
 		}
-		slog.Info("registered part", "disk", sourcePart.Disk, "part", sourcePart.RelativePath, "source_key", sourceKey, "finished_key", finishedKey)
+		slog.Info(
+			"registered source part",
+			"stage", "register_parts",
+			"job_id", resolvedJobID,
+			"part_index", uploadedParts,
+			"parts_total", len(scannedParts),
+			"part_id", partID,
+			"disk", sourcePart.Disk,
+			"part", sourcePart.RelativePath,
+			"source_key", sourceKey,
+			"finished_key", finishedKey,
+		)
 	}
 
-	slog.Info("upload complete", "job_id", resolvedJobID, "parts", len(scannedParts))
+	elapsed := time.Since(startedAt)
+	slog.Info(
+		"upload-freeze complete",
+		"stage", "complete",
+		"job_id", resolvedJobID,
+		"parts", len(scannedParts),
+		"uploaded_bytes", uploadedBytes,
+		"elapsed", elapsed,
+		"parts_per_second", countRatePerSecond(len(scannedParts), elapsed),
+		"bytes_per_second", ratePerSecond(uploadedBytes, elapsed),
+	)
 	return nil
+}
+
+func formatDiskPaths(disks []freeze.Disk) string {
+	parts := make([]string, 0, len(disks))
+	for _, disk := range disks {
+		parts = append(parts, disk.Name+"="+disk.Path)
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatPartCountsByDisk(disks []freeze.Disk, parts []freeze.Part) string {
+	counts := make(map[string]int, len(disks))
+	for _, disk := range disks {
+		counts[disk.Name] = 0
+	}
+	for _, part := range parts {
+		counts[part.Disk]++
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, fmt.Sprintf("%s=%d", name, counts[name]))
+	}
+	return strings.Join(out, ",")
+}
+
+func ratePerSecond(bytes uint64, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(bytes) / elapsed.Seconds()
+}
+
+func countRatePerSecond(count int, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(count) / elapsed.Seconds()
 }
 
 func runWorker(ctx context.Context, args []string) error {
@@ -256,6 +397,16 @@ func runWorker(ctx context.Context, args []string) error {
 	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
 		return err
 	}
+	slog.Info(
+		"worker started",
+		"stage", "start",
+		"once", *once,
+		"state_table", *stateTable,
+		"work_dir", *workDir,
+		"start_clickhouse", *startClickHouse,
+		"clickhouse_url", *clickHouseURL,
+	)
+	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
 		Endpoint: *dynamoEndpoint,
@@ -264,11 +415,14 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	resolvedWorkerID, err := resolveWorkerID(*workerID)
 	if err != nil {
 		return err
 	}
+	slog.Info("resolved worker id", "stage", "resolve_worker", "worker_id", resolvedWorkerID)
 
+	slog.Info("detecting worker resource limits", "stage", "configure_insert_settings")
 	workerLimits, err := resources.DetectLimits()
 	if err != nil {
 		return fmt.Errorf("detect worker resource limits: %w", err)
@@ -288,6 +442,7 @@ func runWorker(ctx context.Context, args []string) error {
 
 	var server *chproc.Server
 	if *startClickHouse {
+		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile)
 		server, err = chproc.Start(ctx, chproc.Config{
 			Binary:     *clickHouseBinary,
 			ConfigFile: *clickHouseConfigFile,
@@ -304,6 +459,7 @@ func runWorker(ctx context.Context, args []string) error {
 
 	var recorder metrics.Recorder = metrics.Noop{}
 	if *metricsAddr != "" {
+		slog.Info("starting metrics server", "stage", "start_metrics", "addr", *metricsAddr, "path", *metricsPath)
 		prom := metrics.NewPrometheus()
 		if _, err := metrics.StartServer(ctx, *metricsAddr, *metricsPath, prom.Handler()); err != nil {
 			return fmt.Errorf("start metrics server: %w", err)
@@ -328,6 +484,7 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 
 	for {
+		slog.Info("claiming next ready part", "stage", "claim_work", "worker_id", resolvedWorkerID)
 		part, err := stateStore.ClaimNextReady(ctx, resolvedWorkerID, time.Now().UTC())
 		if err != nil {
 			return err
@@ -337,11 +494,20 @@ func runWorker(ctx context.Context, args []string) error {
 				slog.Info("no ready part available")
 				return nil
 			}
+			slog.Info("no ready part available; sleeping", "stage", "claim_work", "poll_interval", *pollInterval)
 			if err := sleepOrDone(ctx, *pollInterval); err != nil {
 				return err
 			}
 			continue
 		}
+		slog.Info(
+			"claimed ready part",
+			"stage", "claim_work",
+			"job_id", part.JobID,
+			"part_id", part.PartID,
+			"attempt", part.Attempts,
+			"source_key", part.SourceKey,
+		)
 
 		workItem := rewrite.WorkItem{
 			Bucket:    part.Bucket,
@@ -352,14 +518,17 @@ func runWorker(ctx context.Context, args []string) error {
 		}
 		result, err := processor.ProcessPart(ctx, workItem)
 		if err != nil {
+			slog.Info("part processing failed; marking failed", "stage", "mark_failed", "job_id", part.JobID, "part_id", part.PartID, "error", err)
 			if markErr := stateStore.MarkFailed(ctx, *part, resolvedWorkerID, err, time.Now().UTC()); markErr != nil {
 				return fmt.Errorf("process part %s/%s: %w; additionally failed to mark failed: %v", part.JobID, part.PartID, err, markErr)
 			}
 			return err
 		}
+		slog.Info("marking part finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
 		if err := stateStore.MarkFinished(ctx, *part, resolvedWorkerID, result.FinishedKey, time.Now().UTC()); err != nil {
 			return err
 		}
+		slog.Info("part marked finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
 		if *once {
 			return nil
 		}
@@ -397,6 +566,15 @@ func runImportFinished(ctx context.Context, args []string) error {
 		return errors.New("database, table, and job-id are required")
 	}
 
+	slog.Info(
+		"import-finished started",
+		"stage", "start",
+		"job_id", *jobID,
+		"destination_table", chhttp.TableSQL(*database, *table),
+		"work_dir", *workDir,
+		"require_empty", *requireEmpty,
+	)
+	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
 		Endpoint: *dynamoEndpoint,
@@ -405,10 +583,13 @@ func runImportFinished(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("listing finished parts", "stage", "list_finished_parts", "job_id", *jobID)
 	finishedParts, err := stateStore.ListFinishedParts(ctx, *jobID)
 	if err != nil {
 		return err
 	}
+	slog.Info("listed finished parts", "stage", "list_finished_parts", "job_id", *jobID, "finished_parts", len(finishedParts))
 	artifacts := make([]parts.FinishedArtifact, 0, len(finishedParts))
 	partsByID := make(map[string]state.Part, len(finishedParts))
 	for _, part := range finishedParts {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	artifactpkg "github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
@@ -42,6 +43,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	if len(job.Artifacts) == 0 {
 		return fmt.Errorf("no finished artifacts found for job %s", job.JobID)
 	}
+	startedAt := time.Now()
 	artifacts := append([]FinishedArtifact(nil), job.Artifacts...)
 	sort.Slice(artifacts, func(i, j int) bool {
 		return artifacts[i].Key < artifacts[j].Key
@@ -52,15 +54,19 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 		}
 	}
 
+	slog.Info("import job started", "stage", "start_import", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table), "artifacts", len(artifacts), "require_empty", job.RequireEmpty)
+	slog.Info("locating destination table data path", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
 	dataPath, err := i.tableDataPath(ctx, job.Database, job.Table)
 	if err != nil {
 		return err
 	}
+	slog.Info("located destination table data path", "stage", "prepare_destination", "job_id", job.JobID, "data_path", dataPath)
 	detachedPath := filepath.Join(dataPath, "detached")
 	if err := os.MkdirAll(detachedPath, 0o755); err != nil {
 		return err
 	}
 	if job.RequireEmpty {
+		slog.Info("checking destination table is empty", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
 		count, err := i.activePartCount(ctx, job.Database, job.Table)
 		if err != nil {
 			return err
@@ -68,6 +74,9 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 		if count != 0 {
 			return fmt.Errorf("destination table %s already has %d active parts; rerunning import-finished could duplicate data", chhttp.TableSQL(job.Database, job.Table), count)
 		}
+		slog.Info("destination table is empty", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
+	} else {
+		slog.Info("skipping destination empty check", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
 	}
 
 	root := filepath.Join(defaultImportWorkDir(i.WorkDir), job.JobID)
@@ -80,6 +89,17 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	}
 
 	for idx, artifact := range artifacts {
+		artifactStartedAt := time.Now()
+		slog.Info(
+			"importing artifact",
+			"stage", "import_artifact",
+			"job_id", job.JobID,
+			"artifact_index", idx+1,
+			"artifacts_total", len(artifacts),
+			"part_id", artifact.PartID,
+			"bucket", artifact.Bucket,
+			"key", artifact.Key,
+		)
 		if job.MarkImporting != nil {
 			if err := job.MarkImporting(ctx, artifact); err != nil {
 				return err
@@ -98,8 +118,19 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 				return err
 			}
 		}
+		slog.Info(
+			"imported artifact",
+			"stage", "import_artifact",
+			"job_id", job.JobID,
+			"artifact_index", idx+1,
+			"artifacts_total", len(artifacts),
+			"part_id", artifact.PartID,
+			"key", artifact.Key,
+			"elapsed", time.Since(artifactStartedAt),
+		)
 	}
-	slog.Info("import complete", "job_id", job.JobID, "artifacts", len(artifacts))
+	elapsed := time.Since(startedAt)
+	slog.Info("import complete", "stage", "complete", "job_id", job.JobID, "artifacts", len(artifacts), "elapsed", elapsed, "artifacts_per_second", countRatePerSecond(len(artifacts), elapsed))
 	return nil
 }
 
@@ -108,9 +139,17 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 		return err
 	}
 	extractRoot := filepath.Join(workDir, "finished")
+	slog.Info("downloading finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", artifact.Key)
+	downloadStartedAt := time.Now()
 	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, artifact.Key, extractRoot); err != nil {
 		return fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
+	downloadStats, err := fileutil.StatDir(extractRoot)
+	if err != nil {
+		return fmt.Errorf("stat finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
+	}
+	downloadElapsed := time.Since(downloadStartedAt)
+	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
 
 	m, err := artifactpkg.ReadManifest(extractRoot)
 	if err != nil {
@@ -129,6 +168,11 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	for _, part := range m.Output.Parts {
 		src := artifactpkg.FinishedPartPath(extractRoot, part.Name)
 		dst := filepath.Join(detachedPath, part.Name)
+		partStats, err := fileutil.StatDir(src)
+		if err != nil {
+			return fmt.Errorf("stat finished part %s: %w", part.Name, err)
+		}
+		slog.Info("attaching finished part", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "part", part.Name, "partition_id", part.PartitionID, "files", partStats.Files, "bytes", partStats.Bytes)
 		if err := fileutil.CopyDir(src, dst); err != nil {
 			return fmt.Errorf("copy finished part %s to detached: %w", part.Name, err)
 		}
@@ -136,7 +180,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 			return fmt.Errorf("attach finished part %s: %w", part.Name, err)
 		}
 	}
-	slog.Info("imported artifact", "bucket", artifact.Bucket, "key", artifact.Key, "parts", len(m.Output.Parts))
+	slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(m.Output.Parts))
 	return nil
 }
 
@@ -170,4 +214,18 @@ func defaultImportWorkDir(workDir string) string {
 		return "/tmp/partforge-import"
 	}
 	return workDir
+}
+
+func ratePerSecond(bytes uint64, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(bytes) / elapsed.Seconds()
+}
+
+func countRatePerSecond(count int, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(count) / elapsed.Seconds()
 }

@@ -72,6 +72,16 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 		return ProcessResult{}, err
 	}
 
+	startedAt := time.Now()
+	slog.Info(
+		"processing part",
+		"stage", "process_part",
+		"job_id", item.JobID,
+		"part_id", item.PartID,
+		"attempt", item.Attempt,
+		"source_key", item.SourceKey,
+	)
+
 	root := filepath.Join(defaultWorkDir(p.WorkDir), item.JobID, item.PartID)
 	if err := os.RemoveAll(root); err != nil {
 		return ProcessResult{}, err
@@ -82,14 +92,41 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 	}
 
 	sourceRoot := filepath.Join(root, "source")
+	slog.Info("downloading source artifact", "stage", "download_source", "job_id", item.JobID, "part_id", item.PartID, "bucket", item.Bucket, "source_key", item.SourceKey)
+	downloadStartedAt := time.Now()
 	if err := p.S3Copy.DownloadPrefix(ctx, item.Bucket, item.SourceKey, sourceRoot); err != nil {
 		return ProcessResult{}, fmt.Errorf("download source artifact %s: %w", item.SourceKey, err)
 	}
+	sourceStats, err := fileutil.StatDir(sourceRoot)
+	if err != nil {
+		return ProcessResult{}, fmt.Errorf("stat downloaded source artifact %s: %w", item.SourceKey, err)
+	}
+	downloadElapsed := time.Since(downloadStartedAt)
+	slog.Info(
+		"downloaded source artifact",
+		"stage", "download_source",
+		"job_id", item.JobID,
+		"part_id", item.PartID,
+		"files", sourceStats.Files,
+		"bytes", sourceStats.Bytes,
+		"elapsed", downloadElapsed,
+		"bytes_per_second", ratePerSecond(sourceStats.Bytes, downloadElapsed),
+	)
 
 	m, err := artifact.ReadManifest(sourceRoot)
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
 	}
+	slog.Info(
+		"read source manifest",
+		"stage", "read_manifest",
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table),
+		"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+		"part", m.Part.RelativePath,
+		"disk", m.Part.Disk,
+	)
 	if m.JobID != item.JobID || m.PartID != item.PartID {
 		return ProcessResult{}, fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
 	}
@@ -104,11 +141,14 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 	recorder := p.recorder()
 	recorder.ForgeStarted(m)
 	finishedRoot := filepath.Join(root, "finished")
+	slog.Info("rewriting source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID)
+	rewriteStartedAt := time.Now()
 	output, err := p.rewritePart(ctx, m, sourceRoot, finishedRoot)
 	if err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
 	}
+	slog.Info("rewrote source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID, "output_parts", len(output.Parts), "elapsed", time.Since(rewriteStartedAt))
 
 	m.Output = output
 	m.S3.FinishedKey = manifest.FinishedPartAttemptPrefix(m.S3.FinishedKey, item.Attempt, time.Now().UTC())
@@ -116,12 +156,39 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
 	}
+	finishedStats, err := fileutil.StatDir(finishedRoot)
+	if err != nil {
+		recorder.ForgeFailed(m)
+		return ProcessResult{}, fmt.Errorf("stat finished artifact %s: %w", m.S3.FinishedKey, err)
+	}
+	slog.Info(
+		"uploading finished artifact",
+		"stage", "upload_finished",
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"finished_key", m.S3.FinishedKey,
+		"files", finishedStats.Files,
+		"bytes", finishedStats.Bytes,
+	)
+	uploadStartedAt := time.Now()
 	if err := p.S3Copy.UploadDir(ctx, finishedRoot, m.S3.Bucket, m.S3.FinishedKey); err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
 	}
+	uploadElapsed := time.Since(uploadStartedAt)
+	slog.Info(
+		"uploaded finished artifact",
+		"stage", "upload_finished",
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"finished_key", m.S3.FinishedKey,
+		"files", finishedStats.Files,
+		"bytes", finishedStats.Bytes,
+		"elapsed", uploadElapsed,
+		"bytes_per_second", ratePerSecond(finishedStats.Bytes, uploadElapsed),
+	)
 	recorder.ForgeCompleted(m)
-	slog.Info("processed part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey)
+	slog.Info("processed part", "stage", "complete_part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey, "output_parts", len(output.Parts), "elapsed", time.Since(startedAt))
 	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
 }
 
@@ -138,6 +205,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return manifest.Output{}, fmt.Errorf("normalize destination DDL: %w", err)
 	}
 
+	slog.Info("preparing worker databases", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
@@ -157,12 +225,15 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			return manifest.Output{}, fmt.Errorf("create worker database %s: %w", database, err)
 		}
 	}
+	slog.Info("creating worker source table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, sourceDDL); err != nil {
 		return manifest.Output{}, fmt.Errorf("create source table: %w", err)
 	}
+	slog.Info("creating worker destination table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
 		return manifest.Output{}, fmt.Errorf("create destination table: %w", err)
 	}
+	slog.Info("created worker tables", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
@@ -175,6 +246,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := fileutil.CopyDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
 		return manifest.Output{}, fmt.Errorf("copy source part to detached: %w", err)
 	}
+	slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", m.Part.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
 		return manifest.Output{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
 	}
@@ -186,13 +258,19 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{SourceActivePartStats: &sourceStats}); err != nil {
 		return manifest.Output{}, err
 	}
+	slog.Info("attached source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "active_parts", sourceStats.Count, "active_rows", sourceStats.Rows, "active_bytes", sourceStats.Bytes)
 
+	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
+	insertStartedAt := time.Now()
 	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
 		return manifest.Output{}, fmt.Errorf("run insert-select: %w", err)
 	}
+	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
+	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table); err != nil {
 		return manifest.Output{}, err
 	}
+	slog.Info("destination merges complete", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID)
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return manifest.Output{}, fmt.Errorf("measure destination active parts: %w", err)
@@ -201,14 +279,17 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
 		return manifest.Output{}, err
 	}
+	slog.Info("measured destination parts", "stage", "measure_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes", destStats.Bytes)
 
 	activeParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return manifest.Output{}, err
 	}
+	slog.Info("detaching produced destination parts", "stage", "detach_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "parts", len(activeParts))
 	outputParts := make([]manifest.OutputPart, 0, len(activeParts))
 	for _, part := range activeParts {
 		outputParts = append(outputParts, manifest.OutputPart{Name: part.Name, PartitionID: part.PartitionID})
+		slog.Info("detaching produced destination part", "stage", "detach_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "part", part.Name, "partition_id", part.PartitionID)
 		if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" DETACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
 			return manifest.Output{}, fmt.Errorf("detach destination part %s: %w", part.Name, err)
 		}
@@ -450,6 +531,13 @@ func sleepOrDone(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func ratePerSecond(bytes uint64, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(bytes) / elapsed.Seconds()
 }
 
 func (p Processor) tableDataPath(ctx context.Context, database, table string) (string, error) {

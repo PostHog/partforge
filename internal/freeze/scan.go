@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -68,13 +69,16 @@ func ScanDisks(disks []Disk, freezeName string) ([]Part, error) {
 	for _, disk := range disks {
 		root := filepath.Join(disk.Path, "shadow", freezeName)
 		roots = append(roots, root)
+		slog.Info("scanning freeze root", "stage", "scan_freeze", "disk", disk.Name, "root", root)
 		diskParts, err := Scan(disk.Name, root)
 		if errors.Is(err, os.ErrNotExist) {
+			slog.Info("freeze root missing; skipping disk", "stage", "scan_freeze", "disk", disk.Name, "root", root)
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
+		slog.Info("scanned freeze root", "stage", "scan_freeze", "disk", disk.Name, "root", root, "parts", len(diskParts))
 		parts = append(parts, diskParts...)
 	}
 	if len(parts) == 0 {
