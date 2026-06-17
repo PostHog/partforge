@@ -1,6 +1,7 @@
 package chproc
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -37,6 +38,13 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+	for _, path := range []string{"data", "tmp", "user_files", "format_schemas", "caches", "filesystem_caches", "disks", "access"} {
+		if info, err := os.Stat(filepath.Join(root, path)); err != nil {
+			t.Fatalf("stat generated path %s: %v", path, err)
+		} else if !info.IsDir() {
+			t.Fatalf("generated path %s is not a directory", path)
+		}
 	}
 }
 

@@ -93,20 +93,30 @@ func storageConfigArgs(dataDir string) ([]string, error) {
 		return nil, fmt.Errorf("resolve clickhouse data dir %s: %w", dataDir, err)
 	}
 	root = filepath.Clean(root)
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, fmt.Errorf("create clickhouse data dir %s: %w", root, err)
+	paths := []struct {
+		arg  string
+		path string
+	}{
+		{"--path=", filepath.Join(root, "data")},
+		{"--tmp_path=", filepath.Join(root, "tmp")},
+		{"--user_files_path=", filepath.Join(root, "user_files")},
+		{"--format_schema_path=", filepath.Join(root, "format_schemas")},
+		{"--custom_cached_disks_base_directory=", filepath.Join(root, "caches")},
+		{"--filesystem_caches_path=", filepath.Join(root, "filesystem_caches")},
+		{"--custom_local_disks_base_directory=", filepath.Join(root, "disks")},
+		{"--user_directories.local_directory.path=", filepath.Join(root, "access")},
+	}
+	for _, p := range paths {
+		if err := os.MkdirAll(p.path, 0o755); err != nil {
+			return nil, fmt.Errorf("create clickhouse path %s: %w", p.path, err)
+		}
 	}
 
-	return []string{
-		"--path=" + withTrailingSeparator(filepath.Join(root, "data")),
-		"--tmp_path=" + withTrailingSeparator(filepath.Join(root, "tmp")),
-		"--user_files_path=" + withTrailingSeparator(filepath.Join(root, "user_files")),
-		"--format_schema_path=" + withTrailingSeparator(filepath.Join(root, "format_schemas")),
-		"--custom_cached_disks_base_directory=" + withTrailingSeparator(filepath.Join(root, "caches")),
-		"--filesystem_caches_path=" + withTrailingSeparator(filepath.Join(root, "filesystem_caches")),
-		"--custom_local_disks_base_directory=" + withTrailingSeparator(filepath.Join(root, "disks")),
-		"--user_directories.local_directory.path=" + withTrailingSeparator(filepath.Join(root, "access")),
-	}, nil
+	args := make([]string, 0, len(paths))
+	for _, p := range paths {
+		args = append(args, p.arg+withTrailingSeparator(p.path))
+	}
+	return args, nil
 }
 
 func withTrailingSeparator(path string) string {

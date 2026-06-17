@@ -30,6 +30,6 @@ RUN apt-get update \
 COPY --from=build /out/partforge /usr/local/bin/partforge
 COPY --from=build /out/s5cmd /usr/local/bin/s5cmd
 RUN chmod 0755 /usr/local/bin/partforge /usr/local/bin/s5cmd
-USER clickhouse
+USER root
 ENTRYPOINT ["/usr/local/bin/partforge"]
 CMD ["worker"]

@@ -67,7 +67,7 @@ ClickHouse connection settings are resolved in order: CLI flags, JSON config, `/
 
 ## Worker Container
 
-The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
+The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker runs as root so it can create and write the resolved worker work directory on root-owned host mounts. The worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
 
 Large worker data should live on the same local filesystem. In production, mount local NVMe at `/mnt/nvme` and set the worker `-work-dir` under that mount, for example `/mnt/nvme/partforge-work`. When the worker starts ClickHouse, PartForge automatically derives ClickHouse's data-heavy paths from that work directory under `/mnt/nvme/partforge-work/clickhouse`; no custom ClickHouse config file is needed for the normal worker case. The worker moves source parts into ClickHouse `detached` and moves produced destination parts into the finished artifact directory; it intentionally fails if those moves cross filesystems. This avoids slow cross-partition copies and reduces peak disk usage.
 
