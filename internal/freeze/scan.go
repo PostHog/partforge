@@ -2,6 +2,7 @@ package freeze
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func ScanDisks(disks []Disk, freezeName string) ([]Part, error) {
 		root := filepath.Join(disk.Path, "shadow", freezeName)
 		roots = append(roots, root)
 		diskParts, err := Scan(disk.Name, root)
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {

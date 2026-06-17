@@ -63,6 +63,33 @@ func TestScanDisksFindsPartsOnMultipleDisks(t *testing.T) {
 	}
 }
 
+func TestScanDisksSkipsMissingFreezeRoot(t *testing.T) {
+	root := t.TempDir()
+	part := filepath.Join(root, "default", "shadow", "freeze-1", "store", "abc", "all_1_1_0")
+	if err := os.MkdirAll(part, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"checksums.txt", "columns.txt"} {
+		if err := os.WriteFile(filepath.Join(part, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	parts, err := ScanDisks([]Disk{
+		{Name: "default", Path: filepath.Join(root, "default")},
+		{Name: "lvm", Path: filepath.Join(root, "lvm")},
+	}, "freeze-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("got %d parts", len(parts))
+	}
+	if parts[0].Disk != "default" {
+		t.Fatalf("unexpected disk %q", parts[0].Disk)
+	}
+}
+
 func TestValidateLocalDiskRejectsS3(t *testing.T) {
 	err := validateLocalDisk(Disk{Name: "remote", Path: "/var/lib/clickhouse/disks/remote", Type: "s3"})
 	if err == nil {
