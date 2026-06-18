@@ -26,6 +26,23 @@ import (
 
 const DefaultMergeTimeout = 2 * time.Minute
 
+const (
+	stageProcessPart             = "process_part"
+	stagePrepareWorkDir          = "prepare_work_dir"
+	stageDownloadSource          = "download_source"
+	stageReadManifest            = "read_manifest"
+	stagePrepareWorkerTables     = "prepare_worker_tables"
+	stageAttachSourcePart        = "attach_source_part"
+	stageInsertSelect            = "insert_select"
+	stageWaitMerges              = "wait_merges"
+	stageMeasureDestinationParts = "measure_destination_parts"
+	stageFreezeDestinationParts  = "freeze_destination_parts"
+	stageArchiveFinishedParts    = "archive_finished_parts"
+	stageDeleteFinishedArtifact  = "delete_finished_artifact"
+	stageUploadFinishedTarballs  = "upload_finished_tarballs"
+	stageCompletePart            = "complete_part"
+)
+
 type Processor struct {
 	S3Copy           s3copy.Copier
 	ClickHouse       chhttp.Client
@@ -43,6 +60,15 @@ type ProgressSnapshot struct {
 	QueryProgress              *metrics.QueryProgress
 	SourceActivePartStats      *metrics.PartStats
 	DestinationActivePartStats *metrics.PartStats
+	StageProgress              *StageProgress
+}
+
+type StageProgress struct {
+	Stage                   string
+	StageStartedAt          time.Time
+	StageElapsed            time.Duration
+	TotalElapsed            time.Duration
+	CompletedStageDurations map[string]time.Duration
 }
 
 type WorkItem struct {
@@ -72,6 +98,76 @@ type workerTableInfo struct {
 	Engine   string
 }
 
+type rewriteStageTracker struct {
+	mu             sync.Mutex
+	reportMu       sync.Mutex
+	startedAt      time.Time
+	stage          string
+	stageStartedAt time.Time
+	completed      map[string]time.Duration
+}
+
+func newRewriteStageTracker(startedAt time.Time, stage string) *rewriteStageTracker {
+	return &rewriteStageTracker{
+		startedAt:      startedAt,
+		stage:          stage,
+		stageStartedAt: startedAt,
+		completed:      map[string]time.Duration{},
+	}
+}
+
+func (t *rewriteStageTracker) Start(stage string, now time.Time) StageProgress {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.startLocked(stage, now)
+	return t.snapshotLocked(now)
+}
+
+func (t *rewriteStageTracker) Complete(stage string, now time.Time) StageProgress {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.startLocked(stage, now)
+	return t.snapshotLocked(now)
+}
+
+func (t *rewriteStageTracker) Snapshot(now time.Time) StageProgress {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.snapshotLocked(now)
+}
+
+func (t *rewriteStageTracker) startLocked(stage string, now time.Time) {
+	if stage == "" || stage == t.stage {
+		return
+	}
+	if t.stage != "" && !t.stageStartedAt.IsZero() {
+		t.completed[t.stage] += nonNegativeDuration(now.Sub(t.stageStartedAt))
+	}
+	t.stage = stage
+	t.stageStartedAt = now
+}
+
+func (t *rewriteStageTracker) snapshotLocked(now time.Time) StageProgress {
+	completed := make(map[string]time.Duration, len(t.completed))
+	for stage, duration := range t.completed {
+		completed[stage] = duration
+	}
+	return StageProgress{
+		Stage:                   t.stage,
+		StageStartedAt:          t.stageStartedAt,
+		StageElapsed:            nonNegativeDuration(now.Sub(t.stageStartedAt)),
+		TotalElapsed:            nonNegativeDuration(now.Sub(t.startedAt)),
+		CompletedStageDurations: completed,
+	}
+}
+
+func nonNegativeDuration(duration time.Duration) time.Duration {
+	if duration < 0 {
+		return 0
+	}
+	return duration
+}
+
 func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result ProcessResult, err error) {
 	if item.Bucket == "" || item.SourceKey == "" || item.JobID == "" || item.PartID == "" {
 		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, job_id, or part_id")
@@ -96,7 +192,9 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"source_key", item.SourceKey,
 	)
 
-	heartbeat, err := p.startProgressHeartbeat(ctx, manifest.Manifest{JobID: item.JobID, PartID: item.PartID})
+	progressManifest := manifest.Manifest{JobID: item.JobID, PartID: item.PartID}
+	stageTracker := newRewriteStageTracker(startedAt, stageProcessPart)
+	heartbeat, err := p.startProgressHeartbeat(ctx, progressManifest, stageTracker)
 	if err != nil {
 		return ProcessResult{}, err
 	}
@@ -107,6 +205,9 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		}
 	}()
 
+	if err := p.reportStageProgress(ctx, progressManifest, stageTracker, stagePrepareWorkDir); err != nil {
+		return ProcessResult{}, err
+	}
 	root := filepath.Join(defaultWorkDir(p.WorkDir), item.JobID, item.PartID)
 	if err := os.RemoveAll(root); err != nil {
 		return ProcessResult{}, err
@@ -117,6 +218,9 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	}
 
 	sourceRoot := filepath.Join(root, "source")
+	if err := p.reportStageProgress(ctx, progressManifest, stageTracker, stageDownloadSource); err != nil {
+		return ProcessResult{}, err
+	}
 	slog.Info("downloading source artifact", "stage", "download_source", "job_id", item.JobID, "part_id", item.PartID, "bucket", item.Bucket, "source_key", item.SourceKey)
 	downloadStartedAt := time.Now()
 	if err := p.S3Copy.DownloadPrefix(ctx, item.Bucket, item.SourceKey, sourceRoot); err != nil {
@@ -138,6 +242,9 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"bytes_per_second", ratePerSecond(sourceStats.Bytes, downloadElapsed),
 	)
 
+	if err := p.reportStageProgress(ctx, progressManifest, stageTracker, stageReadManifest); err != nil {
+		return ProcessResult{}, err
+	}
 	m, err := artifact.ReadManifest(sourceRoot)
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
@@ -165,9 +272,12 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 
 	recorder := p.recorder()
 	recorder.ForgeStarted(m)
+	if err := p.reportStageProgress(ctx, m, stageTracker, stagePrepareWorkerTables); err != nil {
+		return ProcessResult{}, err
+	}
 	slog.Info("rewriting source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID)
 	rewriteStartedAt := time.Now()
-	rewriteResult, err := p.rewritePart(ctx, m, sourceRoot)
+	rewriteResult, err := p.rewritePart(ctx, m, sourceRoot, stageTracker)
 	if err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
@@ -184,7 +294,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	)
 	uploadStartedAt := time.Now()
 	finishedTarDir := filepath.Join(root, "finished-tars")
-	if err := p.uploadFinishedArtifact(ctx, m.S3.Bucket, m.S3.FinishedKey, finishedTarDir, rewriteResult.FrozenPartGlobs); err != nil {
+	if err := p.uploadFinishedArtifact(ctx, m, finishedTarDir, rewriteResult.FrozenPartGlobs, stageTracker); err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
 	}
@@ -199,11 +309,14 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"elapsed", uploadElapsed,
 	)
 	recorder.ForgeCompleted(m)
+	if err := p.reportStageComplete(ctx, m, stageTracker, stageCompletePart); err != nil {
+		return ProcessResult{}, err
+	}
 	slog.Info("processed part", "stage", "complete_part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey, "frozen_part_globs", len(rewriteResult.FrozenPartGlobs), "elapsed", time.Since(startedAt))
 	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
 }
 
-func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot string) (result rewriteResult, err error) {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot string, stageTracker *rewriteStageTracker) (result rewriteResult, err error) {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
 		return rewriteResult{}, fmt.Errorf("source and destination table names must differ inside the worker")
 	}
@@ -218,6 +331,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		}
 	}()
 
+	if err := p.reportStageProgress(ctx, m, stageTracker, stagePrepareWorkerTables); err != nil {
+		return rewriteResult{}, err
+	}
 	slog.Info("preparing worker databases", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
 	for _, database := range databases {
@@ -246,6 +362,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := fileutil.MoveDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
 		return rewriteResult{}, fmt.Errorf("move source part to detached: %w", err)
 	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageAttachSourcePart); err != nil {
+		return rewriteResult{}, err
+	}
 	slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", m.Part.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
 		return rewriteResult{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
@@ -260,12 +379,18 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	slog.Info("attached source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "active_parts", sourceStats.Count, "active_rows", sourceStats.Rows, "active_bytes", sourceStats.Bytes)
 
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageInsertSelect); err != nil {
+		return rewriteResult{}, err
+	}
 	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
 	insertStartedAt := time.Now()
 	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
 		return rewriteResult{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
+		return rewriteResult{}, err
+	}
 	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	mergeWait, err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
@@ -283,6 +408,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"active_merges", mergeWait.ActiveMerges,
 		)
 	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
+		return rewriteResult{}, err
+	}
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return rewriteResult{}, fmt.Errorf("measure destination active parts: %w", err)
@@ -295,6 +423,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 
 	if destStats.Count == 0 {
 		return result, nil
+	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageFreezeDestinationParts); err != nil {
+		return rewriteResult{}, err
 	}
 	slog.Info("freezing produced destination parts", "stage", "freeze_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count)
 	freezeName := workerFreezeName(m, time.Now().UTC())
@@ -435,7 +566,7 @@ type progressHeartbeat struct {
 	err error
 }
 
-func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manifest) (*progressHeartbeat, error) {
+func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker) (*progressHeartbeat, error) {
 	heartbeat := &progressHeartbeat{ctx: ctx}
 	if p.ReportProgress == nil || p.ProgressInterval <= 0 {
 		return heartbeat, nil
@@ -443,7 +574,7 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 
 	heartbeat.ctx, heartbeat.cancel = context.WithCancel(ctx)
 	heartbeat.done = make(chan struct{})
-	if err := p.reportProgress(heartbeat.ctx, m, ProgressSnapshot{}); err != nil {
+	if err := p.reportStageSnapshot(heartbeat.ctx, m, tracker); err != nil {
 		heartbeat.cancel()
 		return heartbeat, err
 	}
@@ -455,7 +586,7 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 		for {
 			select {
 			case <-ticker.C:
-				if err := p.reportProgress(heartbeat.ctx, m, ProgressSnapshot{}); err != nil {
+				if err := p.reportStageSnapshot(heartbeat.ctx, m, tracker); err != nil {
 					heartbeat.setErr(err)
 					return
 				}
@@ -465,6 +596,41 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 		}
 	}()
 	return heartbeat, nil
+}
+
+func (p Processor) reportStageProgress(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker, stage string) error {
+	if tracker == nil {
+		return nil
+	}
+	tracker.reportMu.Lock()
+	defer tracker.reportMu.Unlock()
+
+	now := time.Now()
+	progress := tracker.Start(stage, now)
+	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
+}
+
+func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker, stage string) error {
+	if tracker == nil {
+		return nil
+	}
+	tracker.reportMu.Lock()
+	defer tracker.reportMu.Unlock()
+
+	now := time.Now()
+	progress := tracker.Complete(stage, now)
+	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
+}
+
+func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker) error {
+	if tracker == nil {
+		return p.reportProgress(ctx, m, ProgressSnapshot{})
+	}
+	tracker.reportMu.Lock()
+	defer tracker.reportMu.Unlock()
+
+	progress := tracker.Snapshot(time.Now())
+	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
 }
 
 func (h *progressHeartbeat) Context() context.Context {
@@ -898,7 +1064,9 @@ func frozenPartUploadGlobs(disks []freeze.Disk, freezeName string) ([]frozenPart
 	return globs, nil
 }
 
-func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedKey, tarDir string, frozenPartGlobs []frozenPartGlob) error {
+func (p Processor) uploadFinishedArtifact(ctx context.Context, m manifest.Manifest, tarDir string, frozenPartGlobs []frozenPartGlob, stageTracker *rewriteStageTracker) error {
+	bucket := m.S3.Bucket
+	finishedKey := m.S3.FinishedKey
 	if len(frozenPartGlobs) == 0 {
 		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
 	}
@@ -906,14 +1074,23 @@ func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedK
 	if err != nil {
 		return err
 	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageArchiveFinishedParts); err != nil {
+		return err
+	}
 	slog.Info("creating finished artifact tarballs", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey, "tar_dir", tarDir, "parts", len(partDirs))
 	tarFiles, err := createFinishedPartTars(ctx, tarDir, partDirs)
 	if err != nil {
 		return fmt.Errorf("create finished artifact tarballs in %s: %w", tarDir, err)
 	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageDeleteFinishedArtifact); err != nil {
+		return err
+	}
 	slog.Info("removing existing finished artifact prefix", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey)
 	if err := p.S3Copy.DeletePrefixIfExists(ctx, bucket, finishedKey); err != nil {
 		return fmt.Errorf("delete existing finished artifact s3://%s/%s: %w", bucket, finishedKey, err)
+	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageUploadFinishedTarballs); err != nil {
+		return err
 	}
 	slog.Info("uploading finished artifact tarballs", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey, "tar_dir", tarDir, "tarballs", len(tarFiles))
 	if err := p.S3Copy.UploadDir(ctx, tarDir, bucket, finishedKey); err != nil {

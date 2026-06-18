@@ -193,11 +193,21 @@ func TestStateProgress(t *testing.T) {
 	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, WrittenRows: 3, WrittenBytes: 4}
 	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
 	dest := metrics.PartStats{Count: 8, Rows: 9, Bytes: 10}
+	stageStartedAt := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 
 	progress := stateProgress(rewrite.ProgressSnapshot{
 		QueryProgress:              &query,
 		SourceActivePartStats:      &source,
 		DestinationActivePartStats: &dest,
+		StageProgress: &rewrite.StageProgress{
+			Stage:          "download_source",
+			StageStartedAt: stageStartedAt,
+			StageElapsed:   1500 * time.Millisecond,
+			TotalElapsed:   2500 * time.Millisecond,
+			CompletedStageDurations: map[string]time.Duration{
+				"process_part": time.Second,
+			},
+		},
 	})
 
 	if progress.QueryProgress == nil || progress.QueryProgress.WrittenBytes != 4 {
@@ -208,6 +218,28 @@ func TestStateProgress(t *testing.T) {
 	}
 	if progress.DestinationActivePartStats == nil || progress.DestinationActivePartStats.Bytes != 10 {
 		t.Fatalf("destination stats = %+v", progress.DestinationActivePartStats)
+	}
+	if progress.StageProgress == nil || progress.StageProgress.Stage != "download_source" {
+		t.Fatalf("stage progress = %+v", progress.StageProgress)
+	}
+	if progress.StageProgress.StageStartedAt != stageStartedAt {
+		t.Fatalf("stage started at = %s, want %s", progress.StageProgress.StageStartedAt, stageStartedAt)
+	}
+	if progress.StageProgress.StageElapsedMs != 1500 || progress.StageProgress.TotalElapsedMs != 2500 {
+		t.Fatalf("stage durations = %+v", progress.StageProgress)
+	}
+	if progress.StageProgress.CompletedStageDurationsMs["process_part"] != 1000 {
+		t.Fatalf("completed stage durations = %+v", progress.StageProgress.CompletedStageDurationsMs)
+	}
+}
+
+func TestFormatStageDurations(t *testing.T) {
+	got := formatStageDurations(map[string]int64{
+		"b": 2000,
+		"a": 1500,
+	})
+	if got != "a=1.5s,b=2s" {
+		t.Fatalf("formatStageDurations = %q", got)
 	}
 }
 

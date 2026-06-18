@@ -1024,6 +1024,7 @@ func runJobStatus(ctx context.Context, args []string) error {
 		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 		showParts      = fs.Bool("parts", false, "include per-part state rows")
+		showDetails    = fs.Bool("details", false, "include per-part rewrite stage timing details")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1050,7 +1051,7 @@ func runJobStatus(ctx context.Context, args []string) error {
 	summary := summarizeJob(*jobID, jobParts)
 	if *jsonOutput {
 		out := jobStatusOutput{Summary: summary}
-		if *showParts {
+		if *showParts || *showDetails {
 			out.Parts = jobParts
 		}
 		return writeJSON(os.Stdout, out)
@@ -1058,6 +1059,9 @@ func runJobStatus(ctx context.Context, args []string) error {
 	printJobSummary(os.Stdout, summary)
 	if *showParts {
 		printPartRows(os.Stdout, jobParts)
+	}
+	if *showDetails {
+		printPartDetails(os.Stdout, jobParts)
 	}
 	return nil
 }
@@ -1554,6 +1558,19 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 			Bytes: snapshot.DestinationActivePartStats.Bytes,
 		}
 	}
+	if snapshot.StageProgress != nil {
+		completed := make(map[string]int64, len(snapshot.StageProgress.CompletedStageDurations))
+		for stage, duration := range snapshot.StageProgress.CompletedStageDurations {
+			completed[stage] = duration.Milliseconds()
+		}
+		progress.StageProgress = &state.RewriteStageProgress{
+			Stage:                     snapshot.StageProgress.Stage,
+			StageStartedAt:            snapshot.StageProgress.StageStartedAt,
+			StageElapsedMs:            snapshot.StageProgress.StageElapsed.Milliseconds(),
+			TotalElapsedMs:            snapshot.StageProgress.TotalElapsed.Milliseconds(),
+			CompletedStageDurationsMs: completed,
+		}
+	}
 	return progress
 }
 
@@ -1713,6 +1730,63 @@ func printPartRows(out *os.File, parts []state.Part) {
 		)
 	}
 	_ = tw.Flush()
+}
+
+func printPartDetails(out *os.File, parts []state.Part) {
+	if len(parts) == 0 {
+		return
+	}
+	fmt.Fprintln(out, "\nPART DETAILS")
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tSTAGE\tSTAGE_ELAPSED\tTOTAL_ELAPSED\tSTAGE_STARTED\tPROGRESS_AT\tUPDATED_AT\tSTAGE_DURATIONS\tERROR")
+	for _, part := range parts {
+		stageElapsed := ""
+		totalElapsed := ""
+		if part.RewriteStage != "" {
+			stageElapsed = formatDurationMs(part.RewriteStageElapsedMs)
+			totalElapsed = formatDurationMs(part.RewriteTotalElapsedMs)
+		}
+		fmt.Fprintf(
+			tw,
+			"%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			part.PartID,
+			part.Status,
+			part.Attempts,
+			part.WorkerID,
+			part.RewriteStage,
+			stageElapsed,
+			totalElapsed,
+			part.RewriteStageStartedAt,
+			part.ProgressUpdatedAt,
+			part.UpdatedAt,
+			formatStageDurations(part.RewriteStageDurationsMs),
+			part.Error,
+		)
+	}
+	_ = tw.Flush()
+}
+
+func formatStageDurations(durations map[string]int64) string {
+	if len(durations) == 0 {
+		return ""
+	}
+	stages := make([]string, 0, len(durations))
+	for stage := range durations {
+		stages = append(stages, stage)
+	}
+	sort.Strings(stages)
+	parts := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		parts = append(parts, stage+"="+formatDurationMs(durations[stage]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatDurationMs(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	return (time.Duration(ms) * time.Millisecond).String()
 }
 
 type retryPartSelection struct {

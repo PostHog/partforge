@@ -213,7 +213,10 @@ func TestProgressHeartbeatReportsImmediatelyAndOnInterval(t *testing.T) {
 		ProgressInterval: time.Millisecond,
 		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
 			if snapshot.QueryProgress != nil || snapshot.SourceActivePartStats != nil || snapshot.DestinationActivePartStats != nil {
-				t.Errorf("heartbeat snapshot = %+v, want empty", snapshot)
+				t.Errorf("heartbeat snapshot = %+v, want only stage progress", snapshot)
+			}
+			if snapshot.StageProgress == nil || snapshot.StageProgress.Stage != stageProcessPart {
+				t.Errorf("stage progress = %+v, want %s", snapshot.StageProgress, stageProcessPart)
 			}
 			select {
 			case reports <- m:
@@ -223,7 +226,8 @@ func TestProgressHeartbeatReportsImmediatelyAndOnInterval(t *testing.T) {
 		},
 	}
 
-	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,6 +249,35 @@ func TestProgressHeartbeatReportsImmediatelyAndOnInterval(t *testing.T) {
 	}
 }
 
+func TestRewriteStageTrackerDurations(t *testing.T) {
+	started := time.Unix(100, 0)
+	tracker := newRewriteStageTracker(started, stageProcessPart)
+
+	progress := tracker.Start(stageDownloadSource, started.Add(2*time.Second))
+	if progress.Stage != stageDownloadSource {
+		t.Fatalf("stage = %s, want %s", progress.Stage, stageDownloadSource)
+	}
+	if got := progress.CompletedStageDurations[stageProcessPart]; got != 2*time.Second {
+		t.Fatalf("process_part duration = %s, want 2s", got)
+	}
+
+	progress = tracker.Snapshot(started.Add(5 * time.Second))
+	if progress.StageElapsed != 3*time.Second {
+		t.Fatalf("stage elapsed = %s, want 3s", progress.StageElapsed)
+	}
+	if progress.TotalElapsed != 5*time.Second {
+		t.Fatalf("total elapsed = %s, want 5s", progress.TotalElapsed)
+	}
+
+	progress = tracker.Complete(stageCompletePart, started.Add(7*time.Second))
+	if progress.Stage != stageCompletePart {
+		t.Fatalf("stage = %s, want %s", progress.Stage, stageCompletePart)
+	}
+	if got := progress.CompletedStageDurations[stageDownloadSource]; got != 5*time.Second {
+		t.Fatalf("download_source duration = %s, want 5s", got)
+	}
+}
+
 func TestProgressHeartbeatDisabled(t *testing.T) {
 	called := false
 	processor := Processor{
@@ -255,7 +288,7 @@ func TestProgressHeartbeatDisabled(t *testing.T) {
 		},
 	}
 
-	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +314,8 @@ func TestProgressHeartbeatReportFailureCancelsContext(t *testing.T) {
 		},
 	}
 
-	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,9 +372,16 @@ func TestUploadFinishedArtifactReplacesStablePartPrefixWithTarballs(t *testing.T
 
 	err := (Processor{
 		S3Copy: s3copy.Copier{Binary: binary},
-	}).uploadFinishedArtifact(context.Background(), "bucket", finishedKey, tarDir, []frozenPartGlob{
+	}).uploadFinishedArtifact(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		S3: manifest.S3Refs{
+			Bucket:      "bucket",
+			FinishedKey: finishedKey,
+		},
+	}, tarDir, []frozenPartGlob{
 		{Disk: "default", Glob: frozenGlob},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +424,14 @@ func TestUploadFinishedArtifactReplacesStablePartPrefixWithTarballs(t *testing.T
 }
 
 func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
-	err := (Processor{}).uploadFinishedArtifact(context.Background(), "bucket", "partforge/jobs/job-1/finished/part-1", filepath.Join(t.TempDir(), "finished-tars"), nil)
+	err := (Processor{}).uploadFinishedArtifact(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		S3: manifest.S3Refs{
+			Bucket:      "bucket",
+			FinishedKey: "partforge/jobs/job-1/finished/part-1",
+		},
+	}, filepath.Join(t.TempDir(), "finished-tars"), nil, nil)
 	if err == nil {
 		t.Fatal("expected missing frozen part globs error")
 	}

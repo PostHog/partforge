@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,17 +65,22 @@ type Part struct {
 	Attempts    int    `dynamodbav:"attempts"`
 	Error       string `dynamodbav:"error,omitempty"`
 
-	ProgressUpdatedAt          string `dynamodbav:"progress_updated_at,omitempty"`
-	ReadRows                   uint64 `dynamodbav:"read_rows,omitempty"`
-	ReadBytes                  uint64 `dynamodbav:"read_bytes,omitempty"`
-	WrittenRows                uint64 `dynamodbav:"written_rows,omitempty"`
-	WrittenBytes               uint64 `dynamodbav:"written_bytes,omitempty"`
-	SourceActivePartCount      uint64 `dynamodbav:"source_active_part_count,omitempty"`
-	SourceActivePartRows       uint64 `dynamodbav:"source_active_part_rows,omitempty"`
-	SourceActivePartBytes      uint64 `dynamodbav:"source_active_part_bytes,omitempty"`
-	DestinationActivePartCount uint64 `dynamodbav:"destination_active_part_count,omitempty"`
-	DestinationActivePartRows  uint64 `dynamodbav:"destination_active_part_rows,omitempty"`
-	DestinationActivePartBytes uint64 `dynamodbav:"destination_active_part_bytes,omitempty"`
+	ProgressUpdatedAt          string           `dynamodbav:"progress_updated_at,omitempty"`
+	ReadRows                   uint64           `dynamodbav:"read_rows,omitempty"`
+	ReadBytes                  uint64           `dynamodbav:"read_bytes,omitempty"`
+	WrittenRows                uint64           `dynamodbav:"written_rows,omitempty"`
+	WrittenBytes               uint64           `dynamodbav:"written_bytes,omitempty"`
+	SourceActivePartCount      uint64           `dynamodbav:"source_active_part_count,omitempty"`
+	SourceActivePartRows       uint64           `dynamodbav:"source_active_part_rows,omitempty"`
+	SourceActivePartBytes      uint64           `dynamodbav:"source_active_part_bytes,omitempty"`
+	DestinationActivePartCount uint64           `dynamodbav:"destination_active_part_count,omitempty"`
+	DestinationActivePartRows  uint64           `dynamodbav:"destination_active_part_rows,omitempty"`
+	DestinationActivePartBytes uint64           `dynamodbav:"destination_active_part_bytes,omitempty"`
+	RewriteStage               string           `dynamodbav:"rewrite_stage,omitempty"`
+	RewriteStageStartedAt      string           `dynamodbav:"rewrite_stage_started_at,omitempty"`
+	RewriteStageElapsedMs      int64            `dynamodbav:"rewrite_stage_elapsed_ms,omitempty"`
+	RewriteTotalElapsedMs      int64            `dynamodbav:"rewrite_total_elapsed_ms,omitempty"`
+	RewriteStageDurationsMs    map[string]int64 `dynamodbav:"rewrite_stage_durations_ms,omitempty"`
 }
 
 type QueryProgress struct {
@@ -94,6 +100,15 @@ type RewriteProgress struct {
 	QueryProgress              *QueryProgress
 	SourceActivePartStats      *PartStats
 	DestinationActivePartStats *PartStats
+	StageProgress              *RewriteStageProgress
+}
+
+type RewriteStageProgress struct {
+	Stage                     string
+	StageStartedAt            time.Time
+	StageElapsedMs            int64
+	TotalElapsedMs            int64
+	CompletedStageDurationsMs map[string]int64
 }
 
 func New(ctx context.Context, cfg Config) (*Store, error) {
@@ -354,6 +369,20 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 		values[":destination_active_part_count"] = uintAttr(progress.DestinationActivePartStats.Count)
 		values[":destination_active_part_rows"] = uintAttr(progress.DestinationActivePartStats.Rows)
 		values[":destination_active_part_bytes"] = uintAttr(progress.DestinationActivePartStats.Bytes)
+	}
+	if progress.StageProgress != nil {
+		set = append(set,
+			"rewrite_stage = :rewrite_stage",
+			"rewrite_stage_started_at = :rewrite_stage_started_at",
+			"rewrite_stage_elapsed_ms = :rewrite_stage_elapsed_ms",
+			"rewrite_total_elapsed_ms = :rewrite_total_elapsed_ms",
+			"rewrite_stage_durations_ms = :rewrite_stage_durations_ms",
+		)
+		values[":rewrite_stage"] = stringAttr(progress.StageProgress.Stage)
+		values[":rewrite_stage_started_at"] = stringAttr(formatTime(progress.StageProgress.StageStartedAt))
+		values[":rewrite_stage_elapsed_ms"] = int64Attr(progress.StageProgress.StageElapsedMs)
+		values[":rewrite_total_elapsed_ms"] = int64Attr(progress.StageProgress.TotalElapsedMs)
+		values[":rewrite_stage_durations_ms"] = int64MapAttr(progress.StageProgress.CompletedStageDurationsMs)
 	}
 
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -787,7 +816,7 @@ func partStateKey(jobID, partID string) map[string]types.AttributeValue {
 }
 
 func progressRemoveExpression() string {
-	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes"
+	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
 }
 
 func jobKey(jobID string) string {
@@ -820,4 +849,16 @@ func numberAttr(value string) types.AttributeValue {
 
 func uintAttr(value uint64) types.AttributeValue {
 	return numberAttr(fmt.Sprintf("%d", value))
+}
+
+func int64Attr(value int64) types.AttributeValue {
+	return numberAttr(strconv.FormatInt(value, 10))
+}
+
+func int64MapAttr(values map[string]int64) types.AttributeValue {
+	attrs := make(map[string]types.AttributeValue, len(values))
+	for key, value := range values {
+		attrs[key] = int64Attr(value)
+	}
+	return &types.AttributeValueMemberM{Value: attrs}
 }

@@ -117,7 +117,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. Use `job-status -parts` to include one row per part with the latest persisted rewrite counters and active part stats. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. Use `job-status -parts` to include one row per part with the latest persisted rewrite counters and active part stats, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
 
 Retry one failed part:
 
