@@ -15,6 +15,7 @@ import (
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/manifest"
+	"github.com/partforge/partforge/internal/s3copy"
 )
 
 func TestReduceInsertSelectThreadSettings(t *testing.T) {
@@ -236,6 +237,51 @@ func TestFrozenPartUploadGlobsRequiresAtLeastOneStore(t *testing.T) {
 	}
 }
 
+func TestUploadFinishedArtifactReplacesStablePartPrefix(t *testing.T) {
+	binary, logFile := fakeS5cmdRecorder(t)
+	frozenGlob := filepath.Join(t.TempDir(), "shadow", "freeze", "store", "*", "*", "*")
+	finishedKey := "partforge/jobs/job-1/finished/part-1"
+
+	err := (Processor{
+		S3Copy: s3copy.Copier{Binary: binary},
+	}).uploadFinishedArtifact(context.Background(), "bucket", finishedKey, []frozenPartGlob{
+		{Disk: "default", Glob: frozenGlob},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("s5cmd calls = %#v, want delete then upload", lines)
+	}
+	if !strings.Contains(lines[0], " rm s3://bucket/"+finishedKey+"/*") {
+		t.Fatalf("delete call = %q, want finished part prefix delete", lines[0])
+	}
+	if !strings.Contains(lines[1], " cp "+frozenGlob+" s3://bucket/"+finishedKey+"/") {
+		t.Fatalf("upload call = %q, want direct finished part prefix upload", lines[1])
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "/data/") || strings.Contains(line, "/attempt-") {
+			t.Fatalf("s5cmd call uses old finished layout: %q", line)
+		}
+	}
+}
+
+func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
+	err := (Processor{}).uploadFinishedArtifact(context.Background(), "bucket", "partforge/jobs/job-1/finished/part-1", nil)
+	if err == nil {
+		t.Fatal("expected missing frozen part globs error")
+	}
+	if !strings.Contains(err.Error(), "no frozen part globs") {
+		t.Fatalf("error = %q, want missing globs", err)
+	}
+}
+
 func TestWorkerFreezeNameNeedsNoClickHouseEscaping(t *testing.T) {
 	name := workerFreezeName(manifest.Manifest{JobID: "job-1", PartID: "part.2"}, time.Date(2026, 6, 17, 15, 48, 15, 768144022, time.UTC))
 	if strings.ContainsAny(name, "-.") {
@@ -244,6 +290,24 @@ func TestWorkerFreezeNameNeedsNoClickHouseEscaping(t *testing.T) {
 	if name != "partforge_job_1_part_2_20260617T154815768144022Z" {
 		t.Fatalf("freeze name = %q", name)
 	}
+}
+
+func fakeS5cmdRecorder(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	logFile := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> " + shellQuote(logFile) + "\n" +
+		"exit 0\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, logFile
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func createFrozenPart(t *testing.T, path string) {

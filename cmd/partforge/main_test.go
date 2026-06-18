@@ -153,7 +153,7 @@ func TestJobS3Prefixes(t *testing.T) {
 			PartID:      "part-1",
 			Bucket:      "bucket",
 			SourceKey:   "partforge/jobs/job-1/source/part-1",
-			FinishedKey: "partforge/jobs/job-1/finished/part-1/attempt-000001",
+			FinishedKey: "partforge/jobs/job-1/finished/part-1",
 		},
 		{
 			JobID:       "job-1",

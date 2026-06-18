@@ -5,14 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
-	artifactpkg "github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/fileutil"
 	"github.com/partforge/partforge/internal/s3copy"
@@ -149,18 +147,18 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 		return err
 	}
 	downloadRoot := filepath.Join(workDir, "data")
-	sourceKey := path.Join(artifact.Key, artifactpkg.FinishedDataName)
-	slog.Info("downloading finished artifact data", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", sourceKey)
+	sourceKey := artifact.Key
+	slog.Info("downloading finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", sourceKey)
 	downloadStartedAt := time.Now()
 	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, sourceKey, downloadRoot); err != nil {
-		return fmt.Errorf("download finished artifact data s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
+		return fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
 	downloadStats, err := fileutil.StatDir(downloadRoot)
 	if err != nil {
 		return fmt.Errorf("stat finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
-	slog.Info("downloaded finished artifact data", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
+	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
 	partNames, err := downloadedPartNames(downloadRoot)
 	if err != nil {
 		return fmt.Errorf("list downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)

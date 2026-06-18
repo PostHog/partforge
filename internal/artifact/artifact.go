@@ -10,7 +10,6 @@ import (
 )
 
 const ManifestName = "manifest.json"
-const FinishedDataName = "data"
 
 func WriteManifest(dir string, m manifest.Manifest) error {
 	if err := m.Validate(); err != nil {

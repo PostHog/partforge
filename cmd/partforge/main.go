@@ -37,7 +37,7 @@ const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
-const defaultWorkerShutdownGracePeriod = 2 * time.Minute
+const defaultWorkerShutdownGracePeriod = 90 * time.Second
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 

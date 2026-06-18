@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -162,7 +161,6 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 	}
 	slog.Info("rewrote source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID, "frozen_part_globs", len(rewriteResult.FrozenPartGlobs), "elapsed", time.Since(rewriteStartedAt))
 
-	m.S3.FinishedKey = manifest.FinishedPartAttemptPrefix(m.S3.FinishedKey, item.Attempt, time.Now().UTC())
 	slog.Info(
 		"uploading finished artifact",
 		"stage", "upload_finished",
@@ -818,10 +816,16 @@ func frozenPartUploadGlobs(disks []freeze.Disk, freezeName string) ([]frozenPart
 }
 
 func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedKey string, frozenPartGlobs []frozenPartGlob) error {
-	target := path.Join(finishedKey, artifact.FinishedDataName)
+	if len(frozenPartGlobs) == 0 {
+		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
+	}
+	slog.Info("removing existing finished artifact prefix", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey)
+	if err := p.S3Copy.DeletePrefix(ctx, bucket, finishedKey); err != nil {
+		return fmt.Errorf("delete existing finished artifact s3://%s/%s: %w", bucket, finishedKey, err)
+	}
 	for _, source := range frozenPartGlobs {
-		if err := p.S3Copy.UploadGlob(ctx, source.Glob, bucket, target); err != nil {
-			return fmt.Errorf("upload frozen parts matching %s to s3://%s/%s: %w", source.Glob, bucket, target, err)
+		if err := p.S3Copy.UploadGlob(ctx, source.Glob, bucket, finishedKey); err != nil {
+			return fmt.Errorf("upload frozen parts matching %s to s3://%s/%s: %w", source.Glob, bucket, finishedKey, err)
 		}
 	}
 	return nil
