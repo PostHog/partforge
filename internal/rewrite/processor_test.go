@@ -117,6 +117,41 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	}
 }
 
+func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("3\n"))
+	}))
+	defer server.Close()
+
+	timeout := -time.Nanosecond
+	result, err := (Processor{
+		ClickHouse:   chhttp.Client{URL: server.URL},
+		MergeTimeout: timeout,
+	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Settled {
+		t.Fatal("expected unsettled merge result")
+	}
+	if result.ActiveMerges != 3 {
+		t.Fatalf("active merges = %d, want 3", result.ActiveMerges)
+	}
+	if result.Timeout != timeout {
+		t.Fatalf("timeout = %s, want %s", result.Timeout, timeout)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+}
+
 func TestInsertSelectRetryBackoff(t *testing.T) {
 	if got := insertSelectRetryBackoff(1); got != time.Second {
 		t.Fatalf("attempt 1 backoff = %s", got)

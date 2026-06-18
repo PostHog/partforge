@@ -253,10 +253,22 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
 	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
-	if err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table); err != nil {
+	mergeWait, err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table)
+	if err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("destination merges complete", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID)
+	if mergeWait.Settled {
+		slog.Info("destination merges complete", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID)
+	} else {
+		slog.Warn(
+			"destination merges did not settle before timeout; freezing current destination parts",
+			"stage", "wait_merges",
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"timeout", mergeWait.Timeout,
+			"active_merges", mergeWait.ActiveMerges,
+		)
+	}
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return rewriteResult{}, fmt.Errorf("measure destination active parts: %w", err)
@@ -714,7 +726,13 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 	}, true, nil
 }
 
-func (p Processor) waitForMerges(ctx context.Context, database, table string) error {
+type mergeWaitResult struct {
+	Settled      bool
+	ActiveMerges uint64
+	Timeout      time.Duration
+}
+
+func (p Processor) waitForMerges(ctx context.Context, database, table string) (mergeWaitResult, error) {
 	timeout := p.MergeTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Minute
@@ -725,21 +743,21 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) er
 	for {
 		out, err := p.ClickHouse.QueryString(ctx, query)
 		if err != nil {
-			return err
+			return mergeWaitResult{}, err
 		}
 		count, err := chhttp.ParseUInt(out)
 		if err != nil {
-			return err
+			return mergeWaitResult{}, err
 		}
 		if count == 0 {
-			return nil
+			return mergeWaitResult{Settled: true, Timeout: timeout}, nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("destination merges did not settle within %s", timeout)
+			return mergeWaitResult{ActiveMerges: count, Timeout: timeout}, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return mergeWaitResult{}, ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
