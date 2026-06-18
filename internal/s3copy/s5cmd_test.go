@@ -9,13 +9,20 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestCopyArgsUseS5cmdRetryDefaults(t *testing.T) {
+func TestMain(m *testing.M) {
+	s5cmdRetryBaseDelay = 0
+	os.Exit(m.Run())
+}
+
+func TestCopyArgsUseSharedS5cmdRetries(t *testing.T) {
 	copier := Copier{Endpoint: "http://localhost:4566", NumWorkers: 64}
 	got := copier.copyArgs("/tmp/source/", "s3://bucket/prefix/")
 	want := []string{
 		"--log=error",
+		"--retry-count", "3",
 		"--numworkers", "64",
 		"--endpoint-url", "http://localhost:4566",
 		"cp",
@@ -27,12 +34,12 @@ func TestCopyArgsUseS5cmdRetryDefaults(t *testing.T) {
 	}
 }
 
-func TestArgsDisableS5cmdRetriesForNonCopyCommands(t *testing.T) {
+func TestDeleteArgsUseSharedS5cmdRetries(t *testing.T) {
 	copier := Copier{Endpoint: "http://localhost:4566", NumWorkers: 64}
-	got := copier.args("rm", "s3://bucket/prefix/*")
+	got := copier.deleteArgs("s3://bucket/prefix/*")
 	want := []string{
 		"--log=error",
-		"--retry-count", "0",
+		"--retry-count", "3",
 		"--numworkers", "64",
 		"--endpoint-url", "http://localhost:4566",
 		"rm",
@@ -48,6 +55,7 @@ func TestCopyArgsOmitsNumWorkersWhenUnset(t *testing.T) {
 	got := copier.copyArgs("/tmp/source/", "s3://bucket/prefix/")
 	want := []string{
 		"--log=error",
+		"--retry-count", "3",
 		"cp",
 		"/tmp/source/",
 		"s3://bucket/prefix/",
@@ -110,12 +118,12 @@ func TestUploadDirFailsAfterCopyRetries(t *testing.T) {
 	if got := readAttemptCount(t, attemptsFile); got != 4 {
 		t.Fatalf("attempts = %d, want 4", got)
 	}
-	if !strings.Contains(err.Error(), "s5cmd directory copy failed after 4 attempts") {
+	if !strings.Contains(err.Error(), "s5cmd command failed after 4 attempts") {
 		t.Fatalf("error = %q, want exhausted retry message", err)
 	}
 }
 
-func TestDeletePrefixDoesNotUseDirectoryCopyRetries(t *testing.T) {
+func TestDeletePrefixRetriesCommand(t *testing.T) {
 	binary, attemptsFile := fakeS5cmd(t, 10)
 
 	copier := Copier{Binary: binary}
@@ -123,17 +131,23 @@ func TestDeletePrefixDoesNotUseDirectoryCopyRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected delete error")
 	}
-	if got := readAttemptCount(t, attemptsFile); got != 1 {
-		t.Fatalf("attempts = %d, want 1", got)
+	if got := readAttemptCount(t, attemptsFile); got != 4 {
+		t.Fatalf("attempts = %d, want 4", got)
+	}
+	if !strings.Contains(err.Error(), "s5cmd command failed after 4 attempts") {
+		t.Fatalf("error = %q, want exhausted retry message", err)
 	}
 }
 
 func TestDeletePrefixIfExistsIgnoresNoObjectFound(t *testing.T) {
-	binary := fakeS5cmdOutput(t, `ERROR "rm s3://bucket/prefix/*": no object found`, 1)
+	binary, attemptsFile := fakeS5cmdOutputWithAttempts(t, `ERROR "rm s3://bucket/prefix/*": no object found`, 1)
 
 	copier := Copier{Binary: binary}
 	if err := copier.DeletePrefixIfExists(context.Background(), "bucket", "prefix"); err != nil {
 		t.Fatal(err)
+	}
+	if got := readAttemptCount(t, attemptsFile); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
 	}
 }
 
@@ -167,6 +181,24 @@ func TestDeletePrefixTargetRejectsGlobMeta(t *testing.T) {
 	}
 }
 
+func TestS5cmdCommandRetryDelayBacksOff(t *testing.T) {
+	old := s5cmdRetryBaseDelay
+	s5cmdRetryBaseDelay = time.Second
+	t.Cleanup(func() {
+		s5cmdRetryBaseDelay = old
+	})
+
+	for attempt, want := range map[int]time.Duration{
+		1: time.Second,
+		2: 2 * time.Second,
+		3: 4 * time.Second,
+	} {
+		if got := s5cmdCommandRetryDelay(attempt); got != want {
+			t.Fatalf("retry delay for attempt %d = %s, want %s", attempt, got, want)
+		}
+	}
+}
+
 func fakeS5cmd(t *testing.T, failUntil int) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -193,17 +225,30 @@ exit 0
 }
 
 func fakeS5cmdOutput(t *testing.T, output string, exitCode int) string {
+	binary, _ := fakeS5cmdOutputWithAttempts(t, output, exitCode)
+	return binary
+}
+
+func fakeS5cmdOutputWithAttempts(t *testing.T, output string, exitCode int) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "s5cmd")
+	attemptsFile := filepath.Join(dir, "attempts")
 	script := fmt.Sprintf(`#!/bin/sh
+count_file=%s
+count=0
+if [ -f "$count_file" ]; then
+	count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%%s' "$count" > "$count_file"
 echo %s >&2
 exit %d
-`, shellQuote(output), exitCode)
+`, shellQuote(attemptsFile), shellQuote(output), exitCode)
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return binary
+	return binary, attemptsFile
 }
 
 func readAttemptCount(t *testing.T, path string) int {
