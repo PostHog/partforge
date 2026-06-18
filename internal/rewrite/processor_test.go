@@ -1,7 +1,11 @@
 package rewrite
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +64,56 @@ func TestRetryableInsertSelectError(t *testing.T) {
 	}
 	if retryableInsertSelectError(errors.New("network error")) {
 		t.Fatal("expected unstructured error to be non-retryable")
+	}
+}
+
+func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
+	var requests []struct {
+		query string
+		body  string
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests = append(requests, struct {
+			query string
+			body  string
+		}{
+			query: r.URL.RawQuery,
+			body:  string(body),
+		})
+	}))
+	defer server.Close()
+
+	destDDL := "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY tuple()"
+	err := resetDestinationTable(context.Background(), chhttp.Client{URL: server.URL}, manifest.Manifest{
+		Dest: manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	}, destDDL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if requests[0].body != "DROP TABLE IF EXISTS `db`.`query_log_archive_temp` SYNC" {
+		t.Fatalf("drop query = %q", requests[0].body)
+	}
+	dropSettings := requests[0].query
+	if !strings.Contains(dropSettings, "max_table_size_to_drop=0") {
+		t.Fatalf("drop settings = %q, want max_table_size_to_drop=0", dropSettings)
+	}
+	if !strings.Contains(dropSettings, "max_partition_size_to_drop=0") {
+		t.Fatalf("drop settings = %q, want max_partition_size_to_drop=0", dropSettings)
+	}
+	if requests[1].body != destDDL {
+		t.Fatalf("recreate query = %q", requests[1].body)
+	}
+	if strings.Contains(requests[1].query, "max_table_size_to_drop") || strings.Contains(requests[1].query, "max_partition_size_to_drop") {
+		t.Fatalf("recreate settings = %q, want no drop-size settings", requests[1].query)
 	}
 }
 

@@ -409,7 +409,12 @@ func shouldReportProgress(interval time.Duration, last time.Time, now time.Time)
 
 func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest, destDDL string) error {
 	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
-	if err := ch.Exec(ctx, "DROP TABLE IF EXISTS "+table+" SYNC"); err != nil {
+	if err := ch.ExecWithOptions(ctx, "DROP TABLE IF EXISTS "+table+" SYNC", chhttp.QueryOptions{
+		Settings: chhttp.QuerySettings{
+			"max_table_size_to_drop":     "0",
+			"max_partition_size_to_drop": "0",
+		},
+	}); err != nil {
 		return fmt.Errorf("drop destination table before retry: %w", err)
 	}
 	if err := ch.Exec(ctx, destDDL); err != nil {
