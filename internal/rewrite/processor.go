@@ -35,6 +35,16 @@ const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 
 const (
+	autoMergeTargetPartCount             uint64 = 4
+	minMergeMaxBytesAtMaxSpaceInPool     uint64 = 16 * 1024 * 1024 * 1024
+	maxMergeMaxBytesAtMaxSpaceInPool     uint64 = 150 * 1024 * 1024 * 1024
+	minMergeMaxBytesAtMinSpaceInPool     uint64 = 1024 * 1024 * 1024
+	maxMergeMaxBytesAtMinSpaceInPool     uint64 = 32 * 1024 * 1024 * 1024
+	mergeMaxBytesAtMinSpacePoolDivisor   uint64 = 16
+	defaultMergeMaxBytesAtMaxSpaceInPool uint64 = 16 * 1024 * 1024 * 1024
+)
+
+const (
 	stageProcessPart             = "process_part"
 	stagePrepareWorkDir          = "prepare_work_dir"
 	stageDownloadSource          = "download_source"
@@ -635,10 +645,17 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
 		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
 	}
+	stats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
+	if err != nil {
+		return fmt.Errorf("measure destination parts before configuring merge settings: %w", err)
+	}
+	mergeBytes := mergePoolByteSettingsForActiveBytes(stats.Bytes)
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
-		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10)
+		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
+		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
+		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure destination table merge settings: %w", err)
 	}
@@ -651,6 +668,10 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
+		"destination_active_parts", stats.Count,
+		"destination_active_bytes", stats.Bytes,
+		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
+		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
 	)
 	return nil
 }
@@ -666,6 +687,70 @@ func (p Processor) restartClickHouse(ctx context.Context, m manifest.Manifest) e
 	}
 	slog.Info("restarted local ClickHouse before destination merges", "stage", "restart_clickhouse", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(startedAt))
 	return nil
+}
+
+type mergePoolByteSettings struct {
+	MaxBytesAtMaxSpaceInPool uint64
+	MaxBytesAtMinSpaceInPool uint64
+}
+
+func mergePoolByteSettingsForActiveBytes(activeBytes uint64) mergePoolByteSettings {
+	maxAtMaxSpace := defaultMergeMaxBytesAtMaxSpaceInPool
+	if activeBytes > 0 {
+		target := ceilDivUint64(activeBytes, autoMergeTargetPartCount)
+		maxAtMaxSpace = maxUint64(target, minMergeMaxBytesAtMaxSpaceInPool)
+		maxAtMaxSpace = minUint64(maxAtMaxSpace, activeBytes)
+		maxAtMaxSpace = minUint64(maxAtMaxSpace, maxMergeMaxBytesAtMaxSpaceInPool)
+	}
+	if maxAtMaxSpace == 0 {
+		maxAtMaxSpace = 1
+	}
+
+	maxAtMinSpace := ceilDivUint64(maxAtMaxSpace, mergeMaxBytesAtMinSpacePoolDivisor)
+	maxAtMinSpace = clampUint64(maxAtMinSpace, minMergeMaxBytesAtMinSpaceInPool, maxMergeMaxBytesAtMinSpaceInPool)
+	maxAtMinSpace = minUint64(maxAtMinSpace, maxAtMaxSpace)
+	if maxAtMinSpace == 0 {
+		maxAtMinSpace = 1
+	}
+
+	return mergePoolByteSettings{
+		MaxBytesAtMaxSpaceInPool: maxAtMaxSpace,
+		MaxBytesAtMinSpaceInPool: maxAtMinSpace,
+	}
+}
+
+func ceilDivUint64(value, divisor uint64) uint64 {
+	if divisor == 0 {
+		return value
+	}
+	if value == 0 {
+		return 0
+	}
+	return 1 + (value-1)/divisor
+}
+
+func minUint64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxUint64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func clampUint64(value, minValue, maxValue uint64) uint64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func (p Processor) shouldOptimizeFinal(m manifest.Manifest) bool {

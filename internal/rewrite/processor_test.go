@@ -128,7 +128,11 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		queries = append(queries, string(body))
+		query := string(body)
+		queries = append(queries, query)
+		if strings.Contains(query, "system.parts") {
+			_, _ = w.Write([]byte("8\t1000\t107374182400\n"))
+		}
 	}))
 	defer server.Close()
 
@@ -147,8 +151,8 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000"
-	if len(queries) != 1 || queries[0] != want {
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
+	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
 }
@@ -182,6 +186,55 @@ func TestConfigureDestinationCompressionCodec(t *testing.T) {
 	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING default_compression_codec = 'ZSTD(5)'"
 	if len(queries) != 1 || queries[0] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
+	}
+}
+
+func TestMergePoolByteSettingsForActiveBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		bytes   uint64
+		wantMax uint64
+		wantMin uint64
+	}{
+		{
+			name:    "no active bytes uses safe positive defaults",
+			bytes:   0,
+			wantMax: 16 * 1024 * 1024 * 1024,
+			wantMin: 1024 * 1024 * 1024,
+		},
+		{
+			name:    "tiny output can still merge to one part",
+			bytes:   64 * 1024 * 1024,
+			wantMax: 64 * 1024 * 1024,
+			wantMin: 64 * 1024 * 1024,
+		},
+		{
+			name:    "medium output targets four large parts",
+			bytes:   100 * 1024 * 1024 * 1024,
+			wantMax: 25 * 1024 * 1024 * 1024,
+			wantMin: 25 * 1024 * 1024 * 1024 / 16,
+		},
+		{
+			name:    "large output caps individual automatic merges",
+			bytes:   4 * 1024 * 1024 * 1024 * 1024,
+			wantMax: 150 * 1024 * 1024 * 1024,
+			wantMin: 150 * 1024 * 1024 * 1024 / 16,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergePoolByteSettingsForActiveBytes(tt.bytes)
+			if got.MaxBytesAtMaxSpaceInPool != tt.wantMax {
+				t.Fatalf("max_bytes_to_merge_at_max_space_in_pool = %d, want %d", got.MaxBytesAtMaxSpaceInPool, tt.wantMax)
+			}
+			if got.MaxBytesAtMinSpaceInPool != tt.wantMin {
+				t.Fatalf("max_bytes_to_merge_at_min_space_in_pool = %d, want %d", got.MaxBytesAtMinSpaceInPool, tt.wantMin)
+			}
+			if got.MaxBytesAtMinSpaceInPool == 0 || got.MaxBytesAtMinSpaceInPool > got.MaxBytesAtMaxSpaceInPool {
+				t.Fatalf("invalid merge byte settings: %+v", got)
+			}
+		})
 	}
 }
 
