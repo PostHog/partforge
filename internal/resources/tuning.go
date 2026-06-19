@@ -15,6 +15,7 @@ const (
 	insertMemoryUsagePercent       uint64 = 80
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
+	minMergeBackgroundPoolSize            = 13
 	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
 	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
 	minMergeMaxBlockSizeRows       uint64 = 8192
@@ -25,6 +26,16 @@ const (
 type Limits struct {
 	CPUs        int
 	MemoryBytes uint64
+}
+
+func MergeBackgroundPoolSize(limits Limits) (int, error) {
+	if limits.CPUs < 1 {
+		return 0, fmt.Errorf("cpu limit must be at least 1, got %d", limits.CPUs)
+	}
+	if limits.CPUs < minMergeBackgroundPoolSize {
+		return minMergeBackgroundPoolSize, nil
+	}
+	return limits.CPUs, nil
 }
 
 type MergeTreeSettings struct {

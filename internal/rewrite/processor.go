@@ -46,6 +46,31 @@ const (
 	stageCompletePart            = "complete_part"
 )
 
+var stageOrder = []string{
+	stageProcessPart,
+	stagePrepareWorkDir,
+	stageDownloadSource,
+	stageReadManifest,
+	stagePrepareWorkerTables,
+	stageAttachSourcePart,
+	stageInsertSelect,
+	stageConfigureMergeSettings,
+	stageRestartClickHouse,
+	stageOptimizeFinal,
+	stageWaitMerges,
+	stageMeasureDestinationParts,
+	stageFreezeDestinationParts,
+	stageArchiveFinishedParts,
+	stageDeleteFinishedArtifact,
+	stageUploadFinishedTarballs,
+	stageCompletePart,
+}
+
+// StageOrder returns the rewrite progress stages in the order a worker reaches them.
+func StageOrder() []string {
+	return append([]string(nil), stageOrder...)
+}
+
 type Processor struct {
 	S3Copy             s3copy.Copier
 	ClickHouse         chhttp.Client
@@ -537,7 +562,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	}
 	slog.Info(
 		"configured destination merge settings",
-		"stage", "prepare_worker_tables",
+		"stage", stageConfigureMergeSettings,
 		"job_id", m.JobID,
 		"part_id", m.PartID,
 		"destination_table", table,

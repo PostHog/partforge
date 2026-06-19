@@ -1,10 +1,13 @@
 package chproc
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
@@ -53,6 +56,22 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 	}
 }
 
+func TestArgsIncludeBackgroundPoolSize(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{BackgroundPoolSize: 12}}
+	got, err := cfg.args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"server",
+		"--",
+		"--background_pool_size=12",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestArgsForClickHouseServerBinaryOmitServerSubcommand(t *testing.T) {
 	cfg := Config{Binary: "clickhouse-server", ConfigFile: "/etc/clickhouse-server/config.xml"}
 	got, err := cfg.args()
@@ -70,5 +89,31 @@ func TestArgsRejectInvalidBackgroundPoolSize(t *testing.T) {
 	_, err := cfg.args()
 	if err == nil {
 		t.Fatal("expected invalid background pool size error")
+	}
+}
+
+func TestStartFailsWhenProcessExitsBeforeReady(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "fake-clickhouse")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 42\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	server, err := Start(context.Background(), Config{
+		Binary:  binary,
+		URL:     "http://127.0.0.1:1",
+		Timeout: time.Minute,
+	})
+	if server != nil {
+		t.Fatalf("server = %+v, want nil", server)
+	}
+	if err == nil {
+		t.Fatal("expected start error")
+	}
+	if !strings.Contains(err.Error(), "clickhouse server exited before becoming ready") {
+		t.Fatalf("start error = %v", err)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatalf("Start did not fail fast: %s", time.Since(started))
 	}
 }

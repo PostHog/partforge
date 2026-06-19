@@ -40,6 +40,7 @@ const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 const defaultWorkerShutdownGracePeriod = 90 * time.Second
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
+const inProgressStageUnknown = "unknown"
 
 var version = "dev"
 
@@ -691,6 +692,10 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge settings: %w", err)
 	}
+	mergeBackgroundPoolSize, err := resources.MergeBackgroundPoolSize(workerLimits)
+	if err != nil {
+		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
+	}
 	slog.Info(
 		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
@@ -698,7 +703,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_threads", insertSettings["max_threads"],
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
-		"merge_background_pool_size", workerLimits.CPUs,
+		"merge_background_pool_size", mergeBackgroundPoolSize,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 	)
@@ -827,8 +832,8 @@ func runWorker(ctx context.Context, args []string) error {
 				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
 				server.Stop()
 				server = nil
-				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", workerLimits.CPUs)
-				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: workerLimits.CPUs})
+				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", mergeBackgroundPoolSize)
+				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: mergeBackgroundPoolSize})
 				if err != nil {
 					return err
 				}
@@ -1612,19 +1617,25 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 }
 
 type jobSummary struct {
-	JobID            string               `json:"job_id"`
-	Status           string               `json:"status"`
-	Total            int                  `json:"total"`
-	Counts           map[state.Status]int `json:"counts"`
-	RewriteCompleted int                  `json:"rewrite_completed"`
-	RewritePercent   float64              `json:"rewrite_percent"`
-	ImportCompleted  int                  `json:"import_completed"`
-	ImportPercent    float64              `json:"import_percent"`
-	ReadRows         uint64               `json:"read_rows"`
-	ReadBytes        uint64               `json:"read_bytes"`
-	WrittenRows      uint64               `json:"written_rows"`
-	WrittenBytes     uint64               `json:"written_bytes"`
-	FailedParts      []failedPart         `json:"failed_parts,omitempty"`
+	JobID            string                 `json:"job_id"`
+	Status           string                 `json:"status"`
+	Total            int                    `json:"total"`
+	Counts           map[state.Status]int   `json:"counts"`
+	InProgressStages []inProgressStageCount `json:"in_progress_stages,omitempty"`
+	RewriteCompleted int                    `json:"rewrite_completed"`
+	RewritePercent   float64                `json:"rewrite_percent"`
+	ImportCompleted  int                    `json:"import_completed"`
+	ImportPercent    float64                `json:"import_percent"`
+	ReadRows         uint64                 `json:"read_rows"`
+	ReadBytes        uint64                 `json:"read_bytes"`
+	WrittenRows      uint64                 `json:"written_rows"`
+	WrittenBytes     uint64                 `json:"written_bytes"`
+	FailedParts      []failedPart           `json:"failed_parts,omitempty"`
+}
+
+type inProgressStageCount struct {
+	Stage string `json:"stage"`
+	Count int    `json:"count"`
 }
 
 type failedPart struct {
@@ -1674,12 +1685,20 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 
 	var failed []failedPart
 	var readRows, readBytes, writtenRows, writtenBytes uint64
+	stageCounts := map[string]int{}
 	for _, part := range parts {
 		counts[part.Status]++
 		readRows += part.ReadRows
 		readBytes += part.ReadBytes
 		writtenRows += part.WrittenRows
 		writtenBytes += part.WrittenBytes
+		if part.Status == state.StatusInProgress {
+			stage := strings.TrimSpace(part.RewriteStage)
+			if stage == "" {
+				stage = inProgressStageUnknown
+			}
+			stageCounts[stage]++
+		}
 		if part.Status == state.StatusFailed {
 			failed = append(failed, failedPart{
 				PartID:    part.PartID,
@@ -1701,6 +1720,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		Status:           overallStatus(total, counts),
 		Total:            total,
 		Counts:           counts,
+		InProgressStages: inProgressStageCounts(stageCounts),
 		RewriteCompleted: rewriteCompleted,
 		RewritePercent:   percent(rewriteCompleted, total),
 		ImportCompleted:  importCompleted,
@@ -1711,6 +1731,41 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		WrittenBytes:     writtenBytes,
 		FailedParts:      failed,
 	}
+}
+
+func inProgressStageCounts(counts map[string]int) []inProgressStageCount {
+	if len(counts) == 0 {
+		return nil
+	}
+
+	orderedStages := make([]string, 0, len(counts))
+	seen := map[string]struct{}{}
+	for _, stage := range rewrite.StageOrder() {
+		if _, ok := counts[stage]; !ok {
+			continue
+		}
+		orderedStages = append(orderedStages, stage)
+		seen[stage] = struct{}{}
+	}
+
+	remaining := make([]string, 0, len(counts)-len(orderedStages))
+	for stage := range counts {
+		if _, ok := seen[stage]; ok {
+			continue
+		}
+		remaining = append(remaining, stage)
+	}
+	sort.Strings(remaining)
+	orderedStages = append(orderedStages, remaining...)
+
+	stages := make([]inProgressStageCount, 0, len(orderedStages))
+	for _, stage := range orderedStages {
+		stages = append(stages, inProgressStageCount{
+			Stage: stage,
+			Count: counts[stage],
+		})
+	}
+	return stages
 }
 
 func printJobSummary(out *os.File, summary jobSummary) {
@@ -1728,6 +1783,16 @@ func printJobSummary(out *os.File, summary jobSummary) {
 		fmt.Fprintf(tw, "%s\t%d\n", status, summary.Counts[status])
 	}
 	_ = tw.Flush()
+
+	if len(summary.InProgressStages) > 0 {
+		fmt.Fprintln(out, "\nIN_PROGRESS STAGES")
+		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "STAGE\tCOUNT")
+		for _, stage := range summary.InProgressStages {
+			fmt.Fprintf(tw, "%s\t%d\n", stage.Stage, stage.Count)
+		}
+		_ = tw.Flush()
+	}
 
 	if len(summary.FailedParts) > 0 {
 		fmt.Fprintln(out, "\nFAILED PARTS")

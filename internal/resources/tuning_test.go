@@ -37,6 +37,43 @@ func TestInsertThreadCount(t *testing.T) {
 	}
 }
 
+func TestMergeBackgroundPoolSize(t *testing.T) {
+	tests := []struct {
+		name   string
+		limits Limits
+		want   int
+	}{
+		{
+			name:   "small cpu count satisfies ClickHouse merge tree defaults",
+			limits: Limits{CPUs: 4},
+			want:   13,
+		},
+		{
+			name:   "larger cpu count uses detected cpu count",
+			limits: Limits{CPUs: 16},
+			want:   16,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := MergeBackgroundPoolSize(tt.limits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("MergeBackgroundPoolSize(%+v) = %d, want %d", tt.limits, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {
+	if _, err := MergeBackgroundPoolSize(Limits{}); err == nil {
+		t.Fatal("expected invalid cpu count error")
+	}
+}
+
 func TestMergeTreeSettingsForLimits(t *testing.T) {
 	tests := []struct {
 		name      string

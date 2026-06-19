@@ -46,6 +46,30 @@ func TestSummarizeJob(t *testing.T) {
 	}
 }
 
+func TestSummarizeJobCountsInProgressStages(t *testing.T) {
+	summary := summarizeJob("job-1", []state.Part{
+		{PartID: "part-1", Status: state.StatusInProgress, RewriteStage: "wait_merges"},
+		{PartID: "part-2", Status: state.StatusInProgress, RewriteStage: "insert_select"},
+		{PartID: "part-3", Status: state.StatusInProgress, RewriteStage: "insert_select"},
+		{PartID: "part-4", Status: state.StatusInProgress},
+		{PartID: "part-5", Status: state.StatusFinished, RewriteStage: "insert_select"},
+	})
+
+	want := []inProgressStageCount{
+		{Stage: "insert_select", Count: 2},
+		{Stage: "wait_merges", Count: 1},
+		{Stage: "unknown", Count: 1},
+	}
+	if len(summary.InProgressStages) != len(want) {
+		t.Fatalf("in-progress stages = %+v, want %+v", summary.InProgressStages, want)
+	}
+	for i := range want {
+		if summary.InProgressStages[i] != want[i] {
+			t.Fatalf("in-progress stage %d = %+v, want %+v", i, summary.InProgressStages[i], want[i])
+		}
+	}
+}
+
 func TestSelectRetryParts(t *testing.T) {
 	parts := []state.Part{
 		{PartID: "part-1", Status: state.StatusFailed},
@@ -334,6 +358,35 @@ func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
 	}
 	if strings.Contains(got, "10485760 bytes") || strings.Contains(got, "3221225472 bytes") {
 		t.Fatalf("printJobSummary output contains raw byte values:\n%s", got)
+	}
+}
+
+func TestPrintJobSummaryIncludesInProgressStages(t *testing.T) {
+	summary := jobSummary{
+		JobID:  "job-1",
+		Status: "REWRITING",
+		Total:  3,
+		Counts: map[state.Status]int{
+			state.StatusInProgress: 3,
+		},
+		InProgressStages: []inProgressStageCount{
+			{Stage: "insert_select", Count: 2},
+			{Stage: "wait_merges", Count: 1},
+		},
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobSummary(out, summary)
+	})
+
+	for _, want := range []string{
+		"IN_PROGRESS STAGES",
+		"insert_select",
+		"wait_merges",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
+		}
 	}
 }
 

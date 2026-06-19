@@ -2,12 +2,14 @@ package chproc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/partforge/partforge/internal/chhttp"
@@ -29,7 +31,9 @@ type Tuning struct {
 }
 
 type Server struct {
-	cmd *exec.Cmd
+	cmd      *exec.Cmd
+	done     chan error
+	stopOnce sync.Once
 }
 
 func Start(ctx context.Context, cfg Config) (*Server, error) {
@@ -47,7 +51,10 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start clickhouse server: %w", err)
 	}
-	server := &Server{cmd: cmd}
+	server := &Server{cmd: cmd, done: make(chan error, 1)}
+	go func() {
+		server.done <- cmd.Wait()
+	}()
 
 	timeout := cfg.Timeout
 	if timeout == 0 {
@@ -65,6 +72,11 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("clickhouse did not become ready within %s", timeout)
 		}
 		select {
+		case err := <-server.done:
+			if err == nil {
+				return nil, errors.New("clickhouse server exited before becoming ready")
+			}
+			return nil, fmt.Errorf("clickhouse server exited before becoming ready: %w", err)
 		case <-ctx.Done():
 			server.Stop()
 			return nil, ctx.Err()
@@ -156,15 +168,12 @@ func (s *Server) Stop() {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
-	_ = s.cmd.Process.Kill()
-	done := make(chan struct{})
-	go func() {
-		_ = s.cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		slog.Warn("timed out waiting for killed clickhouse process")
-	}
+	s.stopOnce.Do(func() {
+		_ = s.cmd.Process.Kill()
+		select {
+		case <-s.done:
+		case <-time.After(30 * time.Second):
+			slog.Warn("timed out waiting for killed clickhouse process")
+		}
+	})
 }
