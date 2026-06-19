@@ -93,13 +93,23 @@ func TestArgsRejectInvalidBackgroundPoolSize(t *testing.T) {
 }
 
 func TestStartFailsWhenProcessExitsBeforeReady(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "fake-clickhouse")
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "fake-clickhouse")
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 42\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(dir, "clickhouse")
+	errorLogDir := filepath.Join(dataDir, "logs")
+	if err := os.MkdirAll(errorLogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(errorLogDir, "clickhouse-server.err.log"), []byte("Code: 76. Cannot open file /tmp/clickhouse/status\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	started := time.Now()
 	server, err := Start(context.Background(), Config{
+		DataDir: dataDir,
 		Binary:  binary,
 		URL:     "http://127.0.0.1:1",
 		Timeout: time.Minute,
@@ -113,7 +123,18 @@ func TestStartFailsWhenProcessExitsBeforeReady(t *testing.T) {
 	if !strings.Contains(err.Error(), "clickhouse server exited before becoming ready") {
 		t.Fatalf("start error = %v", err)
 	}
+	if !strings.Contains(err.Error(), "Cannot open file /tmp/clickhouse/status") {
+		t.Fatalf("start error missing ClickHouse log detail: %v", err)
+	}
 	if time.Since(started) > 5*time.Second {
 		t.Fatalf("Start did not fail fast: %s", time.Since(started))
+	}
+}
+
+func TestClickHouseErrorLogLinePrefersErrorLine(t *testing.T) {
+	got := clickHouseErrorLogLine("trace\n2026 <Error> Application: Code: 76. Cannot open file /tmp/status\n0. stack\n")
+	want := "2026 <Error> Application: Code: 76. Cannot open file /tmp/status"
+	if got != want {
+		t.Fatalf("clickHouseErrorLogLine = %q, want %q", got, want)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -40,6 +41,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Binary == "" {
 		return nil, fmt.Errorf("clickhouse binary is empty")
 	}
+	errorLogPath := cfg.errorLogPath()
 	args, err := cfg.args()
 	if err != nil {
 		return nil, err
@@ -69,14 +71,14 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		}
 		if time.Now().After(deadline) {
 			server.Stop()
-			return nil, fmt.Errorf("clickhouse did not become ready within %s", timeout)
+			return nil, clickHouseStartError(fmt.Sprintf("clickhouse did not become ready within %s", timeout), nil, errorLogPath)
 		}
 		select {
 		case err := <-server.done:
 			if err == nil {
-				return nil, errors.New("clickhouse server exited before becoming ready")
+				return nil, clickHouseStartError("clickhouse server exited before becoming ready", nil, errorLogPath)
 			}
-			return nil, fmt.Errorf("clickhouse server exited before becoming ready: %w", err)
+			return nil, clickHouseStartError("clickhouse server exited before becoming ready", err, errorLogPath)
 		case <-ctx.Done():
 			server.Stop()
 			return nil, ctx.Err()
@@ -113,6 +115,77 @@ func (cfg Config) args() ([]string, error) {
 		args = append(args, configOverrides...)
 	}
 	return args, nil
+}
+
+func (cfg Config) errorLogPath() string {
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		return ""
+	}
+	root, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Clean(root), "logs", "clickhouse-server.err.log")
+}
+
+func clickHouseStartError(message string, cause error, errorLogPath string) error {
+	detail := clickHouseErrorLogTail(errorLogPath)
+	if cause != nil {
+		if detail != "" {
+			return fmt.Errorf("%s: %w; clickhouse error log: %s", message, cause, detail)
+		}
+		return fmt.Errorf("%s: %w", message, cause)
+	}
+	if detail != "" {
+		return fmt.Errorf("%s; clickhouse error log: %s", message, detail)
+	}
+	return errors.New(message)
+}
+
+func clickHouseErrorLogTail(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	const maxBytes = 16 * 1024
+	info, err := file.Stat()
+	if err != nil {
+		return ""
+	}
+	offset := int64(0)
+	if info.Size() > maxBytes {
+		offset = info.Size() - maxBytes
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return ""
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return ""
+	}
+	return clickHouseErrorLogLine(string(raw))
+}
+
+func clickHouseErrorLogLine(logTail string) string {
+	lines := strings.Split(logTail, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.Contains(line, "<Error>") || strings.Contains(line, "Code:") {
+			return strings.Join(strings.Fields(line), " ")
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return strings.Join(strings.Fields(line), " ")
+		}
+	}
+	return ""
 }
 
 func storageConfigArgs(dataDir string) ([]string, []string, error) {
