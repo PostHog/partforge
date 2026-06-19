@@ -29,7 +29,8 @@ type Config struct {
 }
 
 type Tuning struct {
-	BackgroundPoolSize int
+	BackgroundPoolSize    int
+	MergeSchedulingPolicy string
 }
 
 type Server struct {
@@ -115,6 +116,10 @@ func (cfg Config) args() ([]string, error) {
 	}
 	if cfg.Tuning.BackgroundPoolSize > 0 {
 		configOverrides = append(configOverrides, fmt.Sprintf("--background_pool_size=%d", cfg.Tuning.BackgroundPoolSize))
+	}
+	mergeSchedulingPolicy := strings.TrimSpace(cfg.Tuning.MergeSchedulingPolicy)
+	if mergeSchedulingPolicy != "" {
+		configOverrides = append(configOverrides, "--background_merges_mutations_scheduling_policy="+mergeSchedulingPolicy)
 	}
 	if len(configOverrides) > 0 {
 		args = append(args, "--")

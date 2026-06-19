@@ -623,29 +623,34 @@ func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
 func runWorker(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	var (
-		configPath            = fs.String("config", defaultConfigPath, "JSON config file path")
-		region                = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		s3Endpoint            = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		stateTable            = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
-		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
-		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		clickHouseBinary      = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
-		clickHouseConfigFile  = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
-		once                  = fs.Bool("once", false, "process one part and exit")
-		pollInterval          = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
-		workerID              = fs.String("worker-id", "", "worker identity recorded on claimed parts")
-		workDir               = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
-		mergeTimeout          = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges")
-		mergeSettleMinWait    = fs.Duration("merge-settle-min-wait", rewrite.DefaultMergeSettleMinWait, "minimum time destination merges must stay idle with unchanged active output part count before settling when active output parts remain above -merge-settle-min-parts")
-		mergeSettleMinParts   = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges and unchanged active output part count are required for -merge-settle-min-wait before settling")
-		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
-		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
-		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
-		shutdownGracePeriod   = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
-		optimizeFinal         = fs.Bool("optimize-final", false, "run OPTIMIZE TABLE ... FINAL inside the local worker after every rewrite insert, regardless of manifest")
+		configPath               = fs.String("config", defaultConfigPath, "JSON config file path")
+		region                   = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		s3Endpoint               = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary              = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		stateTable               = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		dynamoEndpoint           = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		clickHouseURL            = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
+		clickHouseUser           = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
+		clickHousePassword       = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
+		clickHouseBinary         = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
+		clickHouseConfigFile     = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
+		once                     = fs.Bool("once", false, "process one part and exit")
+		pollInterval             = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
+		workerID                 = fs.String("worker-id", "", "worker identity recorded on claimed parts")
+		workDir                  = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
+		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
+		mergeTimeout             = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "base time to wait for destination merges before only continuing while useful merge work remains")
+		mergeHardTimeout         = fs.Duration("merge-hard-timeout", rewrite.DefaultMergeHardTimeout, "absolute maximum time to wait for destination merges")
+		mergeSettleMinWait       = fs.Duration("merge-settle-min-wait", rewrite.DefaultMergeSettleMinWait, "minimum time destination merges must stay idle with unchanged active output part count before settling when active output parts remain above -merge-settle-min-parts")
+		mergeSettleMinParts      = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges and unchanged active output part count are required for -merge-settle-min-wait before settling")
+		mergeSmallPartBytes      = fs.Uint64("merge-small-part-bytes", rewrite.DefaultMergeSmallPartBytes, "active output parts below this byte size count as small merge debt")
+		mergeSmallPartMaxCount   = fs.Uint64("merge-small-part-max-count", rewrite.DefaultMergeSmallPartMaxCount, "maximum small active output parts allowed before merge wait treats the table as having small-part debt")
+		mergeSmallPartMaxPercent = fs.Uint64("merge-small-part-max-percent", rewrite.DefaultMergeSmallPartMaxPercent, "maximum percent of active output bytes allowed in small parts before merge wait treats the table as having small-part debt")
+		metricsAddr              = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
+		metricsPath              = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
+		stateProgressInterval    = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
+		shutdownGracePeriod      = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
+		optimizeFinal            = fs.Bool("optimize-final", false, "run OPTIMIZE TABLE ... FINAL inside the local worker after every rewrite insert, regardless of manifest")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -656,8 +661,20 @@ func runWorker(ctx context.Context, args []string) error {
 	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
 		return err
 	}
+	if strings.TrimSpace(*defaultCompressionCodec) == "" {
+		return fmt.Errorf("default-compression-codec must not be empty")
+	}
 	if *mergeSettleMinWait < 0 {
 		return fmt.Errorf("merge-settle-min-wait must be non-negative, got %s", *mergeSettleMinWait)
+	}
+	if *mergeTimeout < 0 {
+		return fmt.Errorf("merge-timeout must be non-negative, got %s", *mergeTimeout)
+	}
+	if *mergeHardTimeout < *mergeTimeout {
+		return fmt.Errorf("merge-hard-timeout %s must be greater than or equal to merge-timeout %s", *mergeHardTimeout, *mergeTimeout)
+	}
+	if *mergeSmallPartMaxPercent > 100 {
+		return fmt.Errorf("merge-small-part-max-percent must be between 0 and 100, got %d", *mergeSmallPartMaxPercent)
 	}
 	slog.Info(
 		"worker started",
@@ -709,12 +726,19 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_threads", insertSettings["max_threads"],
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
+		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", mergeBackgroundPoolSize,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
+		"background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy,
+		"merge_timeout", *mergeTimeout,
+		"merge_hard_timeout", *mergeHardTimeout,
 		"merge_settle_min_wait", *mergeSettleMinWait,
 		"merge_settle_min_parts", *mergeSettleMinParts,
+		"merge_small_part_bytes", *mergeSmallPartBytes,
+		"merge_small_part_max_count", *mergeSmallPartMaxCount,
+		"merge_small_part_max_percent", *mergeSmallPartMaxPercent,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -823,20 +847,25 @@ func runWorker(ctx context.Context, args []string) error {
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:          ch,
-				WorkDir:             runDirs.Scratch,
-				MergeTimeout:        *mergeTimeout,
-				MergeSettleMinWait:  *mergeSettleMinWait,
-				MergeSettleMinParts: *mergeSettleMinParts,
-				Metrics:             recorder,
-				InsertSettings:      insertSettings,
-				ProgressInterval:    *stateProgressInterval,
-				ForceOptimizeFinal:  *optimizeFinal,
+				S3Copy:                   s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:               ch,
+				WorkDir:                  runDirs.Scratch,
+				MergeTimeout:             *mergeTimeout,
+				MergeHardTimeout:         *mergeHardTimeout,
+				MergeSettleMinWait:       *mergeSettleMinWait,
+				MergeSettleMinParts:      *mergeSettleMinParts,
+				MergeSmallPartBytes:      *mergeSmallPartBytes,
+				MergeSmallPartMaxCount:   *mergeSmallPartMaxCount,
+				MergeSmallPartMaxPercent: *mergeSmallPartMaxPercent,
+				Metrics:                  recorder,
+				InsertSettings:           insertSettings,
+				ProgressInterval:         *stateProgressInterval,
+				ForceOptimizeFinal:       *optimizeFinal,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
-					MergeMaxBlockSize:      mergeTreeSettings.MergeMaxBlockSize,
-					MergeMaxBlockSizeBytes: mergeTreeSettings.MergeMaxBlockSizeBytes,
-					MergeSelectingSleepMS:  mergeTreeSettings.MergeSelectingSleepMS,
+					MergeMaxBlockSize:       mergeTreeSettings.MergeMaxBlockSize,
+					MergeMaxBlockSizeBytes:  mergeTreeSettings.MergeMaxBlockSizeBytes,
+					MergeSelectingSleepMS:   mergeTreeSettings.MergeSelectingSleepMS,
+					DefaultCompressionCodec: *defaultCompressionCodec,
 				},
 			}
 			processor.RestartClickHouse = func(ctx context.Context) error {
@@ -848,8 +877,8 @@ func runWorker(ctx context.Context, args []string) error {
 					return fmt.Errorf("stop clickhouse before restart: %w", err)
 				}
 				server = nil
-				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", mergeBackgroundPoolSize)
-				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: mergeBackgroundPoolSize})
+				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", mergeBackgroundPoolSize, "background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy)
+				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: mergeBackgroundPoolSize, MergeSchedulingPolicy: mergeTreeSettings.MergeSchedulingPolicy})
 				if err != nil {
 					return err
 				}

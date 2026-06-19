@@ -77,6 +77,22 @@ func TestArgsIncludeBackgroundPoolSize(t *testing.T) {
 	}
 }
 
+func TestArgsIncludeMergeSchedulingPolicy(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{MergeSchedulingPolicy: "shortest_task_first"}}
+	got, err := cfg.args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"server",
+		"--",
+		"--background_merges_mutations_scheduling_policy=shortest_task_first",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestArgsForClickHouseServerBinaryOmitServerSubcommand(t *testing.T) {
 	cfg := Config{Binary: "clickhouse-server", ConfigFile: "/etc/clickhouse-server/config.xml"}
 	got, err := cfg.args()

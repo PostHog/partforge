@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	DefaultCompressionCodec               = "ZSTD(5)"
 	insertMemoryUsagePercent       uint64 = 80
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
@@ -22,6 +23,7 @@ const (
 	maxMergeMaxBlockSizeRows       uint64 = 262144
 	targetMergeAverageRowSizeBytes uint64 = 1024
 	defaultMergeSelectingSleepMS   uint64 = 1000
+	defaultMergeSchedulingPolicy          = "shortest_task_first"
 )
 
 type Limits struct {
@@ -40,9 +42,11 @@ func MergeBackgroundPoolSize(limits Limits) (int, error) {
 }
 
 type MergeTreeSettings struct {
-	MergeMaxBlockSize      uint64
-	MergeMaxBlockSizeBytes uint64
-	MergeSelectingSleepMS  uint64
+	MergeMaxBlockSize       uint64
+	MergeMaxBlockSizeBytes  uint64
+	MergeSelectingSleepMS   uint64
+	MergeSchedulingPolicy   string
+	DefaultCompressionCodec string
 }
 
 func DetectLimits() (Limits, error) {
@@ -100,9 +104,11 @@ func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
 	mergeMaxBlockSize = clampUint64(mergeMaxBlockSize, minMergeMaxBlockSizeRows, maxMergeMaxBlockSizeRows)
 	mergeMaxBlockSize = roundDownToMultiple(mergeMaxBlockSize, minMergeMaxBlockSizeRows)
 	return MergeTreeSettings{
-		MergeMaxBlockSize:      mergeMaxBlockSize,
-		MergeMaxBlockSizeBytes: mergeMaxBlockSizeBytes,
-		MergeSelectingSleepMS:  defaultMergeSelectingSleepMS,
+		MergeMaxBlockSize:       mergeMaxBlockSize,
+		MergeMaxBlockSizeBytes:  mergeMaxBlockSizeBytes,
+		MergeSelectingSleepMS:   defaultMergeSelectingSleepMS,
+		MergeSchedulingPolicy:   defaultMergeSchedulingPolicy,
+		DefaultCompressionCodec: DefaultCompressionCodec,
 	}, nil
 }
 

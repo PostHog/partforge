@@ -25,8 +25,12 @@ import (
 )
 
 const DefaultMergeTimeout = 10 * time.Minute
+const DefaultMergeHardTimeout = 20 * time.Minute
 const DefaultMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
+const DefaultMergeSmallPartBytes uint64 = 1024 * 1024 * 1024
+const DefaultMergeSmallPartMaxCount uint64 = 2
+const DefaultMergeSmallPartMaxPercent uint64 = 5
 const defaultMergePollInterval = time.Second
 
 const (
@@ -35,6 +39,7 @@ const (
 	stageDownloadSource          = "download_source"
 	stageReadManifest            = "read_manifest"
 	stagePrepareWorkerTables     = "prepare_worker_tables"
+	stageConfigureCompression    = "configure_compression"
 	stageAttachSourcePart        = "attach_source_part"
 	stageInsertSelect            = "insert_select"
 	stageConfigureMergeSettings  = "configure_merge_settings"
@@ -55,6 +60,7 @@ var stageOrder = []string{
 	stageDownloadSource,
 	stageReadManifest,
 	stagePrepareWorkerTables,
+	stageConfigureCompression,
 	stageAttachSourcePart,
 	stageInsertSelect,
 	stageConfigureMergeSettings,
@@ -75,26 +81,31 @@ func StageOrder() []string {
 }
 
 type Processor struct {
-	S3Copy              s3copy.Copier
-	ClickHouse          chhttp.Client
-	WorkDir             string
-	MergeTimeout        time.Duration
-	Metrics             metrics.Recorder
-	InsertSettings      chhttp.QuerySettings
-	ProgressInterval    time.Duration
-	ReportProgress      ProgressReporter
-	MergeTreeSettings   MergeTreeSettings
-	MergeSettleMinWait  time.Duration
-	MergeSettleMinParts uint64
-	MergePollInterval   time.Duration
-	RestartClickHouse   func(context.Context) error
-	ForceOptimizeFinal  bool
+	S3Copy                   s3copy.Copier
+	ClickHouse               chhttp.Client
+	WorkDir                  string
+	MergeTimeout             time.Duration
+	MergeHardTimeout         time.Duration
+	Metrics                  metrics.Recorder
+	InsertSettings           chhttp.QuerySettings
+	ProgressInterval         time.Duration
+	ReportProgress           ProgressReporter
+	MergeTreeSettings        MergeTreeSettings
+	MergeSettleMinWait       time.Duration
+	MergeSettleMinParts      uint64
+	MergeSmallPartBytes      uint64
+	MergeSmallPartMaxCount   uint64
+	MergeSmallPartMaxPercent uint64
+	MergePollInterval        time.Duration
+	RestartClickHouse        func(context.Context) error
+	ForceOptimizeFinal       bool
 }
 
 type MergeTreeSettings struct {
-	MergeMaxBlockSize      uint64
-	MergeMaxBlockSizeBytes uint64
-	MergeSelectingSleepMS  uint64
+	MergeMaxBlockSize       uint64
+	MergeMaxBlockSizeBytes  uint64
+	MergeSelectingSleepMS   uint64
+	DefaultCompressionCodec string
 }
 
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
@@ -395,6 +406,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	slog.Info("created worker tables", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageConfigureCompression); err != nil {
+		return rewriteResult{}, err
+	}
+	if err := p.configureDestinationCompressionCodec(ctx, m); err != nil {
+		return rewriteResult{}, err
+	}
+
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
 		return rewriteResult{}, err
@@ -470,7 +488,12 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"job_id", m.JobID,
 			"part_id", m.PartID,
 			"active_parts", mergeWait.ActiveParts,
+			"small_parts", mergeWait.SmallParts,
+			"small_part_bytes", mergeWait.SmallPartBytes,
+			"total_bytes", mergeWait.TotalBytes,
+			"largest_part_bytes", mergeWait.LargestPartBytes,
 			"zero_merges_idle", mergeWait.ZeroMergesIdle,
+			"no_progress_idle", mergeWait.NoProgressIdle,
 		)
 	} else {
 		slog.Warn(
@@ -479,9 +502,15 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"job_id", m.JobID,
 			"part_id", m.PartID,
 			"timeout", mergeWait.Timeout,
+			"hard_timeout", mergeWait.HardTimeout,
 			"active_merges", mergeWait.ActiveMerges,
 			"active_parts", mergeWait.ActiveParts,
+			"small_parts", mergeWait.SmallParts,
+			"small_part_bytes", mergeWait.SmallPartBytes,
+			"total_bytes", mergeWait.TotalBytes,
+			"largest_part_bytes", mergeWait.LargestPartBytes,
 			"zero_merges_idle", mergeWait.ZeroMergesIdle,
+			"no_progress_idle", mergeWait.NoProgressIdle,
 		)
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
@@ -551,6 +580,9 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m, destDDL); resetErr != nil {
 				return fmt.Errorf("insert-select failed with retryable resource error (%w), but reset destination table failed: %v", err, resetErr)
 			}
+			if settingsErr := p.configureDestinationCompressionCodec(ctx, m); settingsErr != nil {
+				return fmt.Errorf("insert-select failed with retryable resource error (%w), but configure destination compression codec after reset failed: %v", err, settingsErr)
+			}
 			if err := sleepOrDone(ctx, backoff); err != nil {
 				return err
 			}
@@ -559,6 +591,28 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 		}
 		return nil
 	}
+}
+
+func (p Processor) configureDestinationCompressionCodec(ctx context.Context, m manifest.Manifest) error {
+	mergeTreeSettings := p.MergeTreeSettings
+	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
+	if strings.TrimSpace(mergeTreeSettings.DefaultCompressionCodec) == "" {
+		return fmt.Errorf("default_compression_codec must not be empty")
+	}
+	query := "ALTER TABLE " + table +
+		" MODIFY SETTING default_compression_codec = " + chhttp.StringLiteral(mergeTreeSettings.DefaultCompressionCodec)
+	if err := p.ClickHouse.Exec(ctx, query); err != nil {
+		return fmt.Errorf("configure destination compression codec: %w", err)
+	}
+	slog.Info(
+		"configured destination compression codec",
+		"stage", stageConfigureCompression,
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"destination_table", table,
+		"default_compression_codec", mergeTreeSettings.DefaultCompressionCodec,
+	)
+	return nil
 }
 
 func (p Processor) configureDestinationMergeSettings(ctx context.Context, m manifest.Manifest) error {
@@ -1105,17 +1159,33 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 }
 
 type mergeWaitResult struct {
-	Settled        bool
-	ActiveMerges   uint64
-	ActiveParts    uint64
-	ZeroMergesIdle time.Duration
-	Timeout        time.Duration
+	Settled          bool
+	ActiveMerges     uint64
+	ActiveParts      uint64
+	SmallParts       uint64
+	SmallPartBytes   uint64
+	TotalBytes       uint64
+	LargestPartBytes uint64
+	ZeroMergesIdle   time.Duration
+	NoProgressIdle   time.Duration
+	Timeout          time.Duration
+	HardTimeout      time.Duration
 }
 
 func (p Processor) waitForMerges(ctx context.Context, database, table string) (mergeWaitResult, error) {
 	timeout := p.MergeTimeout
 	if timeout == 0 {
 		timeout = DefaultMergeTimeout
+	}
+	if timeout < 0 {
+		return mergeWaitResult{}, fmt.Errorf("merge timeout must be non-negative, got %s", timeout)
+	}
+	hardTimeout := p.MergeHardTimeout
+	if hardTimeout == 0 {
+		hardTimeout = DefaultMergeHardTimeout
+	}
+	if hardTimeout < timeout {
+		return mergeWaitResult{}, fmt.Errorf("merge hard timeout %s must be greater than or equal to merge timeout %s", hardTimeout, timeout)
 	}
 	minWait := p.MergeSettleMinWait
 	if minWait == 0 {
@@ -1128,6 +1198,21 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 	if minParts == 0 {
 		minParts = DefaultMergeSettleMinParts
 	}
+	smallPartBytes := p.MergeSmallPartBytes
+	if smallPartBytes == 0 {
+		smallPartBytes = DefaultMergeSmallPartBytes
+	}
+	smallPartMaxCount := p.MergeSmallPartMaxCount
+	if smallPartMaxCount == 0 {
+		smallPartMaxCount = DefaultMergeSmallPartMaxCount
+	}
+	smallPartMaxPercent := p.MergeSmallPartMaxPercent
+	if smallPartMaxPercent == 0 {
+		smallPartMaxPercent = DefaultMergeSmallPartMaxPercent
+	}
+	if smallPartMaxPercent > 100 {
+		return mergeWaitResult{}, fmt.Errorf("merge small part max percent must be between 0 and 100, got %d", smallPartMaxPercent)
+	}
 	pollInterval := p.MergePollInterval
 	if pollInterval == 0 {
 		pollInterval = defaultMergePollInterval
@@ -1135,11 +1220,16 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 	if pollInterval < 0 {
 		return mergeWaitResult{}, fmt.Errorf("merge poll interval must be non-negative, got %s", pollInterval)
 	}
-	deadline := time.Now().Add(timeout)
+	startedAt := time.Now()
+	baseDeadline := startedAt.Add(timeout)
+	hardDeadline := startedAt.Add(hardTimeout)
 	mergeQuery := "SELECT count() FROM system.merges WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) + " FORMAT TSV"
-	var zeroMergesStablePartsSince time.Time
-	var zeroMergesActiveParts uint64
+	var zeroMergesStableSnapshotSince time.Time
+	var zeroMergesSnapshot mergePartSnapshot
+	var previousSnapshot mergePartSnapshot
+	var havePreviousSnapshot bool
+	lastProgressAt := startedAt
 	for {
 		out, err := p.ClickHouse.QueryString(ctx, mergeQuery)
 		if err != nil {
@@ -1150,53 +1240,209 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 			return mergeWaitResult{}, err
 		}
 		now := time.Now()
+		snapshot, err := p.mergePartSnapshot(ctx, database, table, smallPartBytes)
+		if err != nil {
+			return mergeWaitResult{}, err
+		}
+		debt := hasSmallPartDebt(snapshot, smallPartMaxCount, smallPartMaxPercent)
+		progress := count > 0
+		if havePreviousSnapshot && mergePartProgress(previousSnapshot, snapshot) {
+			progress = true
+		}
+		if progress {
+			lastProgressAt = now
+		}
+		havePreviousSnapshot = true
+		previousSnapshot = snapshot
+		noProgressIdle := now.Sub(lastProgressAt)
+
 		if count == 0 {
-			activeParts, err := p.activePartCount(ctx, database, table)
-			if err != nil {
-				return mergeWaitResult{}, err
+			if snapshot.ActiveParts <= minParts || !debt {
+				return mergeWaitResult{
+					Settled:          true,
+					ActiveParts:      snapshot.ActiveParts,
+					SmallParts:       snapshot.SmallParts,
+					SmallPartBytes:   snapshot.SmallPartBytes,
+					TotalBytes:       snapshot.TotalBytes,
+					LargestPartBytes: snapshot.LargestPartBytes,
+					NoProgressIdle:   noProgressIdle,
+					Timeout:          timeout,
+					HardTimeout:      hardTimeout,
+				}, nil
 			}
-			if activeParts <= minParts {
-				return mergeWaitResult{Settled: true, ActiveParts: activeParts, Timeout: timeout}, nil
+			if zeroMergesStableSnapshotSince.IsZero() || !sameMergePartSnapshot(snapshot, zeroMergesSnapshot) {
+				zeroMergesStableSnapshotSince = now
+				zeroMergesSnapshot = snapshot
 			}
-			if zeroMergesStablePartsSince.IsZero() || activeParts != zeroMergesActiveParts {
-				zeroMergesStablePartsSince = now
-				zeroMergesActiveParts = activeParts
-			}
-			zeroMergesIdle := now.Sub(zeroMergesStablePartsSince)
+			zeroMergesIdle := now.Sub(zeroMergesStableSnapshotSince)
 			if zeroMergesIdle >= minWait {
-				return mergeWaitResult{Settled: true, ActiveParts: activeParts, ZeroMergesIdle: zeroMergesIdle, Timeout: timeout}, nil
+				return mergeWaitResult{
+					Settled:          true,
+					ActiveParts:      snapshot.ActiveParts,
+					SmallParts:       snapshot.SmallParts,
+					SmallPartBytes:   snapshot.SmallPartBytes,
+					TotalBytes:       snapshot.TotalBytes,
+					LargestPartBytes: snapshot.LargestPartBytes,
+					ZeroMergesIdle:   zeroMergesIdle,
+					NoProgressIdle:   noProgressIdle,
+					Timeout:          timeout,
+					HardTimeout:      hardTimeout,
+				}, nil
 			}
-			if now.After(deadline) {
-				return mergeWaitResult{ActiveParts: activeParts, ZeroMergesIdle: zeroMergesIdle, Timeout: timeout}, nil
+			if !now.Before(hardDeadline) {
+				return mergeWaitResult{
+					ActiveParts:      snapshot.ActiveParts,
+					SmallParts:       snapshot.SmallParts,
+					SmallPartBytes:   snapshot.SmallPartBytes,
+					TotalBytes:       snapshot.TotalBytes,
+					LargestPartBytes: snapshot.LargestPartBytes,
+					ZeroMergesIdle:   zeroMergesIdle,
+					NoProgressIdle:   noProgressIdle,
+					Timeout:          timeout,
+					HardTimeout:      hardTimeout,
+				}, nil
 			}
 		} else {
-			zeroMergesStablePartsSince = time.Time{}
-			zeroMergesActiveParts = 0
+			zeroMergesStableSnapshotSince = time.Time{}
+			zeroMergesSnapshot = mergePartSnapshot{}
 		}
-		if now.After(deadline) {
-			return mergeWaitResult{ActiveMerges: count, Timeout: timeout}, nil
+		if !now.Before(hardDeadline) {
+			return mergeWaitResult{
+				ActiveMerges:     count,
+				ActiveParts:      snapshot.ActiveParts,
+				SmallParts:       snapshot.SmallParts,
+				SmallPartBytes:   snapshot.SmallPartBytes,
+				TotalBytes:       snapshot.TotalBytes,
+				LargestPartBytes: snapshot.LargestPartBytes,
+				NoProgressIdle:   noProgressIdle,
+				Timeout:          timeout,
+				HardTimeout:      hardTimeout,
+			}, nil
 		}
+		if !now.Before(baseDeadline) && !shouldExtendMergeWait(count, debt, noProgressIdle, minWait) {
+			return mergeWaitResult{
+				ActiveMerges:     count,
+				ActiveParts:      snapshot.ActiveParts,
+				SmallParts:       snapshot.SmallParts,
+				SmallPartBytes:   snapshot.SmallPartBytes,
+				TotalBytes:       snapshot.TotalBytes,
+				LargestPartBytes: snapshot.LargestPartBytes,
+				NoProgressIdle:   noProgressIdle,
+				Timeout:          timeout,
+				HardTimeout:      hardTimeout,
+			}, nil
+		}
+		sleep := mergeWaitSleepDuration(now, pollInterval, baseDeadline, hardDeadline)
 		select {
 		case <-ctx.Done():
 			return mergeWaitResult{}, ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(sleep):
 		}
 	}
 }
 
-func (p Processor) activePartCount(ctx context.Context, database, table string) (uint64, error) {
-	query := "SELECT count() FROM system.parts WHERE database = " +
+type mergePartSnapshot struct {
+	ActiveParts      uint64
+	TotalBytes       uint64
+	SmallParts       uint64
+	SmallPartBytes   uint64
+	LargestPartBytes uint64
+}
+
+func (p Processor) mergePartSnapshot(ctx context.Context, database, table string, smallPartBytes uint64) (mergePartSnapshot, error) {
+	query := "SELECT count(), ifNull(sum(bytes_on_disk), 0), countIf(bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), " +
+		"ifNull(sumIf(bytes_on_disk, bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), 0), ifNull(max(bytes_on_disk), 0) FROM system.parts WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
 		" AND active FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
-		return 0, err
+		return mergePartSnapshot{}, err
 	}
-	count, err := chhttp.ParseUInt(out)
+	rows, err := chhttp.FormatTSVStrings(out, 5)
 	if err != nil {
-		return 0, err
+		return mergePartSnapshot{}, err
 	}
-	return count, nil
+	if len(rows) != 1 {
+		return mergePartSnapshot{}, fmt.Errorf("expected one active part merge snapshot row, got %d", len(rows))
+	}
+	activeParts, err := chhttp.ParseUInt(rows[0][0])
+	if err != nil {
+		return mergePartSnapshot{}, err
+	}
+	totalBytes, err := chhttp.ParseUInt(rows[0][1])
+	if err != nil {
+		return mergePartSnapshot{}, err
+	}
+	smallParts, err := chhttp.ParseUInt(rows[0][2])
+	if err != nil {
+		return mergePartSnapshot{}, err
+	}
+	smallPartBytesSum, err := chhttp.ParseUInt(rows[0][3])
+	if err != nil {
+		return mergePartSnapshot{}, err
+	}
+	largestPartBytes, err := chhttp.ParseUInt(rows[0][4])
+	if err != nil {
+		return mergePartSnapshot{}, err
+	}
+	return mergePartSnapshot{
+		ActiveParts:      activeParts,
+		TotalBytes:       totalBytes,
+		SmallParts:       smallParts,
+		SmallPartBytes:   smallPartBytesSum,
+		LargestPartBytes: largestPartBytes,
+	}, nil
+}
+
+func hasSmallPartDebt(snapshot mergePartSnapshot, maxSmallParts, maxSmallPercent uint64) bool {
+	if snapshot.ActiveParts <= 1 {
+		return false
+	}
+	if snapshot.SmallParts > maxSmallParts {
+		return true
+	}
+	if snapshot.TotalBytes == 0 {
+		return snapshot.SmallPartBytes > 0
+	}
+	return snapshot.SmallPartBytes*100 > snapshot.TotalBytes*maxSmallPercent
+}
+
+func mergePartProgress(previous, current mergePartSnapshot) bool {
+	return current.ActiveParts < previous.ActiveParts ||
+		current.SmallParts < previous.SmallParts ||
+		current.SmallPartBytes < previous.SmallPartBytes
+}
+
+func sameMergePartSnapshot(a, b mergePartSnapshot) bool {
+	return a.ActiveParts == b.ActiveParts &&
+		a.SmallParts == b.SmallParts &&
+		a.SmallPartBytes == b.SmallPartBytes &&
+		a.TotalBytes == b.TotalBytes &&
+		a.LargestPartBytes == b.LargestPartBytes
+}
+
+func shouldExtendMergeWait(activeMerges uint64, hasDebt bool, noProgressIdle, idleTimeout time.Duration) bool {
+	if !hasDebt {
+		return false
+	}
+	return activeMerges > 0 || noProgressIdle < idleTimeout
+}
+
+func mergeWaitSleepDuration(now time.Time, pollInterval time.Duration, deadlines ...time.Time) time.Duration {
+	sleep := pollInterval
+	for _, deadline := range deadlines {
+		if deadline.IsZero() {
+			continue
+		}
+		remaining := deadline.Sub(now)
+		if remaining > 0 && remaining < sleep {
+			sleep = remaining
+		}
+	}
+	if sleep <= 0 {
+		return time.Nanosecond
+	}
+	return sleep
 }
 
 func defaultWorkDir(workDir string) string {

@@ -116,6 +116,12 @@ func TestMergeTreeSettingsForLimits(t *testing.T) {
 			if settings.MergeSelectingSleepMS != defaultMergeSelectingSleepMS {
 				t.Fatalf("merge_selecting_sleep_ms = %d, want %d", settings.MergeSelectingSleepMS, defaultMergeSelectingSleepMS)
 			}
+			if settings.MergeSchedulingPolicy != defaultMergeSchedulingPolicy {
+				t.Fatalf("background_merges_mutations_scheduling_policy = %q, want %q", settings.MergeSchedulingPolicy, defaultMergeSchedulingPolicy)
+			}
+			if settings.DefaultCompressionCodec != DefaultCompressionCodec {
+				t.Fatalf("default_compression_codec = %q, want %q", settings.DefaultCompressionCodec, DefaultCompressionCodec)
+			}
 		})
 	}
 }
