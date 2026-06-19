@@ -645,7 +645,6 @@ func runWorker(ctx context.Context, args []string) error {
 		mergeSettleMinParts            = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges and unchanged active output part count are required for -merge-settle-min-wait before settling")
 		mergeSmallPartBytes            = fs.Uint64("merge-small-part-bytes", rewrite.DefaultMergeSmallPartBytes, "active output parts below this byte size count as small merge debt")
 		mergeSmallPartMaxCount         = fs.Uint64("merge-small-part-max-count", rewrite.DefaultMergeSmallPartMaxCount, "maximum small active output parts allowed before merge wait treats the table as having small-part debt")
-		mergeSmallPartMaxPercent       = fs.Uint64("merge-small-part-max-percent", rewrite.DefaultMergeSmallPartMaxPercent, "maximum percent of active output bytes allowed in small parts before merge wait treats the table as having small-part debt")
 		mergeIdleOptimizeFinalMaxBytes = fs.Uint64("merge-idle-optimize-final-max-bytes", rewrite.DefaultMergeIdleOptimizeFinalMaxBytes, "maximum active output bytes_on_disk eligible for OPTIMIZE FINAL after destination merges stay idle with small-part debt; 0 disables")
 		metricsAddr                    = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath                    = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
@@ -673,9 +672,6 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *mergeHardTimeout < *mergeTimeout {
 		return fmt.Errorf("merge-hard-timeout %s must be greater than or equal to merge-timeout %s", *mergeHardTimeout, *mergeTimeout)
-	}
-	if *mergeSmallPartMaxPercent > 100 {
-		return fmt.Errorf("merge-small-part-max-percent must be between 0 and 100, got %d", *mergeSmallPartMaxPercent)
 	}
 	slog.Info(
 		"worker started",
@@ -739,7 +735,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_settle_min_parts", *mergeSettleMinParts,
 		"merge_small_part_bytes_on_disk", *mergeSmallPartBytes,
 		"merge_small_part_max_count", *mergeSmallPartMaxCount,
-		"merge_small_part_max_percent", *mergeSmallPartMaxPercent,
 		"merge_idle_optimize_final_max_bytes_on_disk", *mergeIdleOptimizeFinalMaxBytes,
 	)
 
@@ -858,7 +853,6 @@ func runWorker(ctx context.Context, args []string) error {
 				MergeSettleMinParts:            *mergeSettleMinParts,
 				MergeSmallPartBytes:            *mergeSmallPartBytes,
 				MergeSmallPartMaxCount:         *mergeSmallPartMaxCount,
-				MergeSmallPartMaxPercent:       *mergeSmallPartMaxPercent,
 				MergeIdleOptimizeFinalMaxBytes: *mergeIdleOptimizeFinalMaxBytes,
 				Metrics:                        recorder,
 				InsertSettings:                 insertSettings,

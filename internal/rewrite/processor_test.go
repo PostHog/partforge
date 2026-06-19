@@ -151,7 +151,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600, enable_vertical_merge_algorithm = 0"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -279,8 +279,7 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
 
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000"
-	if containsString(queries, want) {
+	if containsQueryWith(queries, "merge_max_block_size") || containsQueryWith(queries, "enable_vertical_merge_algorithm") {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
 	wantCompression := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING default_compression_codec = 'ZSTD(5)'"
@@ -334,6 +333,110 @@ func TestOptimizeFinal(t *testing.T) {
 	want := "OPTIMIZE TABLE `db`.`query_log_archive_temp` FINAL"
 	if len(queries) != 1 || queries[0] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartRetriesUntilSinglePart(t *testing.T) {
+	var queries []string
+	statsResponses := []string{
+		"3\t3000\t300\n",
+		"2\t2000\t200\n",
+		"1\t1000\t100\n",
+	}
+	var statsQueries int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		if strings.Contains(query, "system.parts") {
+			if statsQueries >= len(statsResponses) {
+				t.Fatalf("unexpected extra stats query: %s", query)
+			}
+			_, _ = w.Write([]byte(statsResponses[statsQueries]))
+			statsQueries++
+		}
+	}))
+	defer server.Close()
+
+	var backoffAttempts []uint64
+	stats, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			backoffAttempts = append(backoffAttempts, attempt)
+			return 0
+		},
+	}).optimizeFinalUntilSinglePart(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 1 {
+		t.Fatalf("active parts = %d, want 1", stats.Count)
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != 2 {
+		t.Fatalf("optimize queries = %d, want 2; queries = %#v", optimizeQueries, queries)
+	}
+	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
+		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		if strings.Contains(query, "system.parts") {
+			_, _ = w.Write([]byte("2\t2000\t200\n"))
+		}
+	}))
+	defer server.Close()
+
+	var backoffAttempts []uint64
+	_, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			backoffAttempts = append(backoffAttempts, attempt)
+			return 0
+		},
+	}).optimizeFinalUntilSinglePart(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err == nil {
+		t.Fatal("expected optimize final attempt limit error")
+	}
+	if !strings.Contains(err.Error(), "left 2 active destination parts after 10 optimize final attempts") {
+		t.Fatalf("error = %q, want attempt limit", err)
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != int(DefaultOptimizeFinalMaxAttempts) {
+		t.Fatalf("optimize queries = %d, want %d", optimizeQueries, DefaultOptimizeFinalMaxAttempts)
+	}
+	if len(backoffAttempts) != int(DefaultOptimizeFinalMaxAttempts-1) {
+		t.Fatalf("backoff attempts = %#v, want %d attempts", backoffAttempts, DefaultOptimizeFinalMaxAttempts-1)
+	}
+	for i, attempt := range backoffAttempts {
+		want := uint64(i + 1)
+		if attempt != want {
+			t.Fatalf("backoff attempt %d = %d, want %d", i, attempt, want)
+		}
 	}
 }
 
@@ -507,22 +610,30 @@ func TestWaitForMergesSettlesLargeTailParts(t *testing.T) {
 	}
 }
 
-func TestHasSmallPartDebtWithZeroPercentThreshold(t *testing.T) {
+func TestHasSmallPartDebtUsesSmallPartCount(t *testing.T) {
 	if hasSmallPartDebt(mergePartSnapshot{
-		ActiveParts:    2,
+		ActiveParts:    1,
+		TotalBytes:     1,
+		SmallParts:     10,
+		SmallPartBytes: 1,
+	}, 2) {
+		t.Fatal("expected no small-part debt with one active part")
+	}
+	if hasSmallPartDebt(mergePartSnapshot{
+		ActiveParts:    4,
 		TotalBytes:     10 * 1024 * 1024 * 1024,
-		SmallParts:     0,
-		SmallPartBytes: 0,
-	}, 2, 0) {
-		t.Fatal("expected no small-part debt when no bytes are in small parts")
+		SmallParts:     2,
+		SmallPartBytes: 2 * 1024 * 1024 * 1024,
+	}, 2) {
+		t.Fatal("expected no small-part debt at the allowed small-part count")
 	}
 	if !hasSmallPartDebt(mergePartSnapshot{
-		ActiveParts:    2,
+		ActiveParts:    4,
 		TotalBytes:     10 * 1024 * 1024 * 1024,
-		SmallParts:     1,
+		SmallParts:     3,
 		SmallPartBytes: 1,
-	}, 2, 0) {
-		t.Fatal("expected any small-part bytes to be debt at zero percent threshold")
+	}, 2) {
+		t.Fatal("expected small-part debt above the allowed small-part count")
 	}
 }
 
@@ -772,11 +883,11 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeSmallPartMaxCount != 2 {
 		t.Fatalf("DefaultMergeSmallPartMaxCount = %d, want 2", DefaultMergeSmallPartMaxCount)
 	}
-	if DefaultMergeSmallPartMaxPercent != 5 {
-		t.Fatalf("DefaultMergeSmallPartMaxPercent = %d, want 5", DefaultMergeSmallPartMaxPercent)
-	}
 	if DefaultMergeIdleOptimizeFinalMaxBytes != 50*1024*1024*1024 {
 		t.Fatalf("DefaultMergeIdleOptimizeFinalMaxBytes = %d, want 50 GiB", DefaultMergeIdleOptimizeFinalMaxBytes)
+	}
+	if DefaultOptimizeFinalMaxAttempts != 10 {
+		t.Fatalf("DefaultOptimizeFinalMaxAttempts = %d, want 10", DefaultOptimizeFinalMaxAttempts)
 	}
 }
 
@@ -789,6 +900,26 @@ func TestInsertSelectRetryBackoff(t *testing.T) {
 	}
 	if got := insertSelectRetryBackoff(10); got != 10*time.Second {
 		t.Fatalf("attempt 10 backoff = %s", got)
+	}
+}
+
+func TestOptimizeFinalRetryBackoff(t *testing.T) {
+	tests := []struct {
+		attempt uint64
+		want    time.Duration
+	}{
+		{attempt: 0, want: time.Second},
+		{attempt: 1, want: time.Second},
+		{attempt: 2, want: 2 * time.Second},
+		{attempt: 4, want: 8 * time.Second},
+		{attempt: 5, want: 10 * time.Second},
+		{attempt: 10, want: 10 * time.Second},
+	}
+
+	for _, tt := range tests {
+		if got := optimizeFinalRetryBackoff(tt.attempt); got != tt.want {
+			t.Fatalf("attempt %d backoff = %s, want %s", tt.attempt, got, tt.want)
+		}
 	}
 }
 
@@ -1091,4 +1222,23 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func containsQueryWith(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func countQueriesWith(values []string, want string) int {
+	count := 0
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			count++
+		}
+	}
+	return count
 }

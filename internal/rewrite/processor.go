@@ -30,10 +30,11 @@ const DefaultMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
 const DefaultMergeSmallPartBytes uint64 = 1024 * 1024 * 1024
 const DefaultMergeSmallPartMaxCount uint64 = 2
-const DefaultMergeSmallPartMaxPercent uint64 = 5
 const DefaultMergeIdleOptimizeFinalMaxBytes uint64 = 50 * 1024 * 1024 * 1024
+const DefaultOptimizeFinalMaxAttempts uint64 = 10
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
+const defaultOptimizeFinalRetryMaxBackoff = 10 * time.Second
 
 const (
 	autoMergeTargetPartCount             uint64 = 4
@@ -107,9 +108,9 @@ type Processor struct {
 	MergeSettleMinParts            uint64
 	MergeSmallPartBytes            uint64
 	MergeSmallPartMaxCount         uint64
-	MergeSmallPartMaxPercent       uint64
 	MergeIdleOptimizeFinalMaxBytes uint64
 	MergePollInterval              time.Duration
+	optimizeFinalRetryBackoff      func(uint64) time.Duration
 	RestartClickHouse              func(context.Context) error
 	ForceOptimizeFinal             bool
 }
@@ -480,12 +481,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
 			return rewriteResult{}, err
 		}
-		slog.Info("optimizing destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal)
+		slog.Info("optimizing destination table final until one active part", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal, "max_attempts", DefaultOptimizeFinalMaxAttempts)
 		optimizeStartedAt := time.Now()
-		if err := p.optimizeFinal(ctx, m); err != nil {
+		optimizeStats, err := p.optimizeFinalUntilSinglePart(ctx, m)
+		if err != nil {
 			return rewriteResult{}, fmt.Errorf("optimize destination table final: %w", err)
 		}
-		slog.Info("optimized destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(optimizeStartedAt))
+		slog.Info("optimized destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "active_parts", optimizeStats.Count, "active_rows", optimizeStats.Rows, "active_bytes_on_disk", optimizeStats.Bytes, "elapsed", time.Since(optimizeStartedAt))
 		ranOptimizeFinal = true
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
@@ -698,7 +700,8 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
-		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
+		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10) +
+		", enable_vertical_merge_algorithm = 0"
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure destination table merge settings: %w", err)
 	}
@@ -715,6 +718,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"destination_active_bytes_on_disk", stats.Bytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
+		"enable_vertical_merge_algorithm", false,
 	)
 	return nil
 }
@@ -813,6 +817,94 @@ func (p Processor) shouldOptimizeFinalAfterIdleMerges(result mergeWaitResult) bo
 
 func (p Processor) optimizeFinal(ctx context.Context, m manifest.Manifest) error {
 	return p.ClickHouse.Exec(ctx, "OPTIMIZE TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FINAL")
+}
+
+func (p Processor) optimizeFinalUntilSinglePart(ctx context.Context, m manifest.Manifest) (metrics.PartStats, error) {
+	stats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
+	if err != nil {
+		return metrics.PartStats{}, fmt.Errorf("measure destination active parts before optimize final: %w", err)
+	}
+	if stats.Count <= 1 {
+		return stats, nil
+	}
+	for attempt := uint64(1); attempt <= DefaultOptimizeFinalMaxAttempts; attempt++ {
+		slog.Info(
+			"optimizing destination table final attempt",
+			"stage", stageOptimizeFinal,
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+			"attempt", attempt,
+			"max_attempts", DefaultOptimizeFinalMaxAttempts,
+			"active_parts", stats.Count,
+			"active_rows", stats.Rows,
+			"active_bytes_on_disk", stats.Bytes,
+		)
+		startedAt := time.Now()
+		if err := p.optimizeFinal(ctx, m); err != nil {
+			return stats, fmt.Errorf("attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+		}
+		stats, err = p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
+		if err != nil {
+			return metrics.PartStats{}, fmt.Errorf("measure destination active parts after optimize final attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+		}
+		slog.Info(
+			"optimized destination table final attempt",
+			"stage", stageOptimizeFinal,
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+			"attempt", attempt,
+			"max_attempts", DefaultOptimizeFinalMaxAttempts,
+			"active_parts", stats.Count,
+			"active_rows", stats.Rows,
+			"active_bytes_on_disk", stats.Bytes,
+			"elapsed", time.Since(startedAt),
+		)
+		if stats.Count <= 1 {
+			return stats, nil
+		}
+		if attempt < DefaultOptimizeFinalMaxAttempts {
+			backoff := p.optimizeFinalBackoff(attempt)
+			if backoff < 0 {
+				return stats, fmt.Errorf("optimize final retry backoff after attempt %d/%d must be non-negative, got %s", attempt, DefaultOptimizeFinalMaxAttempts, backoff)
+			}
+			if backoff > 0 {
+				slog.Info(
+					"waiting before retrying destination table final optimize",
+					"stage", stageOptimizeFinal,
+					"job_id", m.JobID,
+					"part_id", m.PartID,
+					"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+					"next_attempt", attempt+1,
+					"max_attempts", DefaultOptimizeFinalMaxAttempts,
+					"active_parts", stats.Count,
+					"backoff", backoff,
+				)
+				if err := sleepOrDone(ctx, backoff); err != nil {
+					return stats, err
+				}
+			}
+		}
+	}
+	return stats, fmt.Errorf("left %d active destination parts after %d optimize final attempts", stats.Count, DefaultOptimizeFinalMaxAttempts)
+}
+
+func (p Processor) optimizeFinalBackoff(attempt uint64) time.Duration {
+	if p.optimizeFinalRetryBackoff != nil {
+		return p.optimizeFinalRetryBackoff(attempt)
+	}
+	return optimizeFinalRetryBackoff(attempt)
+}
+
+func optimizeFinalRetryBackoff(attempt uint64) time.Duration {
+	if attempt < 1 {
+		return time.Second
+	}
+	if attempt >= 5 {
+		return defaultOptimizeFinalRetryMaxBackoff
+	}
+	return time.Second << (attempt - 1)
 }
 
 func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {
@@ -1367,13 +1459,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 	if smallPartMaxCount == 0 {
 		smallPartMaxCount = DefaultMergeSmallPartMaxCount
 	}
-	smallPartMaxPercent := p.MergeSmallPartMaxPercent
-	if smallPartMaxPercent == 0 {
-		smallPartMaxPercent = DefaultMergeSmallPartMaxPercent
-	}
-	if smallPartMaxPercent > 100 {
-		return mergeWaitResult{}, fmt.Errorf("merge small part max percent must be between 0 and 100, got %d", smallPartMaxPercent)
-	}
 	pollInterval := p.MergePollInterval
 	if pollInterval == 0 {
 		pollInterval = defaultMergePollInterval
@@ -1400,7 +1485,7 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
-		debt := hasSmallPartDebt(snapshot, smallPartMaxCount, smallPartMaxPercent)
+		debt := hasSmallPartDebt(snapshot, smallPartMaxCount)
 		progress := count > 0
 		if havePreviousSnapshot && mergePartProgress(previousSnapshot, snapshot) {
 			progress = true
@@ -1657,17 +1742,11 @@ func (p Processor) mergeSmallPartBytes() uint64 {
 	return p.MergeSmallPartBytes
 }
 
-func hasSmallPartDebt(snapshot mergePartSnapshot, maxSmallParts, maxSmallPercent uint64) bool {
+func hasSmallPartDebt(snapshot mergePartSnapshot, maxSmallParts uint64) bool {
 	if snapshot.ActiveParts <= 1 {
 		return false
 	}
-	if snapshot.SmallParts > maxSmallParts {
-		return true
-	}
-	if snapshot.TotalBytes == 0 {
-		return snapshot.SmallPartBytes > 0
-	}
-	return snapshot.SmallPartBytes*100 > snapshot.TotalBytes*maxSmallPercent
+	return snapshot.SmallParts > maxSmallParts
 }
 
 func mergePartProgress(previous, current mergePartSnapshot) bool {
