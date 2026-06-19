@@ -31,6 +31,7 @@ const DefaultMergeSettleMinParts uint64 = 1
 const DefaultMergeSmallPartBytes uint64 = 1024 * 1024 * 1024
 const DefaultMergeSmallPartMaxCount uint64 = 2
 const DefaultMergeSmallPartMaxPercent uint64 = 5
+const DefaultMergeIdleOptimizeFinalMaxBytes uint64 = 50 * 1024 * 1024 * 1024
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 
@@ -92,24 +93,25 @@ func StageOrder() []string {
 }
 
 type Processor struct {
-	S3Copy                   s3copy.Copier
-	ClickHouse               chhttp.Client
-	WorkDir                  string
-	MergeTimeout             time.Duration
-	MergeHardTimeout         time.Duration
-	Metrics                  metrics.Recorder
-	InsertSettings           chhttp.QuerySettings
-	ProgressInterval         time.Duration
-	ReportProgress           ProgressReporter
-	MergeTreeSettings        MergeTreeSettings
-	MergeSettleMinWait       time.Duration
-	MergeSettleMinParts      uint64
-	MergeSmallPartBytes      uint64
-	MergeSmallPartMaxCount   uint64
-	MergeSmallPartMaxPercent uint64
-	MergePollInterval        time.Duration
-	RestartClickHouse        func(context.Context) error
-	ForceOptimizeFinal       bool
+	S3Copy                         s3copy.Copier
+	ClickHouse                     chhttp.Client
+	WorkDir                        string
+	MergeTimeout                   time.Duration
+	MergeHardTimeout               time.Duration
+	Metrics                        metrics.Recorder
+	InsertSettings                 chhttp.QuerySettings
+	ProgressInterval               time.Duration
+	ReportProgress                 ProgressReporter
+	MergeTreeSettings              MergeTreeSettings
+	MergeSettleMinWait             time.Duration
+	MergeSettleMinParts            uint64
+	MergeSmallPartBytes            uint64
+	MergeSmallPartMaxCount         uint64
+	MergeSmallPartMaxPercent       uint64
+	MergeIdleOptimizeFinalMaxBytes uint64
+	MergePollInterval              time.Duration
+	RestartClickHouse              func(context.Context) error
+	ForceOptimizeFinal             bool
 }
 
 type MergeTreeSettings struct {
@@ -450,7 +452,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{SourceActivePartStats: &sourceStats}); err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("attached source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "active_parts", sourceStats.Count, "active_rows", sourceStats.Rows, "active_bytes", sourceStats.Bytes)
+	slog.Info("attached source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "active_parts", sourceStats.Count, "active_rows", sourceStats.Rows, "active_bytes_on_disk", sourceStats.Bytes)
 
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageInsertSelect); err != nil {
 		return rewriteResult{}, err
@@ -473,6 +475,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.restartClickHouse(ctx, m); err != nil {
 		return rewriteResult{}, err
 	}
+	ranOptimizeFinal := false
 	if p.shouldOptimizeFinal(m) {
 		if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
 			return rewriteResult{}, err
@@ -483,19 +486,59 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			return rewriteResult{}, fmt.Errorf("optimize destination table final: %w", err)
 		}
 		slog.Info("optimized destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(optimizeStartedAt))
+		ranOptimizeFinal = true
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
-	mergeWait, err := p.waitForMerges(ctx, mergeWaitTarget{
+	mergeTarget := mergeWaitTarget{
 		JobID:    m.JobID,
 		PartID:   m.PartID,
 		Database: m.Dest.Database,
 		Table:    m.Dest.Table,
-	})
+	}
+	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
+	mergeWait, err := p.waitForMerges(ctx, mergeTarget)
 	if err != nil {
 		return rewriteResult{}, err
+	}
+	if !ranOptimizeFinal && p.shouldOptimizeFinalAfterIdleMerges(mergeWait) {
+		if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
+			return rewriteResult{}, err
+		}
+		slog.Info(
+			"optimizing destination table final after idle destination merges",
+			"stage", stageOptimizeFinal,
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+			"settle_reason", mergeWait.Reason,
+			"active_parts", mergeWait.ActiveParts,
+			"small_parts", mergeWait.SmallParts,
+			"small_part_bytes_on_disk", mergeWait.SmallPartBytes,
+			"total_bytes_on_disk", mergeWait.TotalBytes,
+			"largest_part_bytes_on_disk", mergeWait.LargestPartBytes,
+			"merge_idle_optimize_final_max_bytes_on_disk", p.MergeIdleOptimizeFinalMaxBytes,
+		)
+		optimizeStartedAt := time.Now()
+		if err := p.optimizeFinal(ctx, m); err != nil {
+			return rewriteResult{}, fmt.Errorf("optimize destination table final after idle destination merges: %w", err)
+		}
+		slog.Info("optimized destination table final after idle destination merges", "stage", stageOptimizeFinal, "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(optimizeStartedAt))
+		if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
+			return rewriteResult{}, err
+		}
+		postOptimizeSnapshot, err := p.mergePartSnapshot(ctx, mergeTarget, p.mergeSmallPartBytes())
+		if err != nil {
+			return rewriteResult{}, fmt.Errorf("measure destination parts after idle optimize final: %w", err)
+		}
+		mergeWait.Reason = "optimized_final_after_idle_destination_merges"
+		mergeWait.ActiveMerges = 0
+		mergeWait.ActiveParts = postOptimizeSnapshot.ActiveParts
+		mergeWait.SmallParts = postOptimizeSnapshot.SmallParts
+		mergeWait.SmallPartBytes = postOptimizeSnapshot.SmallPartBytes
+		mergeWait.TotalBytes = postOptimizeSnapshot.TotalBytes
+		mergeWait.LargestPartBytes = postOptimizeSnapshot.LargestPartBytes
 	}
 	if mergeWait.Settled {
 		slog.Info(
@@ -506,9 +549,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"settle_reason", mergeWait.Reason,
 			"active_parts", mergeWait.ActiveParts,
 			"small_parts", mergeWait.SmallParts,
-			"small_part_bytes", mergeWait.SmallPartBytes,
-			"total_bytes", mergeWait.TotalBytes,
-			"largest_part_bytes", mergeWait.LargestPartBytes,
+			"small_part_bytes_on_disk", mergeWait.SmallPartBytes,
+			"total_bytes_on_disk", mergeWait.TotalBytes,
+			"largest_part_bytes_on_disk", mergeWait.LargestPartBytes,
 			"zero_merges_idle", mergeWait.ZeroMergesIdle,
 			"no_progress_idle", mergeWait.NoProgressIdle,
 		)
@@ -524,9 +567,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"active_merges", mergeWait.ActiveMerges,
 			"active_parts", mergeWait.ActiveParts,
 			"small_parts", mergeWait.SmallParts,
-			"small_part_bytes", mergeWait.SmallPartBytes,
-			"total_bytes", mergeWait.TotalBytes,
-			"largest_part_bytes", mergeWait.LargestPartBytes,
+			"small_part_bytes_on_disk", mergeWait.SmallPartBytes,
+			"total_bytes_on_disk", mergeWait.TotalBytes,
+			"largest_part_bytes_on_disk", mergeWait.LargestPartBytes,
 			"zero_merges_idle", mergeWait.ZeroMergesIdle,
 			"no_progress_idle", mergeWait.NoProgressIdle,
 		)
@@ -542,7 +585,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("measured destination parts", "stage", "measure_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes", destStats.Bytes)
+	slog.Info("measured destination parts", "stage", "measure_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes)
 
 	if destStats.Count == 0 {
 		return result, nil
@@ -669,7 +712,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"destination_active_parts", stats.Count,
-		"destination_active_bytes", stats.Bytes,
+		"destination_active_bytes_on_disk", stats.Bytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
 	)
@@ -755,6 +798,17 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 
 func (p Processor) shouldOptimizeFinal(m manifest.Manifest) bool {
 	return p.ForceOptimizeFinal || m.Options.OptimizeFinal
+}
+
+func (p Processor) shouldOptimizeFinalAfterIdleMerges(result mergeWaitResult) bool {
+	if p.MergeIdleOptimizeFinalMaxBytes == 0 {
+		return false
+	}
+	return result.Settled &&
+		result.Reason == "destination_merges_idle" &&
+		result.ActiveParts > 1 &&
+		result.TotalBytes > 0 &&
+		result.TotalBytes <= p.MergeIdleOptimizeFinalMaxBytes
 }
 
 func (p Processor) optimizeFinal(ctx context.Context, m manifest.Manifest) error {
@@ -1308,10 +1362,7 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 	if minParts == 0 {
 		minParts = DefaultMergeSettleMinParts
 	}
-	smallPartBytes := p.MergeSmallPartBytes
-	if smallPartBytes == 0 {
-		smallPartBytes = DefaultMergeSmallPartBytes
-	}
+	smallPartBytes := p.mergeSmallPartBytes()
 	smallPartMaxCount := p.MergeSmallPartMaxCount
 	if smallPartMaxCount == 0 {
 		smallPartMaxCount = DefaultMergeSmallPartMaxCount
@@ -1542,9 +1593,9 @@ func (s *mergeWaitLogState) maybeLog(
 		"active_destination_merges", activeMerges,
 		"active_parts", snapshot.ActiveParts,
 		"small_parts", snapshot.SmallParts,
-		"small_part_bytes", snapshot.SmallPartBytes,
-		"total_bytes", snapshot.TotalBytes,
-		"largest_part_bytes", snapshot.LargestPartBytes,
+		"small_part_bytes_on_disk", snapshot.SmallPartBytes,
+		"total_bytes_on_disk", snapshot.TotalBytes,
+		"largest_part_bytes_on_disk", snapshot.LargestPartBytes,
 		"has_small_part_debt", hasDebt,
 		"progress_observed", progress,
 		"zero_merges_idle", zeroMergesIdle,
@@ -1597,6 +1648,13 @@ func (p Processor) mergePartSnapshot(ctx context.Context, target mergeWaitTarget
 		SmallPartBytes:   smallPartBytesSum,
 		LargestPartBytes: largestPartBytes,
 	}, nil
+}
+
+func (p Processor) mergeSmallPartBytes() uint64 {
+	if p.MergeSmallPartBytes == 0 {
+		return DefaultMergeSmallPartBytes
+	}
+	return p.MergeSmallPartBytes
 }
 
 func hasSmallPartDebt(snapshot mergePartSnapshot, maxSmallParts, maxSmallPercent uint64) bool {

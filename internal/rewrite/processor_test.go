@@ -349,6 +349,45 @@ func TestShouldOptimizeFinal(t *testing.T) {
 	}
 }
 
+func TestShouldOptimizeFinalAfterIdleMerges(t *testing.T) {
+	eligible := mergeWaitResult{
+		Settled:     true,
+		Reason:      "destination_merges_idle",
+		ActiveParts: 4,
+		TotalBytes:  40 * 1024 * 1024 * 1024,
+	}
+	if !((Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(eligible)) {
+		t.Fatal("expected idle small output to trigger optimize final")
+	}
+	if (Processor{}).shouldOptimizeFinalAfterIdleMerges(eligible) {
+		t.Fatal("expected zero threshold to disable idle optimize final")
+	}
+	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
+		Settled:     true,
+		Reason:      "destination_merges_idle",
+		ActiveParts: 4,
+		TotalBytes:  60 * 1024 * 1024 * 1024,
+	}) {
+		t.Fatal("expected large output to skip idle optimize final")
+	}
+	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
+		Settled:     true,
+		Reason:      "no_small_part_debt",
+		ActiveParts: 4,
+		TotalBytes:  40 * 1024 * 1024 * 1024,
+	}) {
+		t.Fatal("expected settled output without idle merge debt to skip optimize final")
+	}
+	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
+		Settled:     true,
+		Reason:      "destination_merges_idle",
+		ActiveParts: 1,
+		TotalBytes:  40 * 1024 * 1024 * 1024,
+	}) {
+		t.Fatal("expected one active part to skip idle optimize final")
+	}
+}
+
 func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -662,6 +701,41 @@ func TestDestinationMergeCountFiltersToTargetTable(t *testing.T) {
 	}
 }
 
+func TestMergePartSnapshotUsesBytesOnDisk(t *testing.T) {
+	var partQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		partQuery = string(body)
+		_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+	}))
+	defer server.Close()
+
+	snapshot, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).mergePartSnapshot(context.Background(), testMergeWaitTarget(), DefaultMergeSmallPartBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.TotalBytes == 0 {
+		t.Fatal("expected snapshot bytes")
+	}
+	for _, want := range []string{
+		"sum(bytes_on_disk)",
+		"countIf(bytes_on_disk <",
+		"sumIf(bytes_on_disk, bytes_on_disk <",
+		"max(bytes_on_disk)",
+	} {
+		if !strings.Contains(partQuery, want) {
+			t.Fatalf("part query = %q, missing %q", partQuery, want)
+		}
+	}
+}
+
 func smallDebtMergeSnapshot() string {
 	return "4\t1073741824\t4\t1073741824\t268435456\n"
 }
@@ -700,6 +774,9 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	}
 	if DefaultMergeSmallPartMaxPercent != 5 {
 		t.Fatalf("DefaultMergeSmallPartMaxPercent = %d, want 5", DefaultMergeSmallPartMaxPercent)
+	}
+	if DefaultMergeIdleOptimizeFinalMaxBytes != 50*1024*1024*1024 {
+		t.Fatalf("DefaultMergeIdleOptimizeFinalMaxBytes = %d, want 50 GiB", DefaultMergeIdleOptimizeFinalMaxBytes)
 	}
 }
 
