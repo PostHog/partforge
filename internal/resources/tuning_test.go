@@ -113,6 +113,9 @@ func TestMergeTreeSettingsForLimits(t *testing.T) {
 			if settings.MergeMaxBlockSizeBytes != tt.wantBytes {
 				t.Fatalf("merge_max_block_size_bytes = %d, want %d", settings.MergeMaxBlockSizeBytes, tt.wantBytes)
 			}
+			if settings.MergeSelectingSleepMS != defaultMergeSelectingSleepMS {
+				t.Fatalf("merge_selecting_sleep_ms = %d, want %d", settings.MergeSelectingSleepMS, defaultMergeSelectingSleepMS)
+			}
 		})
 	}
 }

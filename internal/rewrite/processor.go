@@ -25,6 +25,8 @@ import (
 )
 
 const DefaultMergeTimeout = 10 * time.Minute
+const DefaultMergeSettleMinWait = 2 * time.Minute
+const DefaultMergeSettleMinParts uint64 = 1
 
 const (
 	stageProcessPart             = "process_part"
@@ -72,22 +74,25 @@ func StageOrder() []string {
 }
 
 type Processor struct {
-	S3Copy             s3copy.Copier
-	ClickHouse         chhttp.Client
-	WorkDir            string
-	MergeTimeout       time.Duration
-	Metrics            metrics.Recorder
-	InsertSettings     chhttp.QuerySettings
-	ProgressInterval   time.Duration
-	ReportProgress     ProgressReporter
-	MergeTreeSettings  MergeTreeSettings
-	RestartClickHouse  func(context.Context) error
-	ForceOptimizeFinal bool
+	S3Copy              s3copy.Copier
+	ClickHouse          chhttp.Client
+	WorkDir             string
+	MergeTimeout        time.Duration
+	Metrics             metrics.Recorder
+	InsertSettings      chhttp.QuerySettings
+	ProgressInterval    time.Duration
+	ReportProgress      ProgressReporter
+	MergeTreeSettings   MergeTreeSettings
+	MergeSettleMinWait  time.Duration
+	MergeSettleMinParts uint64
+	RestartClickHouse   func(context.Context) error
+	ForceOptimizeFinal  bool
 }
 
 type MergeTreeSettings struct {
 	MergeMaxBlockSize      uint64
 	MergeMaxBlockSizeBytes uint64
+	MergeSelectingSleepMS  uint64
 }
 
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
@@ -466,6 +471,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"part_id", m.PartID,
 			"timeout", mergeWait.Timeout,
 			"active_merges", mergeWait.ActiveMerges,
+			"active_parts", mergeWait.ActiveParts,
 		)
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
@@ -554,9 +560,13 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	if mergeTreeSettings.MergeMaxBlockSizeBytes == 0 {
 		return fmt.Errorf("merge_max_block_size_bytes must be greater than zero")
 	}
+	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
+		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
+	}
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
-		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10)
+		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
+		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure destination table merge settings: %w", err)
 	}
@@ -568,6 +578,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"destination_table", table,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
+		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 	)
 	return nil
 }
@@ -1086,6 +1097,7 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 type mergeWaitResult struct {
 	Settled      bool
 	ActiveMerges uint64
+	ActiveParts  uint64
 	Timeout      time.Duration
 }
 
@@ -1094,11 +1106,23 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 	if timeout == 0 {
 		timeout = DefaultMergeTimeout
 	}
+	minWait := p.MergeSettleMinWait
+	if minWait == 0 {
+		minWait = DefaultMergeSettleMinWait
+	}
+	if minWait < 0 {
+		return mergeWaitResult{}, fmt.Errorf("merge settle minimum wait must be non-negative, got %s", minWait)
+	}
+	minParts := p.MergeSettleMinParts
+	if minParts == 0 {
+		minParts = DefaultMergeSettleMinParts
+	}
 	deadline := time.Now().Add(timeout)
-	query := "SELECT count() FROM system.merges WHERE database = " +
+	mergeQuery := "SELECT count() FROM system.merges WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) + " FORMAT TSV"
+	var zeroMergesWithManyPartsSince time.Time
 	for {
-		out, err := p.ClickHouse.QueryString(ctx, query)
+		out, err := p.ClickHouse.QueryString(ctx, mergeQuery)
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
@@ -1106,10 +1130,28 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
+		now := time.Now()
 		if count == 0 {
-			return mergeWaitResult{Settled: true, Timeout: timeout}, nil
+			activeParts, err := p.activePartCount(ctx, database, table)
+			if err != nil {
+				return mergeWaitResult{}, err
+			}
+			if activeParts <= minParts {
+				return mergeWaitResult{Settled: true, ActiveParts: activeParts, Timeout: timeout}, nil
+			}
+			if zeroMergesWithManyPartsSince.IsZero() {
+				zeroMergesWithManyPartsSince = now
+			}
+			if now.Sub(zeroMergesWithManyPartsSince) >= minWait {
+				return mergeWaitResult{Settled: true, ActiveParts: activeParts, Timeout: timeout}, nil
+			}
+			if now.After(deadline) {
+				return mergeWaitResult{ActiveParts: activeParts, Timeout: timeout}, nil
+			}
+		} else {
+			zeroMergesWithManyPartsSince = time.Time{}
 		}
-		if time.Now().After(deadline) {
+		if now.After(deadline) {
 			return mergeWaitResult{ActiveMerges: count, Timeout: timeout}, nil
 		}
 		select {
@@ -1118,6 +1160,21 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+func (p Processor) activePartCount(ctx context.Context, database, table string) (uint64, error) {
+	query := "SELECT count() FROM system.parts WHERE database = " +
+		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
+		" AND active FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	count, err := chhttp.ParseUInt(out)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func defaultWorkDir(workDir string) string {

@@ -137,6 +137,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:      32768,
 			MergeMaxBlockSizeBytes: 67108864,
+			MergeSelectingSleepMS:  1000,
 		},
 	}).configureDestinationMergeSettings(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
@@ -146,7 +147,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000"
 	if len(queries) != 1 || queries[0] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -180,6 +181,7 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:      32768,
 			MergeMaxBlockSizeBytes: 67108864,
+			MergeSelectingSleepMS:  1000,
 		},
 	}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
@@ -191,7 +193,7 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
 
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000"
 	if containsString(queries, want) {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
@@ -317,9 +319,58 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T) {
+	var mergeRequests int
+	var partRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			mergeRequests++
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.parts"):
+			partRequests++
+			_, _ = w.Write([]byte("4\n"))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 3,
+	}).waitForMerges(ctx, "db", "query_log_archive_temp")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if mergeRequests == 0 {
+		t.Fatal("expected system.merges to be queried")
+	}
+	if partRequests == 0 {
+		t.Fatal("expected system.parts to be queried after zero active merges")
+	}
+}
+
 func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeTimeout != 10*time.Minute {
 		t.Fatalf("DefaultMergeTimeout = %s, want 10m", DefaultMergeTimeout)
+	}
+	if DefaultMergeSettleMinWait != 2*time.Minute {
+		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
+	}
+	if DefaultMergeSettleMinParts != 3 {
+		t.Fatalf("DefaultMergeSettleMinParts = %d, want 3", DefaultMergeSettleMinParts)
 	}
 }
 

@@ -21,6 +21,7 @@ const (
 	minMergeMaxBlockSizeRows       uint64 = 8192
 	maxMergeMaxBlockSizeRows       uint64 = 262144
 	targetMergeAverageRowSizeBytes uint64 = 1024
+	defaultMergeSelectingSleepMS   uint64 = 1000
 )
 
 type Limits struct {
@@ -41,6 +42,7 @@ func MergeBackgroundPoolSize(limits Limits) (int, error) {
 type MergeTreeSettings struct {
 	MergeMaxBlockSize      uint64
 	MergeMaxBlockSizeBytes uint64
+	MergeSelectingSleepMS  uint64
 }
 
 func DetectLimits() (Limits, error) {
@@ -100,6 +102,7 @@ func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
 	return MergeTreeSettings{
 		MergeMaxBlockSize:      mergeMaxBlockSize,
 		MergeMaxBlockSizeBytes: mergeMaxBlockSizeBytes,
+		MergeSelectingSleepMS:  defaultMergeSelectingSleepMS,
 	}, nil
 }
 

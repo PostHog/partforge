@@ -394,12 +394,16 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 	got := captureFileOutput(t, func(out *os.File) {
 		printPartRows(out, []state.Part{
 			{
-				PartID:       "part-1",
-				Status:       state.StatusFinished,
-				ReadRows:     100,
-				ReadBytes:    1536,
-				WrittenRows:  90,
-				WrittenBytes: 2 * 1024 * 1024,
+				PartID:                     "part-1",
+				Status:                     state.StatusFinished,
+				ReadRows:                   100,
+				ReadBytes:                  1536,
+				WrittenRows:                90,
+				WrittenBytes:               2 * 1024 * 1024,
+				DestinationActivePartCount: 3,
+				RewriteStageDurationsMs: map[string]int64{
+					"wait_merges": 65_000,
+				},
 			},
 		})
 	})
@@ -407,8 +411,12 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 	for _, want := range []string{
 		"READ_SIZE",
 		"WRITTEN_SIZE",
+		"OUTPUT_PARTS",
+		"SETTLE_WAIT",
 		"1.5 KB",
 		"2 MB",
+		"3",
+		"1m5s",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("printPartRows output missing %q:\n%s", want, got)
@@ -416,6 +424,23 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 	}
 	if strings.Contains(got, "READ_BYTES") || strings.Contains(got, "WRITTEN_BYTES") {
 		t.Fatalf("printPartRows output still uses raw byte headers:\n%s", got)
+	}
+}
+
+func TestPrintPartRowsUsesCurrentWaitMergesElapsed(t *testing.T) {
+	got := captureFileOutput(t, func(out *os.File) {
+		printPartRows(out, []state.Part{
+			{
+				PartID:                "part-1",
+				Status:                state.StatusInProgress,
+				RewriteStage:          "wait_merges",
+				RewriteStageElapsedMs: 125_000,
+			},
+		})
+	})
+
+	if !strings.Contains(got, "2m5s") {
+		t.Fatalf("printPartRows output missing live settle wait:\n%s", got)
 	}
 }
 

@@ -41,6 +41,7 @@ const defaultWorkerShutdownGracePeriod = 90 * time.Second
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 const inProgressStageUnknown = "unknown"
+const settleWaitStage = "wait_merges"
 
 var version = "dev"
 
@@ -638,6 +639,8 @@ func runWorker(ctx context.Context, args []string) error {
 		workerID              = fs.String("worker-id", "", "worker identity recorded on claimed parts")
 		workDir               = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
 		mergeTimeout          = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges")
+		mergeSettleMinWait    = fs.Duration("merge-settle-min-wait", rewrite.DefaultMergeSettleMinWait, "minimum time to keep polling when destination merges are idle but active output parts remain above -merge-settle-min-parts")
+		mergeSettleMinParts   = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges must remain idle for -merge-settle-min-wait before settling")
 		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
@@ -652,6 +655,9 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
 		return err
+	}
+	if *mergeSettleMinWait < 0 {
+		return fmt.Errorf("merge-settle-min-wait must be non-negative, got %s", *mergeSettleMinWait)
 	}
 	slog.Info(
 		"worker started",
@@ -706,6 +712,9 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_background_pool_size", mergeBackgroundPoolSize,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
+		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
+		"merge_settle_min_wait", *mergeSettleMinWait,
+		"merge_settle_min_parts", *mergeSettleMinParts,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -814,17 +823,20 @@ func runWorker(ctx context.Context, args []string) error {
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:             s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:         ch,
-				WorkDir:            runDirs.Scratch,
-				MergeTimeout:       *mergeTimeout,
-				Metrics:            recorder,
-				InsertSettings:     insertSettings,
-				ProgressInterval:   *stateProgressInterval,
-				ForceOptimizeFinal: *optimizeFinal,
+				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:          ch,
+				WorkDir:             runDirs.Scratch,
+				MergeTimeout:        *mergeTimeout,
+				MergeSettleMinWait:  *mergeSettleMinWait,
+				MergeSettleMinParts: *mergeSettleMinParts,
+				Metrics:             recorder,
+				InsertSettings:      insertSettings,
+				ProgressInterval:    *stateProgressInterval,
+				ForceOptimizeFinal:  *optimizeFinal,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:      mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes: mergeTreeSettings.MergeMaxBlockSizeBytes,
+					MergeSelectingSleepMS:  mergeTreeSettings.MergeSelectingSleepMS,
 				},
 			}
 			processor.RestartClickHouse = func(ctx context.Context) error {
@@ -1815,11 +1827,11 @@ func printPartRows(out *os.File, parts []state.Part) {
 	}
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tOUTPUT_PARTS\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
@@ -1830,12 +1842,24 @@ func printPartRows(out *os.File, parts []state.Part) {
 			formatBytes(part.WrittenBytes),
 			part.SourceActivePartRows,
 			part.DestinationActivePartRows,
+			part.DestinationActivePartCount,
+			formatSettleWait(part),
 			part.ProgressUpdatedAt,
 			part.UpdatedAt,
 			part.Error,
 		)
 	}
 	_ = tw.Flush()
+}
+
+func formatSettleWait(part state.Part) string {
+	if durationMs, ok := part.RewriteStageDurationsMs[settleWaitStage]; ok {
+		return formatDurationMs(durationMs)
+	}
+	if part.RewriteStage == settleWaitStage {
+		return formatDurationMs(part.RewriteStageElapsedMs)
+	}
+	return ""
 }
 
 func printPartDetails(out *os.File, parts []state.Part) {
