@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,7 +152,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600, enable_vertical_merge_algorithm = 0"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -313,6 +314,7 @@ func TestRestartClickHouseRequiresCallback(t *testing.T) {
 
 func TestOptimizeFinal(t *testing.T) {
 	var queries []string
+	var optimizeSettings url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -321,6 +323,7 @@ func TestOptimizeFinal(t *testing.T) {
 			return
 		}
 		queries = append(queries, string(body))
+		optimizeSettings = r.URL.Query()
 	}))
 	defer server.Close()
 
@@ -334,16 +337,26 @@ func TestOptimizeFinal(t *testing.T) {
 	if len(queries) != 1 || queries[0] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
+	for key, want := range map[string]string{
+		"optimize_throw_if_noop": "1",
+		"receive_timeout":        "0",
+		"send_timeout":           "0",
+	} {
+		if got := optimizeSettings.Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
 }
 
 func TestOptimizeFinalUntilSinglePartRetriesUntilSinglePart(t *testing.T) {
 	var queries []string
-	statsResponses := []string{
-		"3\t3000\t300\n",
-		"2\t2000\t200\n",
-		"1\t1000\t100\n",
+	snapshotResponses := []string{
+		"3\t3000\t300\t1\t3\n",
+		"2\t2000\t200\t1\t2\n",
+		"2\t2000\t200\t1\t2\n",
+		"1\t1000\t100\t1\t1\n",
 	}
-	var statsQueries int
+	var snapshotQueries int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -353,12 +366,17 @@ func TestOptimizeFinalUntilSinglePartRetriesUntilSinglePart(t *testing.T) {
 		}
 		query := string(body)
 		queries = append(queries, query)
-		if strings.Contains(query, "system.parts") {
-			if statsQueries >= len(statsResponses) {
-				t.Fatalf("unexpected extra stats query: %s", query)
+		switch {
+		case strings.Contains(query, "system.parts"):
+			if snapshotQueries >= len(snapshotResponses) {
+				t.Fatalf("unexpected extra snapshot query: %s", query)
 			}
-			_, _ = w.Write([]byte(statsResponses[statsQueries]))
-			statsQueries++
+			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
+			snapshotQueries++
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.part_log"):
+			_, _ = w.Write([]byte(""))
 		}
 	}))
 	defer server.Close()
@@ -370,7 +388,7 @@ func TestOptimizeFinalUntilSinglePartRetriesUntilSinglePart(t *testing.T) {
 			backoffAttempts = append(backoffAttempts, attempt)
 			return 0
 		},
-	}).optimizeFinalUntilSinglePart(context.Background(), manifest.Manifest{
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
 		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
@@ -401,8 +419,13 @@ func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
 		}
 		query := string(body)
 		queries = append(queries, query)
-		if strings.Contains(query, "system.parts") {
-			_, _ = w.Write([]byte("2\t2000\t200\n"))
+		switch {
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("2\t2000\t200\t1\t2\n"))
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.part_log"):
+			_, _ = w.Write([]byte(""))
 		}
 	}))
 	defer server.Close()
@@ -414,7 +437,7 @@ func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
 			backoffAttempts = append(backoffAttempts, attempt)
 			return 0
 		},
-	}).optimizeFinalUntilSinglePart(context.Background(), manifest.Manifest{
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
 		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
@@ -422,7 +445,7 @@ func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected optimize final attempt limit error")
 	}
-	if !strings.Contains(err.Error(), "left 2 active destination parts after 10 optimize final attempts") {
+	if !strings.Contains(err.Error(), "left 2 active destination parts across 1 partitions after 10 optimize final checks") {
 		t.Fatalf("error = %q, want attempt limit", err)
 	}
 	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
@@ -437,6 +460,253 @@ func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
 		if attempt != want {
 			t.Fatalf("backoff attempt %d = %d, want %d", i, attempt, want)
 		}
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartWaitsForActiveMergeAfterClickHouseReturns(t *testing.T) {
+	var queries []string
+	snapshotResponses := []string{
+		"2\t2000\t200\t1\t2\n",
+		"2\t2000\t200\t1\t2\n",
+		"1\t2000\t190\t1\t1\n",
+	}
+	mergeResponses := []string{
+		"0\n",
+		"1\n",
+		"0\n",
+	}
+	var snapshotQueries int
+	var mergeQueries int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case strings.Contains(query, "system.parts"):
+			if snapshotQueries >= len(snapshotResponses) {
+				t.Fatalf("unexpected extra snapshot query: %s", query)
+			}
+			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
+			snapshotQueries++
+		case strings.Contains(query, "system.merges"):
+			if mergeQueries >= len(mergeResponses) {
+				t.Fatalf("unexpected extra merge query: %s", query)
+			}
+			_, _ = w.Write([]byte(mergeResponses[mergeQueries]))
+			mergeQueries++
+		case strings.Contains(query, "system.part_log"):
+			t.Fatalf("did not expect part_log query while an active merge can finish")
+		}
+	}))
+	defer server.Close()
+
+	var backoffAttempts []uint64
+	stats, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			backoffAttempts = append(backoffAttempts, attempt)
+			return 0
+		},
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 1 {
+		t.Fatalf("active parts = %d, want 1", stats.Count)
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != 1 {
+		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
+	}
+	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
+		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartWaitsForActiveMergeAfterClientError(t *testing.T) {
+	var queries []string
+	snapshotResponses := []string{
+		"2\t2000\t200\t1\t2\n",
+		"2\t2000\t200\t1\t2\n",
+		"1\t2000\t190\t1\t1\n",
+	}
+	mergeResponses := []string{
+		"0\n",
+		"1\n",
+		"0\n",
+	}
+	var snapshotQueries int
+	var mergeQueries int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case strings.Contains(query, "OPTIMIZE TABLE"):
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack response: %v", err)
+				return
+			}
+			_ = conn.Close()
+		case strings.Contains(query, "system.parts"):
+			if snapshotQueries >= len(snapshotResponses) {
+				t.Fatalf("unexpected extra snapshot query: %s", query)
+			}
+			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
+			snapshotQueries++
+		case strings.Contains(query, "system.merges"):
+			if mergeQueries >= len(mergeResponses) {
+				t.Fatalf("unexpected extra merge query: %s", query)
+			}
+			_, _ = w.Write([]byte(mergeResponses[mergeQueries]))
+			mergeQueries++
+		case strings.Contains(query, "system.part_log"):
+			t.Fatalf("did not expect part_log query while an active merge can finish")
+		}
+	}))
+	defer server.Close()
+
+	var backoffAttempts []uint64
+	stats, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			backoffAttempts = append(backoffAttempts, attempt)
+			return 0
+		},
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Count != 1 {
+		t.Fatalf("active parts = %d, want 1", stats.Count)
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != 1 {
+		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
+	}
+	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
+		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartFailsOnClickHouseQueryError(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case strings.Contains(query, "OPTIMIZE TABLE"):
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("MEMORY_LIMIT_EXCEEDED"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("2\t2000\t200\t1\t2\n"))
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.part_log"):
+			t.Fatalf("did not expect part_log query after ClickHouse query error")
+		}
+	}))
+	defer server.Close()
+
+	_, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			return 0
+		},
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err == nil {
+		t.Fatal("expected ClickHouse query error")
+	}
+	if !strings.Contains(err.Error(), "MEMORY_LIMIT_EXCEEDED") {
+		t.Fatalf("error = %q, want ClickHouse query error", err)
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != 1 {
+		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
+	}
+}
+
+func TestOptimizeFinalUntilSinglePartFailsFastOnPartLogMergeFailure(t *testing.T) {
+	var queries []string
+	snapshotResponses := []string{
+		"2\t2000\t200\t1\t2\n",
+		"2\t2000\t200\t1\t2\n",
+	}
+	var snapshotQueries int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case strings.Contains(query, "system.parts"):
+			if snapshotQueries >= len(snapshotResponses) {
+				t.Fatalf("unexpected extra snapshot query: %s", query)
+			}
+			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
+			snapshotQueries++
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.part_log"):
+			_, _ = w.Write([]byte("MergeParts\t241\tMEMORY_LIMIT_EXCEEDED\tall_1_2_1\tall_1_1_0,all_2_2_0\t0\t0\t123456\n"))
+		}
+	}))
+	defer server.Close()
+
+	_, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
+			return 0
+		},
+	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err == nil {
+		t.Fatal("expected part_log merge failure")
+	}
+	for _, want := range []string{"latest destination merge failed", "MEMORY_LIMIT_EXCEEDED", "peak_memory_usage=123456"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, missing %q", err, want)
+		}
+	}
+	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
+	if optimizeQueries != 1 {
+		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
 	}
 }
 

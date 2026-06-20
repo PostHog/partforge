@@ -481,9 +481,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
 			return rewriteResult{}, err
 		}
-		slog.Info("optimizing destination table final until one active part", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal, "max_attempts", DefaultOptimizeFinalMaxAttempts)
+		slog.Info("optimizing destination table final until one active part per partition", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal, "max_attempts", DefaultOptimizeFinalMaxAttempts)
 		optimizeStartedAt := time.Now()
-		optimizeStats, err := p.optimizeFinalUntilSinglePart(ctx, m)
+		optimizeStats, err := p.optimizeFinalUntilSinglePartPerPartition(ctx, m)
 		if err != nil {
 			return rewriteResult{}, fmt.Errorf("optimize destination table final: %w", err)
 		}
@@ -700,8 +700,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
-		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10) +
-		", enable_vertical_merge_algorithm = 0"
+		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure destination table merge settings: %w", err)
 	}
@@ -718,7 +717,6 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"destination_active_bytes_on_disk", stats.Bytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
-		"enable_vertical_merge_algorithm", false,
 	)
 	return nil
 }
@@ -816,18 +814,51 @@ func (p Processor) shouldOptimizeFinalAfterIdleMerges(result mergeWaitResult) bo
 }
 
 func (p Processor) optimizeFinal(ctx context.Context, m manifest.Manifest) error {
-	return p.ClickHouse.Exec(ctx, "OPTIMIZE TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FINAL")
+	return p.ClickHouse.ExecWithOptions(ctx, "OPTIMIZE TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FINAL", chhttp.QueryOptions{
+		Settings: chhttp.QuerySettings{
+			"optimize_throw_if_noop": "1",
+			"receive_timeout":        "0",
+			"send_timeout":           "0",
+		},
+	})
 }
 
-func (p Processor) optimizeFinalUntilSinglePart(ctx context.Context, m manifest.Manifest) (metrics.PartStats, error) {
-	stats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
+func (p Processor) optimizeFinalUntilSinglePartPerPartition(ctx context.Context, m manifest.Manifest) (metrics.PartStats, error) {
+	target := mergeWaitTarget{
+		JobID:    m.JobID,
+		PartID:   m.PartID,
+		Database: m.Dest.Database,
+		Table:    m.Dest.Table,
+	}
+	snapshot, err := p.optimizeFinalSnapshot(ctx, target)
 	if err != nil {
 		return metrics.PartStats{}, fmt.Errorf("measure destination active parts before optimize final: %w", err)
 	}
-	if stats.Count <= 1 {
-		return stats, nil
+	if snapshot.Done() {
+		return snapshot.Stats, nil
 	}
 	for attempt := uint64(1); attempt <= DefaultOptimizeFinalMaxAttempts; attempt++ {
+		if snapshot.ActiveMerges > 0 {
+			if attempt == DefaultOptimizeFinalMaxAttempts {
+				break
+			}
+			if err := p.sleepBeforeOptimizeFinalRetry(ctx, m, snapshot, attempt); err != nil {
+				return snapshot.Stats, err
+			}
+			snapshot, err = p.optimizeFinalSnapshot(ctx, target)
+			if err != nil {
+				return metrics.PartStats{}, fmt.Errorf("measure destination active parts after waiting for active optimize final merge %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+			}
+			if snapshot.Done() {
+				return snapshot.Stats, nil
+			}
+			if snapshot.ActiveMerges == 0 {
+				if err := p.failIfLatestDestinationMergeFailed(ctx, target); err != nil {
+					return snapshot.Stats, err
+				}
+			}
+			continue
+		}
 		slog.Info(
 			"optimizing destination table final attempt",
 			"stage", stageOptimizeFinal,
@@ -836,58 +867,172 @@ func (p Processor) optimizeFinalUntilSinglePart(ctx context.Context, m manifest.
 			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
 			"attempt", attempt,
 			"max_attempts", DefaultOptimizeFinalMaxAttempts,
-			"active_parts", stats.Count,
-			"active_rows", stats.Rows,
-			"active_bytes_on_disk", stats.Bytes,
+			"active_parts", snapshot.Stats.Count,
+			"active_partitions", snapshot.ActivePartitions,
+			"max_parts_per_partition", snapshot.MaxPartsPerPartition,
+			"active_destination_merges", snapshot.ActiveMerges,
+			"active_rows", snapshot.Stats.Rows,
+			"active_bytes_on_disk", snapshot.Stats.Bytes,
 		)
 		startedAt := time.Now()
+		optimizeReturnedClientError := false
 		if err := p.optimizeFinal(ctx, m); err != nil {
-			return stats, fmt.Errorf("attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+			nextSnapshot, handled, handleErr := p.handleOptimizeFinalExecError(ctx, m, target, err, attempt)
+			if handleErr != nil {
+				return snapshot.Stats, handleErr
+			}
+			if handled {
+				snapshot = nextSnapshot
+				optimizeReturnedClientError = true
+			} else {
+				return snapshot.Stats, fmt.Errorf("attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+			}
+		} else {
+			snapshot, err = p.optimizeFinalSnapshot(ctx, target)
+			if err != nil {
+				return metrics.PartStats{}, fmt.Errorf("measure destination active parts after optimize final attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+			}
 		}
-		stats, err = p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
-		if err != nil {
-			return metrics.PartStats{}, fmt.Errorf("measure destination active parts after optimize final attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, err)
+		if !optimizeReturnedClientError {
+			slog.Info(
+				"optimized destination table final attempt",
+				"stage", stageOptimizeFinal,
+				"job_id", m.JobID,
+				"part_id", m.PartID,
+				"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+				"attempt", attempt,
+				"max_attempts", DefaultOptimizeFinalMaxAttempts,
+				"active_parts", snapshot.Stats.Count,
+				"active_partitions", snapshot.ActivePartitions,
+				"max_parts_per_partition", snapshot.MaxPartsPerPartition,
+				"active_destination_merges", snapshot.ActiveMerges,
+				"active_rows", snapshot.Stats.Rows,
+				"active_bytes_on_disk", snapshot.Stats.Bytes,
+				"elapsed", time.Since(startedAt),
+			)
 		}
-		slog.Info(
-			"optimized destination table final attempt",
+		if snapshot.Done() {
+			return snapshot.Stats, nil
+		}
+		if snapshot.ActiveMerges == 0 {
+			if err := p.failIfLatestDestinationMergeFailed(ctx, target); err != nil {
+				return snapshot.Stats, err
+			}
+		}
+		if attempt < DefaultOptimizeFinalMaxAttempts {
+			if err := p.sleepBeforeOptimizeFinalRetry(ctx, m, snapshot, attempt); err != nil {
+				return snapshot.Stats, err
+			}
+			snapshot, err = p.optimizeFinalSnapshot(ctx, target)
+			if err != nil {
+				return metrics.PartStats{}, fmt.Errorf("measure destination active parts before optimize final retry %d/%d: %w", attempt+1, DefaultOptimizeFinalMaxAttempts, err)
+			}
+			if snapshot.Done() {
+				return snapshot.Stats, nil
+			}
+			if snapshot.ActiveMerges == 0 {
+				if err := p.failIfLatestDestinationMergeFailed(ctx, target); err != nil {
+					return snapshot.Stats, err
+				}
+			}
+		}
+	}
+	if err := p.failIfLatestDestinationMergeFailed(ctx, target); err != nil {
+		return snapshot.Stats, err
+	}
+	return snapshot.Stats, fmt.Errorf("left %d active destination parts across %d partitions after %d optimize final checks; max active parts in one partition is %d and active destination merges is %d", snapshot.Stats.Count, snapshot.ActivePartitions, DefaultOptimizeFinalMaxAttempts, snapshot.MaxPartsPerPartition, snapshot.ActiveMerges)
+}
+
+func (p Processor) sleepBeforeOptimizeFinalRetry(ctx context.Context, m manifest.Manifest, snapshot optimizeFinalSnapshot, attempt uint64) error {
+	backoff := p.optimizeFinalBackoff(attempt)
+	if backoff < 0 {
+		return fmt.Errorf("optimize final retry backoff after attempt %d/%d must be non-negative, got %s", attempt, DefaultOptimizeFinalMaxAttempts, backoff)
+	}
+	if backoff == 0 {
+		return nil
+	}
+	message := "waiting before retrying destination table final optimize"
+	if snapshot.ActiveMerges > 0 {
+		message = "waiting for active destination merges before retrying destination table final optimize"
+	}
+	slog.Info(
+		message,
+		"stage", stageOptimizeFinal,
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+		"next_attempt", attempt+1,
+		"max_attempts", DefaultOptimizeFinalMaxAttempts,
+		"active_parts", snapshot.Stats.Count,
+		"active_partitions", snapshot.ActivePartitions,
+		"max_parts_per_partition", snapshot.MaxPartsPerPartition,
+		"active_destination_merges", snapshot.ActiveMerges,
+		"backoff", backoff,
+	)
+	return sleepOrDone(ctx, backoff)
+}
+
+func (p Processor) handleOptimizeFinalExecError(ctx context.Context, m manifest.Manifest, target mergeWaitTarget, optimizeErr error, attempt uint64) (optimizeFinalSnapshot, bool, error) {
+	if ctx.Err() != nil {
+		return optimizeFinalSnapshot{}, false, fmt.Errorf("attempt %d/%d: %w", attempt, DefaultOptimizeFinalMaxAttempts, optimizeErr)
+	}
+	var queryErr *chhttp.QueryError
+	if errors.As(optimizeErr, &queryErr) {
+		return optimizeFinalSnapshot{}, false, nil
+	}
+	snapshot, err := p.optimizeFinalSnapshot(ctx, target)
+	if err != nil {
+		return optimizeFinalSnapshot{}, false, fmt.Errorf("attempt %d/%d returned client error (%w), and inspecting destination optimize state failed: %v", attempt, DefaultOptimizeFinalMaxAttempts, optimizeErr, err)
+	}
+	if snapshot.Done() {
+		slog.Warn(
+			"destination table final optimize returned a client error after ClickHouse completed the merge",
 			"stage", stageOptimizeFinal,
 			"job_id", m.JobID,
 			"part_id", m.PartID,
 			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
 			"attempt", attempt,
 			"max_attempts", DefaultOptimizeFinalMaxAttempts,
-			"active_parts", stats.Count,
-			"active_rows", stats.Rows,
-			"active_bytes_on_disk", stats.Bytes,
-			"elapsed", time.Since(startedAt),
+			"active_parts", snapshot.Stats.Count,
+			"active_partitions", snapshot.ActivePartitions,
+			"max_parts_per_partition", snapshot.MaxPartsPerPartition,
+			"active_destination_merges", snapshot.ActiveMerges,
+			"error", optimizeErr,
 		)
-		if stats.Count <= 1 {
-			return stats, nil
-		}
-		if attempt < DefaultOptimizeFinalMaxAttempts {
-			backoff := p.optimizeFinalBackoff(attempt)
-			if backoff < 0 {
-				return stats, fmt.Errorf("optimize final retry backoff after attempt %d/%d must be non-negative, got %s", attempt, DefaultOptimizeFinalMaxAttempts, backoff)
-			}
-			if backoff > 0 {
-				slog.Info(
-					"waiting before retrying destination table final optimize",
-					"stage", stageOptimizeFinal,
-					"job_id", m.JobID,
-					"part_id", m.PartID,
-					"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
-					"next_attempt", attempt+1,
-					"max_attempts", DefaultOptimizeFinalMaxAttempts,
-					"active_parts", stats.Count,
-					"backoff", backoff,
-				)
-				if err := sleepOrDone(ctx, backoff); err != nil {
-					return stats, err
-				}
-			}
-		}
+		return snapshot, true, nil
 	}
-	return stats, fmt.Errorf("left %d active destination parts after %d optimize final attempts", stats.Count, DefaultOptimizeFinalMaxAttempts)
+	if snapshot.ActiveMerges > 0 {
+		slog.Warn(
+			"destination table final optimize returned a client error while ClickHouse merge is still active",
+			"stage", stageOptimizeFinal,
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+			"attempt", attempt,
+			"max_attempts", DefaultOptimizeFinalMaxAttempts,
+			"active_parts", snapshot.Stats.Count,
+			"active_partitions", snapshot.ActivePartitions,
+			"max_parts_per_partition", snapshot.MaxPartsPerPartition,
+			"active_destination_merges", snapshot.ActiveMerges,
+			"error", optimizeErr,
+		)
+		return snapshot, true, nil
+	}
+	if err := p.failIfLatestDestinationMergeFailed(ctx, target); err != nil {
+		return snapshot, false, fmt.Errorf("attempt %d/%d returned client error (%w), and ClickHouse recorded a destination merge failure: %v", attempt, DefaultOptimizeFinalMaxAttempts, optimizeErr, err)
+	}
+	return snapshot, false, fmt.Errorf("attempt %d/%d returned client error and no active destination merge remains: %w", attempt, DefaultOptimizeFinalMaxAttempts, optimizeErr)
+}
+
+type optimizeFinalSnapshot struct {
+	Stats                metrics.PartStats
+	ActivePartitions     uint64
+	MaxPartsPerPartition uint64
+	ActiveMerges         uint64
+}
+
+func (s optimizeFinalSnapshot) Done() bool {
+	return s.MaxPartsPerPartition <= 1
 }
 
 func (p Processor) optimizeFinalBackoff(attempt uint64) time.Duration {
@@ -1337,6 +1482,147 @@ func (p Processor) activePartStats(ctx context.Context, database, table string) 
 		return metrics.PartStats{}, err
 	}
 	return metrics.PartStats{Count: count, Rows: partRows, Bytes: bytes}, nil
+}
+
+func (p Processor) optimizeFinalSnapshot(ctx context.Context, target mergeWaitTarget) (optimizeFinalSnapshot, error) {
+	query := "SELECT ifNull(sum(part_count), 0), ifNull(sum(part_rows), 0), ifNull(sum(part_bytes), 0), count(), ifNull(max(part_count), 0) " +
+		"FROM (SELECT partition_id, count() AS part_count, sum(rows) AS part_rows, sum(bytes_on_disk) AS part_bytes FROM system.parts WHERE database = " +
+		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
+		" AND active GROUP BY partition_id) FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 5)
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	if len(rows) != 1 {
+		return optimizeFinalSnapshot{}, fmt.Errorf("expected one optimize final snapshot row, got %d", len(rows))
+	}
+	activeParts, err := chhttp.ParseUInt(rows[0][0])
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	partRows, err := chhttp.ParseUInt(rows[0][1])
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	bytes, err := chhttp.ParseUInt(rows[0][2])
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	activePartitions, err := chhttp.ParseUInt(rows[0][3])
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	maxPartsPerPartition, err := chhttp.ParseUInt(rows[0][4])
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	if activeParts > 0 && activePartitions == 0 {
+		return optimizeFinalSnapshot{}, fmt.Errorf("optimize final snapshot has %d active parts but no active partitions", activeParts)
+	}
+	if maxPartsPerPartition > activeParts {
+		return optimizeFinalSnapshot{}, fmt.Errorf("optimize final snapshot has max %d parts in one partition but only %d active parts", maxPartsPerPartition, activeParts)
+	}
+	activeMerges, err := p.destinationMergeCount(ctx, target)
+	if err != nil {
+		return optimizeFinalSnapshot{}, err
+	}
+	return optimizeFinalSnapshot{
+		Stats: metrics.PartStats{
+			Count: activeParts,
+			Rows:  partRows,
+			Bytes: bytes,
+		},
+		ActivePartitions:     activePartitions,
+		MaxPartsPerPartition: maxPartsPerPartition,
+		ActiveMerges:         activeMerges,
+	}, nil
+}
+
+func (p Processor) failIfLatestDestinationMergeFailed(ctx context.Context, target mergeWaitTarget) error {
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
+		return fmt.Errorf("flush ClickHouse logs before inspecting destination merge failure: %w", err)
+	}
+	query := "SELECT event_type, error, exception, part_name, arrayStringConcat(merged_from, ','), rows, size_in_bytes, peak_memory_usage " +
+		"FROM system.part_log WHERE database = " + chhttp.StringLiteral(target.Database) +
+		" AND table = " + chhttp.StringLiteral(target.Table) +
+		" AND event_type = 'MergeParts' AND error != 0 ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return fmt.Errorf("inspect system.part_log for destination merge failure: %w", err)
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 8)
+	if err != nil {
+		return fmt.Errorf("parse destination merge failure from system.part_log: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	failure, err := parseMergeFailure(rows[0])
+	if err != nil {
+		return fmt.Errorf("parse destination merge failure from system.part_log: %w", err)
+	}
+	return failure
+}
+
+type mergeFailure struct {
+	EventType       string
+	Code            uint64
+	Exception       string
+	PartName        string
+	MergedFrom      string
+	Rows            uint64
+	SizeBytes       uint64
+	PeakMemoryBytes uint64
+}
+
+func (f mergeFailure) Error() string {
+	return fmt.Sprintf(
+		"latest destination merge failed in system.part_log: event_type=%s error=%d part=%s merged_from=%s rows=%d size_in_bytes=%d peak_memory_usage=%d exception=%s",
+		f.EventType,
+		f.Code,
+		f.PartName,
+		f.MergedFrom,
+		f.Rows,
+		f.SizeBytes,
+		f.PeakMemoryBytes,
+		strings.TrimSpace(f.Exception),
+	)
+}
+
+func parseMergeFailure(row []string) (mergeFailure, error) {
+	if len(row) != 8 {
+		return mergeFailure{}, fmt.Errorf("expected 8 merge failure columns, got %d", len(row))
+	}
+	code, err := chhttp.ParseUInt(row[1])
+	if err != nil {
+		return mergeFailure{}, err
+	}
+	rows, err := chhttp.ParseUInt(row[5])
+	if err != nil {
+		return mergeFailure{}, err
+	}
+	sizeBytes, err := chhttp.ParseUInt(row[6])
+	if err != nil {
+		return mergeFailure{}, err
+	}
+	peakMemoryBytes, err := chhttp.ParseUInt(row[7])
+	if err != nil {
+		return mergeFailure{}, err
+	}
+	return mergeFailure{
+		EventType:       row[0],
+		Code:            code,
+		Exception:       row[2],
+		PartName:        row[3],
+		MergedFrom:      row[4],
+		Rows:            rows,
+		SizeBytes:       sizeBytes,
+		PeakMemoryBytes: peakMemoryBytes,
+	}, nil
 }
 
 func (p Processor) queryProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {
