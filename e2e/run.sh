@@ -10,6 +10,88 @@ JOB_ID="e2e-job"
 
 cd "$ROOT"
 
+log_value() {
+  local line="$1"
+  local key="$2"
+  printf '%s\n' "$line" |
+    tr ' ' '\n' |
+    sed -n "s/^${key}=//p" |
+    tail -n 1 |
+    tr -d '"'
+}
+
+require_uint() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "expected numeric $name in worker settings log, got ${value:-<empty>}" >&2
+    exit 1
+  fi
+}
+
+assert_worker_insert_memory_settings() {
+  local log_file="$1"
+  local line
+  line="$(grep 'configured clickhouse resource settings' "$log_file" | tail -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    echo "worker log $log_file did not contain configured clickhouse resource settings" >&2
+    exit 1
+  fi
+
+  local cpus memory_bytes max_threads max_insert_threads max_memory_usage min_rows min_bytes
+  cpus="$(log_value "$line" "cpus")"
+  memory_bytes="$(log_value "$line" "memory_bytes_raw")"
+  max_threads="$(log_value "$line" "max_threads")"
+  max_insert_threads="$(log_value "$line" "max_insert_threads")"
+  max_memory_usage="$(log_value "$line" "max_memory_usage_raw")"
+  min_rows="$(log_value "$line" "min_insert_block_size_rows")"
+  min_bytes="$(log_value "$line" "min_insert_block_size_bytes_raw")"
+
+  require_uint "cpus" "$cpus"
+  require_uint "memory_bytes" "$memory_bytes"
+  require_uint "max_threads" "$max_threads"
+  require_uint "max_insert_threads" "$max_insert_threads"
+  require_uint "max_memory_usage" "$max_memory_usage"
+  require_uint "min_insert_block_size_rows" "$min_rows"
+  require_uint "min_insert_block_size_bytes" "$min_bytes"
+
+  local expected_threads
+  if (( cpus < 2 )); then
+    expected_threads=1
+  else
+    expected_threads=$((cpus / 2))
+  fi
+  local expected_max_memory expected_min_bytes reserved_insert_block_memory
+  expected_max_memory=$((memory_bytes * 80 / 100))
+  expected_min_bytes=$((expected_max_memory / (3 * expected_threads)))
+  reserved_insert_block_memory=$((min_bytes * max_insert_threads * 3))
+
+  if (( max_threads != expected_threads )); then
+    echo "max_threads=$max_threads, expected $expected_threads from cpus=$cpus" >&2
+    exit 1
+  fi
+  if (( max_insert_threads != expected_threads )); then
+    echo "max_insert_threads=$max_insert_threads, expected $expected_threads from cpus=$cpus" >&2
+    exit 1
+  fi
+  if (( max_memory_usage != expected_max_memory )); then
+    echo "max_memory_usage=$max_memory_usage, expected $expected_max_memory from memory_bytes=$memory_bytes" >&2
+    exit 1
+  fi
+  if (( min_rows != 0 )); then
+    echo "min_insert_block_size_rows=$min_rows, expected 0" >&2
+    exit 1
+  fi
+  if (( min_bytes != expected_min_bytes )); then
+    echo "min_insert_block_size_bytes=$min_bytes, expected $expected_min_bytes" >&2
+    exit 1
+  fi
+  if (( reserved_insert_block_memory > max_memory_usage )); then
+    echo "insert block memory budget $reserved_insert_block_memory exceeds max_memory_usage $max_memory_usage" >&2
+    exit 1
+  fi
+}
+
 rm -rf "$ROOT/.e2e"
 mkdir -p "$DATA_DIR"
 chmod -R a+rwx "$ROOT/.e2e"
@@ -80,12 +162,14 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -s3-endpoint=http://localstack:4566 \
   -dynamodb-endpoint=http://localstack:4566
 
-for _ in $(seq 1 "$part_count"); do
+for i in $(seq 1 "$part_count"); do
+  worker_log="$ROOT/.e2e/worker-${i}.log"
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -s3-endpoint=http://localstack:4566 \
     -dynamodb-endpoint=http://localstack:4566 \
-    -once
+    -once 2>&1 | tee "$worker_log"
+  assert_worker_insert_memory_settings "$worker_log"
 done
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \

@@ -822,7 +822,7 @@ func partStateKey(jobID, partID string) map[string]types.AttributeValue {
 }
 
 func progressRemoveExpression() string {
-	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
+	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, destination_failed_merges, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
 }
 
 func jobKey(jobID string) string {

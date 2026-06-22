@@ -55,7 +55,7 @@ graph TD
     U --> V[Mark part FINISHED]
 ```
 
-The insert-select step has its own resource retry loop. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
+The insert-select step has its own resource retry loop. The worker initially sets `max_threads` and `max_insert_threads` to about half the detected CPU count, sets `min_insert_block_size_rows = 0`, and derives `min_insert_block_size_bytes` from the insert memory cap divided by three times the insert thread count. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
 
 ## Destination Merge Settings
 

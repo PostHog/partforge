@@ -56,6 +56,52 @@ func TestReduceInsertSelectThreadSettingsStopsAtOne(t *testing.T) {
 	}
 }
 
+func TestRunInsertSelectSendsInsertBlockSettings(t *testing.T) {
+	var insertSettings url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "INSERT "):
+			insertSettings = r.URL.Query()
+		case query == "SYSTEM FLUSH LOGS":
+		case strings.Contains(query, "system.query_log"):
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	settings := chhttp.QuerySettings{
+		"max_threads":                 "4",
+		"max_insert_threads":          "4",
+		"max_memory_usage":            "34359738368",
+		"min_insert_block_size_rows":  "0",
+		"min_insert_block_size_bytes": "2863311530",
+	}
+	err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).runInsertSelect(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO dst SELECT * FROM src"},
+	}, 1, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range settings {
+		if got := insertSettings.Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestRetryableInsertSelectError(t *testing.T) {
 	err := &chhttp.QueryError{StatusCode: 500, Body: "Code: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED"}
 	if !retryableInsertSelectError(err) {

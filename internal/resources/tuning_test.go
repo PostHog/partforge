@@ -1,20 +1,29 @@
 package resources
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestInsertSelectSettings(t *testing.T) {
 	settings, err := InsertSelectSettings(Limits{CPUs: 6, MemoryBytes: 10_000})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings["max_threads"] != "6" {
+	if settings["max_threads"] != "3" {
 		t.Fatalf("max_threads = %q", settings["max_threads"])
 	}
-	if settings["max_insert_threads"] != "6" {
+	if settings["max_insert_threads"] != "3" {
 		t.Fatalf("max_insert_threads = %q", settings["max_insert_threads"])
 	}
 	if settings["max_memory_usage"] != "8000" {
 		t.Fatalf("max_memory_usage = %q", settings["max_memory_usage"])
+	}
+	if settings["min_insert_block_size_rows"] != "0" {
+		t.Fatalf("min_insert_block_size_rows = %q", settings["min_insert_block_size_rows"])
+	}
+	if settings["min_insert_block_size_bytes"] != "888" {
+		t.Fatalf("min_insert_block_size_bytes = %q", settings["min_insert_block_size_bytes"])
 	}
 }
 
@@ -24,16 +33,88 @@ func TestInsertThreadCount(t *testing.T) {
 		want int
 	}{
 		{cpus: 1, want: 1},
-		{cpus: 2, want: 2},
-		{cpus: 3, want: 3},
-		{cpus: 8, want: 8},
-		{cpus: 16, want: 16},
+		{cpus: 2, want: 1},
+		{cpus: 3, want: 1},
+		{cpus: 8, want: 4},
+		{cpus: 16, want: 8},
 	}
 
 	for _, tt := range tests {
 		if got := insertThreadCount(tt.cpus); got != tt.want {
 			t.Fatalf("insertThreadCount(%d) = %d, want %d", tt.cpus, got, tt.want)
 		}
+	}
+}
+
+func TestInsertSelectSettingsKeepBlockMemoryWithinBudget(t *testing.T) {
+	tests := []struct {
+		name        string
+		limits      Limits
+		wantThreads uint64
+	}{
+		{
+			name:        "moderate worker",
+			limits:      Limits{CPUs: 8, MemoryBytes: 32 * 1024 * 1024 * 1024},
+			wantThreads: 4,
+		},
+		{
+			name:        "large worker",
+			limits:      Limits{CPUs: 16, MemoryBytes: 64 * 1024 * 1024 * 1024},
+			wantThreads: 8,
+		},
+		{
+			name:        "high cpu worker",
+			limits:      Limits{CPUs: 64, MemoryBytes: 256 * 1024 * 1024 * 1024},
+			wantThreads: 32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := InsertSelectSettings(tt.limits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			threads := mustParseUintSetting(t, settings["max_insert_threads"])
+			if threads != tt.wantThreads {
+				t.Fatalf("max_insert_threads = %d, want %d", threads, tt.wantThreads)
+			}
+			if got := settings["max_threads"]; got != settings["max_insert_threads"] {
+				t.Fatalf("max_threads = %q, want %q", got, settings["max_insert_threads"])
+			}
+			if settings["min_insert_block_size_rows"] != "0" {
+				t.Fatalf("min_insert_block_size_rows = %q, want 0", settings["min_insert_block_size_rows"])
+			}
+
+			maxMemoryUsage := mustParseUintSetting(t, settings["max_memory_usage"])
+			minBlockBytes := mustParseUintSetting(t, settings["min_insert_block_size_bytes"])
+			wantMaxMemoryUsage := tt.limits.MemoryBytes * insertMemoryUsagePercent / 100
+			if maxMemoryUsage != wantMaxMemoryUsage {
+				t.Fatalf("max_memory_usage = %d, want %d", maxMemoryUsage, wantMaxMemoryUsage)
+			}
+
+			if got, want := minBlockBytes, maxMemoryUsage/(insertBlockMemoryDivisor*threads); got != want {
+				t.Fatalf("min_insert_block_size_bytes = %d, want %d", got, want)
+			}
+			if reserved := minBlockBytes * threads * insertBlockMemoryDivisor; reserved > maxMemoryUsage {
+				t.Fatalf("block memory budget = %d, exceeds max_memory_usage %d", reserved, maxMemoryUsage)
+			}
+		})
+	}
+}
+
+func TestInsertSelectSettingsReducedThreadsIncreaseBlockSize(t *testing.T) {
+	limits := Limits{CPUs: 16, MemoryBytes: 64 * 1024 * 1024 * 1024}
+	settings, err := InsertSelectSettings(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	maxMemoryUsage := mustParseUintSetting(t, settings["max_memory_usage"])
+	minBlockBytes := mustParseUintSetting(t, settings["min_insert_block_size_bytes"])
+	fullCPUThreadBlockBytes := maxMemoryUsage / (insertBlockMemoryDivisor * uint64(limits.CPUs))
+	if minBlockBytes != fullCPUThreadBlockBytes*2 {
+		t.Fatalf("min_insert_block_size_bytes = %d, want double full-cpu block size %d", minBlockBytes, fullCPUThreadBlockBytes*2)
 	}
 }
 
@@ -66,6 +147,15 @@ func TestMergeBackgroundPoolSize(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustParseUintSetting(t *testing.T, raw string) uint64 {
+	t.Helper()
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse setting %q: %v", raw, err)
+	}
+	return value
 }
 
 func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {

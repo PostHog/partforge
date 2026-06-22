@@ -14,6 +14,7 @@ import (
 const (
 	DefaultCompressionCodec               = "ZSTD(5)"
 	insertMemoryUsagePercent       uint64 = 80
+	insertBlockMemoryDivisor       uint64 = 3
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
 	minMergeBackgroundPoolSize            = 13
@@ -72,16 +73,26 @@ func InsertSelectSettings(limits Limits) (chhttp.QuerySettings, error) {
 	if maxMemoryUsage == 0 {
 		return nil, fmt.Errorf("derived max_memory_usage is zero from memory limit %d", limits.MemoryBytes)
 	}
-	threads := strconv.Itoa(insertThreadCount(limits.CPUs))
+	threadCount := insertThreadCount(limits.CPUs)
+	minInsertBlockSizeBytes := maxMemoryUsage / (insertBlockMemoryDivisor * uint64(threadCount))
+	if minInsertBlockSizeBytes == 0 {
+		return nil, fmt.Errorf("derived min_insert_block_size_bytes is zero from memory limit %d and cpu limit %d", limits.MemoryBytes, limits.CPUs)
+	}
+	threads := strconv.Itoa(threadCount)
 	return chhttp.QuerySettings{
-		"max_threads":        threads,
-		"max_insert_threads": threads,
-		"max_memory_usage":   strconv.FormatUint(maxMemoryUsage, 10),
+		"max_threads":                 threads,
+		"max_insert_threads":          threads,
+		"max_memory_usage":            strconv.FormatUint(maxMemoryUsage, 10),
+		"min_insert_block_size_rows":  "0",
+		"min_insert_block_size_bytes": strconv.FormatUint(minInsertBlockSizeBytes, 10),
 	}, nil
 }
 
 func insertThreadCount(cpus int) int {
-	return cpus
+	if cpus < 2 {
+		return 1
+	}
+	return cpus / 2
 }
 
 func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
