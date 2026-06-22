@@ -152,7 +152,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600, enable_vertical_merge_algorithm = 0"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -280,7 +280,7 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
 
-	if containsQueryWith(queries, "merge_max_block_size") || containsQueryWith(queries, "enable_vertical_merge_algorithm") {
+	if containsQueryWith(queries, "merge_max_block_size") {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
 	wantCompression := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING default_compression_codec = 'ZSTD(5)'"
@@ -356,6 +356,37 @@ func TestShouldOptimizeFinal(t *testing.T) {
 	}
 	if !(Processor{ForceOptimizeFinal: true}).shouldOptimizeFinal(manifest.Manifest{}) {
 		t.Fatal("expected worker override to enable optimize final")
+	}
+}
+
+func TestDestinationFailedMergeCount(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		if strings.Contains(query, "system.part_log") {
+			_, _ = w.Write([]byte("7\n"))
+		}
+	}))
+	defer server.Close()
+
+	count, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).destinationFailedMergeCount(context.Background(), testMergeWaitTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 7 {
+		t.Fatalf("failed merge count = %d, want 7", count)
+	}
+	if len(queries) != 2 || queries[0] != "SYSTEM FLUSH LOGS" || !strings.Contains(queries[1], "system.part_log") || !strings.Contains(queries[1], "error != 0") {
+		t.Fatalf("queries = %#v, want flush logs then failed merge count", queries)
 	}
 }
 

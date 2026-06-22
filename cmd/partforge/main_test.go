@@ -21,8 +21,8 @@ import (
 
 func TestSummarizeJob(t *testing.T) {
 	summary := summarizeJob("job-1", []state.Part{
-		{PartID: "part-1", Status: state.StatusImported, ReadRows: 10, ReadBytes: 100, WrittenRows: 9, WrittenBytes: 90},
-		{PartID: "part-2", Status: state.StatusFinished, ReadRows: 20, ReadBytes: 200, WrittenRows: 19, WrittenBytes: 190},
+		{PartID: "part-1", Status: state.StatusImported, ReadRows: 10, ReadBytes: 100, WrittenRows: 9, WrittenBytes: 90, DestinationFailedMerges: 1},
+		{PartID: "part-2", Status: state.StatusFinished, ReadRows: 20, ReadBytes: 200, WrittenRows: 19, WrittenBytes: 190, DestinationFailedMerges: 2},
 		{PartID: "part-3", Status: state.StatusFailed, Error: "boom"},
 	})
 
@@ -40,6 +40,9 @@ func TestSummarizeJob(t *testing.T) {
 	}
 	if summary.ReadRows != 30 || summary.ReadBytes != 300 || summary.WrittenRows != 28 || summary.WrittenBytes != 280 {
 		t.Fatalf("summary progress = %+v", summary)
+	}
+	if summary.FailedMerges != 3 {
+		t.Fatalf("failed merges = %d, want 3", summary.FailedMerges)
 	}
 	if len(summary.FailedParts) != 1 || summary.FailedParts[0].PartID != "part-3" {
 		t.Fatalf("failed parts = %+v", summary.FailedParts)
@@ -219,12 +222,14 @@ func TestStateProgress(t *testing.T) {
 	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, WrittenRows: 3, WrittenBytes: 4}
 	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
 	dest := metrics.PartStats{Count: 8, Rows: 9, Bytes: 10}
+	failedMerges := uint64(11)
 	stageStartedAt := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 
 	progress := stateProgress(rewrite.ProgressSnapshot{
 		QueryProgress:              &query,
 		SourceActivePartStats:      &source,
 		DestinationActivePartStats: &dest,
+		DestinationFailedMerges:    &failedMerges,
 		StageProgress: &rewrite.StageProgress{
 			Stage:          "download_source",
 			StageStartedAt: stageStartedAt,
@@ -244,6 +249,9 @@ func TestStateProgress(t *testing.T) {
 	}
 	if progress.DestinationActivePartStats == nil || progress.DestinationActivePartStats.Bytes != 10 {
 		t.Fatalf("destination stats = %+v", progress.DestinationActivePartStats)
+	}
+	if progress.DestinationFailedMerges == nil || *progress.DestinationFailedMerges != failedMerges {
+		t.Fatalf("destination failed merges = %+v", progress.DestinationFailedMerges)
 	}
 	if progress.StageProgress == nil || progress.StageProgress.Stage != "download_source" {
 		t.Fatalf("stage progress = %+v", progress.StageProgress)
@@ -342,6 +350,7 @@ func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
 		ReadBytes:    10 * 1024 * 1024,
 		WrittenRows:  900,
 		WrittenBytes: 3 * 1024 * 1024 * 1024,
+		FailedMerges: 4,
 	}
 
 	got := captureFileOutput(t, func(out *os.File) {
@@ -351,6 +360,7 @@ func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
 	for _, want := range []string{
 		"read: 1000 rows 10 MB",
 		"written: 900 rows 3 GB",
+		"failed_merges: 4",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
@@ -401,6 +411,7 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 				WrittenRows:                90,
 				WrittenBytes:               2 * 1024 * 1024,
 				DestinationActivePartCount: 3,
+				DestinationFailedMerges:    4,
 				RewriteStageDurationsMs: map[string]int64{
 					"wait_merges": 65_000,
 				},
@@ -412,9 +423,11 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 		"READ_SIZE",
 		"WRITTEN_SIZE",
 		"OUTPUT_PARTS",
+		"FAILED_MERGES",
 		"SETTLE_WAIT",
 		"1.5 KB",
 		"2 MB",
+		"4",
 		"3",
 		"1m5s",
 	} {

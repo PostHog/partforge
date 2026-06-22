@@ -66,9 +66,6 @@ After a successful insert-select and before the ClickHouse restart, the worker a
 - `merge_selecting_sleep_ms`
 - `max_bytes_to_merge_at_max_space_in_pool`
 - `max_bytes_to_merge_at_min_space_in_pool`
-- `enable_vertical_merge_algorithm = 0`
-
-The last setting forces horizontal merges.
 
 ## Merge Wait
 
@@ -98,6 +95,12 @@ There is no separate optimize-final path and no normal-path fallback. If `optimi
 If the first merge wait does not settle or cannot inspect merge state, the worker skips `OPTIMIZE FINAL` and continues with the current destination parts. If the optimize request itself returns an error and the worker context was not canceled, the worker logs the error and still performs the second merge wait. ClickHouse may still have started merge work before the client saw an error.
 
 The optimize request uses `send_timeout=0` and `receive_timeout=0`, and does not use `optimize_throw_if_noop=1`. It is not retried, it does not inspect `system.part_log`, and it does not require the table to end with one active part.
+
+## Failed Merge Count
+
+Before measuring and freezing destination parts, the worker flushes ClickHouse logs and counts failed destination `MergeParts` events in `system.part_log`. The count is persisted as `destination_failed_merges`, rolled up in `job-status`, and shown per part as `FAILED_MERGES` in `job-status -parts`.
+
+If that diagnostic query fails and the worker context was not canceled, the worker logs the diagnostic failure and continues. This counter is for visibility into merge contention or merge errors; it does not decide whether the rewrite succeeds.
 
 ## What Gets Frozen
 

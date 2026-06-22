@@ -76,6 +76,7 @@ type Part struct {
 	DestinationActivePartCount uint64           `dynamodbav:"destination_active_part_count,omitempty"`
 	DestinationActivePartRows  uint64           `dynamodbav:"destination_active_part_rows,omitempty"`
 	DestinationActivePartBytes uint64           `dynamodbav:"destination_active_part_bytes,omitempty"`
+	DestinationFailedMerges    uint64           `dynamodbav:"destination_failed_merges,omitempty"`
 	RewriteStage               string           `dynamodbav:"rewrite_stage,omitempty"`
 	RewriteStageStartedAt      string           `dynamodbav:"rewrite_stage_started_at,omitempty"`
 	RewriteStageElapsedMs      int64            `dynamodbav:"rewrite_stage_elapsed_ms,omitempty"`
@@ -100,6 +101,7 @@ type RewriteProgress struct {
 	QueryProgress              *QueryProgress
 	SourceActivePartStats      *PartStats
 	DestinationActivePartStats *PartStats
+	DestinationFailedMerges    *uint64
 	StageProgress              *RewriteStageProgress
 }
 
@@ -369,6 +371,10 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 		values[":destination_active_part_count"] = uintAttr(progress.DestinationActivePartStats.Count)
 		values[":destination_active_part_rows"] = uintAttr(progress.DestinationActivePartStats.Rows)
 		values[":destination_active_part_bytes"] = uintAttr(progress.DestinationActivePartStats.Bytes)
+	}
+	if progress.DestinationFailedMerges != nil {
+		set = append(set, "destination_failed_merges = :destination_failed_merges")
+		values[":destination_failed_merges"] = uintAttr(*progress.DestinationFailedMerges)
 	}
 	if progress.StageProgress != nil {
 		set = append(set,

@@ -121,6 +121,7 @@ type ProgressSnapshot struct {
 	QueryProgress              *metrics.QueryProgress
 	SourceActivePartStats      *metrics.PartStats
 	DestinationActivePartStats *metrics.PartStats
+	DestinationFailedMerges    *uint64
 	StageProgress              *StageProgress
 }
 
@@ -504,15 +505,36 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
 		return rewriteResult{}, err
 	}
+	var destinationFailedMerges *uint64
+	failedMerges, err := p.destinationFailedMergeCount(ctx, mergeTarget)
+	if err != nil {
+		if ctx.Err() != nil {
+			return rewriteResult{}, fmt.Errorf("measure destination failed merges: %w", err)
+		}
+		slog.Warn(
+			"could not measure destination failed merges",
+			"stage", stageMeasureDestinationParts,
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"destination_table", mergeTarget.tableSQL(),
+			"error", err,
+		)
+	} else {
+		destinationFailedMerges = &failedMerges
+	}
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return rewriteResult{}, fmt.Errorf("measure destination active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("destination", m, destStats)
-	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
+	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats, DestinationFailedMerges: destinationFailedMerges}); err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("measured destination parts", "stage", "measure_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes)
+	logArgs := []any{"stage", stageMeasureDestinationParts, "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes}
+	if destinationFailedMerges != nil {
+		logArgs = append(logArgs, "failed_merges", *destinationFailedMerges)
+	}
+	slog.Info("measured destination parts", logArgs...)
 
 	if destStats.Count == 0 {
 		return result, nil
@@ -625,8 +647,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
-		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10) +
-		", enable_vertical_merge_algorithm = 0"
+		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure destination table merge settings: %w", err)
 	}
@@ -643,7 +664,6 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"destination_active_bytes_on_disk", stats.Bytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
-		"enable_vertical_merge_algorithm", false,
 	)
 	return nil
 }
@@ -1227,6 +1247,24 @@ func (p Processor) activePartStats(ctx context.Context, database, table string) 
 		return metrics.PartStats{}, err
 	}
 	return metrics.PartStats{Count: count, Rows: partRows, Bytes: bytes}, nil
+}
+
+func (p Processor) destinationFailedMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
+		return 0, fmt.Errorf("flush ClickHouse logs before measuring destination failed merges: %w", err)
+	}
+	query := "SELECT count() FROM system.part_log WHERE database = " +
+		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
+		" AND event_type = 'MergeParts' AND error != 0 FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("measure destination failed merges from system.part_log: %w", err)
+	}
+	count, err := chhttp.ParseUInt(out)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (p Processor) queryProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {

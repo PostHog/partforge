@@ -1633,6 +1633,9 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 			Bytes: snapshot.DestinationActivePartStats.Bytes,
 		}
 	}
+	if snapshot.DestinationFailedMerges != nil {
+		progress.DestinationFailedMerges = snapshot.DestinationFailedMerges
+	}
 	if snapshot.StageProgress != nil {
 		completed := make(map[string]int64, len(snapshot.StageProgress.CompletedStageDurations))
 		for stage, duration := range snapshot.StageProgress.CompletedStageDurations {
@@ -1663,6 +1666,7 @@ type jobSummary struct {
 	ReadBytes        uint64                 `json:"read_bytes"`
 	WrittenRows      uint64                 `json:"written_rows"`
 	WrittenBytes     uint64                 `json:"written_bytes"`
+	FailedMerges     uint64                 `json:"failed_merges"`
 	FailedParts      []failedPart           `json:"failed_parts,omitempty"`
 }
 
@@ -1717,7 +1721,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 	}
 
 	var failed []failedPart
-	var readRows, readBytes, writtenRows, writtenBytes uint64
+	var readRows, readBytes, writtenRows, writtenBytes, failedMerges uint64
 	stageCounts := map[string]int{}
 	for _, part := range parts {
 		counts[part.Status]++
@@ -1725,6 +1729,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		readBytes += part.ReadBytes
 		writtenRows += part.WrittenRows
 		writtenBytes += part.WrittenBytes
+		failedMerges += part.DestinationFailedMerges
 		if part.Status == state.StatusInProgress {
 			stage := strings.TrimSpace(part.RewriteStage)
 			if stage == "" {
@@ -1762,6 +1767,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		ReadBytes:        readBytes,
 		WrittenRows:      writtenRows,
 		WrittenBytes:     writtenBytes,
+		FailedMerges:     failedMerges,
 		FailedParts:      failed,
 	}
 }
@@ -1809,6 +1815,7 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "import_complete: %d/%d %.1f%%\n", summary.ImportCompleted, summary.Total, summary.ImportPercent)
 	fmt.Fprintf(out, "read: %d rows %s\n", summary.ReadRows, formatBytes(summary.ReadBytes))
 	fmt.Fprintf(out, "written: %d rows %s\n", summary.WrittenRows, formatBytes(summary.WrittenBytes))
+	fmt.Fprintf(out, "failed_merges: %d\n", summary.FailedMerges)
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "\nSTATE\tCOUNT")
@@ -1844,11 +1851,11 @@ func printPartRows(out *os.File, parts []state.Part) {
 	}
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tOUTPUT_PARTS\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tOUTPUT_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
@@ -1860,6 +1867,7 @@ func printPartRows(out *os.File, parts []state.Part) {
 			part.SourceActivePartRows,
 			part.DestinationActivePartRows,
 			part.DestinationActivePartCount,
+			part.DestinationFailedMerges,
 			formatSettleWait(part),
 			part.ProgressUpdatedAt,
 			part.UpdatedAt,
