@@ -24,7 +24,7 @@ import (
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
-const DefaultMergeTimeout = 20 * time.Minute
+const DefaultMergeTimeout = time.Hour
 const DefaultMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second

@@ -901,8 +901,8 @@ func testMergeWaitTarget() mergeWaitTarget {
 }
 
 func TestDefaultMergeTimeout(t *testing.T) {
-	if DefaultMergeTimeout != 20*time.Minute {
-		t.Fatalf("DefaultMergeTimeout = %s, want 20m", DefaultMergeTimeout)
+	if DefaultMergeTimeout != time.Hour {
+		t.Fatalf("DefaultMergeTimeout = %s, want 1h", DefaultMergeTimeout)
 	}
 	if DefaultMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
