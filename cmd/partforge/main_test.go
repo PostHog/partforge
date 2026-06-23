@@ -139,6 +139,55 @@ func TestSelectRetryParts(t *testing.T) {
 	}
 }
 
+func TestSelectDeletePartsByStatus(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusImported},
+		{PartID: "part-2", Status: state.StatusFinished},
+		{PartID: "part-3", Status: state.StatusImported},
+	}
+
+	selected, err := selectDeleteParts(parts, deletePartSelection{Status: state.StatusImported})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 2 || selected[0].PartID != "part-1" || selected[1].PartID != "part-3" {
+		t.Fatalf("selected = %+v, want imported parts", selected)
+	}
+}
+
+func TestSelectDeletePartsByRepeatedPartID(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusImported},
+		{PartID: "part-2", Status: state.StatusFinished},
+	}
+
+	selected, err := selectDeleteParts(parts, deletePartSelection{PartIDs: []string{"part-2", "part-2", "part-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 2 || selected[0].PartID != "part-2" || selected[1].PartID != "part-1" {
+		t.Fatalf("selected = %+v, want selected ids in request order without duplicates", selected)
+	}
+}
+
+func TestSelectDeletePartsRejectsUnknownStatus(t *testing.T) {
+	_, err := selectDeleteParts([]state.Part{
+		{PartID: "part-1", Status: state.StatusImported},
+	}, deletePartSelection{Status: state.Status("NOT_A_STATUS")})
+	if err == nil {
+		t.Fatal("expected unknown status error")
+	}
+}
+
+func TestSelectDeletePartsRejectsMissingPartID(t *testing.T) {
+	_, err := selectDeleteParts([]state.Part{
+		{PartID: "part-1", Status: state.StatusImported},
+	}, deletePartSelection{PartIDs: []string{"part-missing"}})
+	if err == nil {
+		t.Fatal("expected missing part error")
+	}
+}
+
 func TestSelectImportFinishedParts(t *testing.T) {
 	parts := []state.Part{
 		{PartID: "part-1", Status: state.StatusFinished},

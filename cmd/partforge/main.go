@@ -93,6 +93,8 @@ func run() error {
 		return runJobStatus(ctx, os.Args[2:])
 	case "retry-failed":
 		return runRetryFailed(ctx, os.Args[2:])
+	case "delete-parts":
+		return runDeleteParts(ctx, os.Args[2:])
 	case "delete-job":
 		return runDeleteJob(ctx, os.Args[2:])
 	case "version":
@@ -115,6 +117,7 @@ func usage() {
   partforge list-jobs       [flags]
   partforge job-status      [flags]
   partforge retry-failed    [flags]
+  partforge delete-parts    [flags]
   partforge delete-job      [flags]
 
 Commands:
@@ -124,6 +127,7 @@ Commands:
   list-jobs         List job IDs found in the DynamoDB state table.
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
+  delete-parts      Force delete selected DynamoDB part rows from one job.
   delete-job        Delete one job's DynamoDB state rows, optionally including S3 artifacts.
   version           Print the build version.
 `)
@@ -1798,6 +1802,93 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runDeleteParts(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("delete-parts", flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id containing parts to delete")
+		partIDs        partIDListFlag
+		status         = fs.String("status", "", "delete parts in this exact state, e.g. IMPORTED")
+		all            = fs.Bool("all", false, "delete every part row in the job")
+		force          = fs.Bool("force", false, "required to delete selected part rows")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	fs.Var(&partIDs, "part-id", "specific part id to delete; may be repeated")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "delete-parts"); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+	if !*force {
+		return errors.New("delete-parts requires -force")
+	}
+	selectors := 0
+	if *all {
+		selectors++
+	}
+	if strings.TrimSpace(*status) != "" {
+		selectors++
+	}
+	if len(partIDs) > 0 {
+		selectors++
+	}
+	if selectors != 1 {
+		return errors.New("exactly one of -all, -status, or -part-id is required")
+	}
+
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	deleteParts, err := selectDeleteParts(jobParts, deletePartSelection{
+		All:     *all,
+		PartIDs: []string(partIDs),
+		Status:  state.Status(strings.TrimSpace(*status)),
+	})
+	if err != nil {
+		return err
+	}
+	if len(deleteParts) == 0 {
+		return fmt.Errorf("no parts matched delete selection for job %s", *jobID)
+	}
+	if err := stateStore.DeleteJobParts(ctx, deleteParts); err != nil {
+		return err
+	}
+
+	results := make([]deletePartResult, 0, len(deleteParts))
+	for _, part := range deleteParts {
+		results = append(results, deletePartResult{
+			PartID: part.PartID,
+			Status: string(part.Status),
+		})
+	}
+	out := deletePartsOutput{
+		JobID:   *jobID,
+		Deleted: len(results),
+		Parts:   results,
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printDeletePartsResult(os.Stdout, out)
+	return nil
+}
+
 func runDeleteJob(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("delete-job", flag.ExitOnError)
 	var (
@@ -2249,6 +2340,17 @@ type retryResult struct {
 	To     string `json:"to"`
 }
 
+type deletePartsOutput struct {
+	JobID   string             `json:"job_id"`
+	Deleted int                `json:"deleted"`
+	Parts   []deletePartResult `json:"parts"`
+}
+
+type deletePartResult struct {
+	PartID string `json:"part_id"`
+	Status string `json:"status"`
+}
+
 type deleteJobOutput struct {
 	JobID             string        `json:"job_id"`
 	StatePartsDeleted int           `json:"state_parts_deleted"`
@@ -2501,6 +2603,83 @@ type retryPartSelection struct {
 	PartID            string
 }
 
+type deletePartSelection struct {
+	All     bool
+	PartIDs []string
+	Status  state.Status
+}
+
+type partIDListFlag []string
+
+func (f *partIDListFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *partIDListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("part-id must not be empty")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+func selectDeleteParts(parts []state.Part, selection deletePartSelection) ([]state.Part, error) {
+	if selection.All {
+		return append([]state.Part(nil), parts...), nil
+	}
+	if len(selection.PartIDs) > 0 {
+		return selectDeletePartsByID(parts, selection.PartIDs)
+	}
+	if selection.Status != "" {
+		if !knownStatus(selection.Status) {
+			return nil, fmt.Errorf("unknown status %q", selection.Status)
+		}
+		selected := make([]state.Part, 0)
+		for _, part := range parts {
+			if part.Status == selection.Status {
+				selected = append(selected, part)
+			}
+		}
+		return selected, nil
+	}
+	return nil, errors.New("delete part selection is empty")
+}
+
+func selectDeletePartsByID(parts []state.Part, partIDs []string) ([]state.Part, error) {
+	byID := make(map[string]state.Part, len(parts))
+	for _, part := range parts {
+		byID[part.PartID] = part
+	}
+	selected := make([]state.Part, 0, len(partIDs))
+	seen := map[string]struct{}{}
+	for _, partID := range partIDs {
+		partID = strings.TrimSpace(partID)
+		if partID == "" {
+			return nil, errors.New("part-id must not be empty")
+		}
+		if _, ok := seen[partID]; ok {
+			continue
+		}
+		part, ok := byID[partID]
+		if !ok {
+			return nil, fmt.Errorf("part %s was not found in job", partID)
+		}
+		seen[partID] = struct{}{}
+		selected = append(selected, part)
+	}
+	return selected, nil
+}
+
+func knownStatus(status state.Status) bool {
+	for _, known := range statusOrder() {
+		if status == known {
+			return true
+		}
+	}
+	return false
+}
+
 func selectRetryParts(parts []state.Part, selection retryPartSelection) ([]state.Part, error) {
 	if selection.Stale {
 		return selectStaleRetryParts(parts, selection.Now, selection.StaleAfter)
@@ -2647,6 +2826,20 @@ func printDeleteJobResult(out *os.File, result deleteJobOutput) {
 	fmt.Fprintln(tw, "BUCKET\tPREFIX")
 	for _, prefix := range result.S3PrefixesDeleted {
 		fmt.Fprintf(tw, "%s\t%s\n", prefix.Bucket, prefix.Prefix)
+	}
+	_ = tw.Flush()
+}
+
+func printDeletePartsResult(out *os.File, result deletePartsOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "deleted: %d\n", result.Deleted)
+	if len(result.Parts) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nPART_ID\tSTATUS")
+	for _, part := range result.Parts {
+		fmt.Fprintf(tw, "%s\t%s\n", part.PartID, part.Status)
 	}
 	_ = tw.Flush()
 }

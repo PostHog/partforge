@@ -180,6 +180,27 @@ partforge retry-failed \
 
 Use `-force` only when the selected part or whole job should be rewritten from the worker stage.
 
+Force delete imported state rows from a job without deleting S3 artifacts:
+
+```sh
+partforge delete-parts \
+  -job-id=job-123 \
+  -status=IMPORTED \
+  -force
+```
+
+Force delete specific state rows from a job:
+
+```sh
+partforge delete-parts \
+  -job-id=job-123 \
+  -part-id=part-abc \
+  -part-id=part-def \
+  -force
+```
+
+`delete-parts` only removes selected DynamoDB part rows. It does not delete S3 artifacts and it does not remove data that has already been attached into ClickHouse. Use it when you intentionally want the state table to forget selected rows, for example after partial import cleanup before forcing the remaining source rows through the worker again.
+
 Delete one job's DynamoDB state rows:
 
 ```sh
