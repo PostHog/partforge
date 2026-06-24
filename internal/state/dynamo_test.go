@@ -135,6 +135,54 @@ func TestCompactCandidateGroupsSkipsCooldown(t *testing.T) {
 	}
 }
 
+func TestNewCompactPartSetsCompactReadyAt(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := NewCompactPart("job-1", "compact-1", "bucket", "finished/key", "db", "table", "schema", []string{"part-1"}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, now)
+	if part.CompactReadyAt != formatTime(now) {
+		t.Fatalf("compact_ready_at = %q, want %q", part.CompactReadyAt, formatTime(now))
+	}
+}
+
+func TestCompactReadyAtForReleasePreservesStableTime(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := Part{
+		CompactReadyAt:    formatTime(now.Add(-3 * time.Hour)),
+		ProgressUpdatedAt: formatTime(now.Add(-2 * time.Hour)),
+		UpdatedAt:         formatTime(now),
+	}
+	if got := compactReadyAtForRelease(part, now); got != part.CompactReadyAt {
+		t.Fatalf("compactReadyAtForRelease = %q, want compact_ready_at %q", got, part.CompactReadyAt)
+	}
+}
+
+func TestCompactReadyAtForReleaseBackfillsExistingRowsFromProgress(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := Part{
+		ProgressUpdatedAt: formatTime(now.Add(-2 * time.Hour)),
+		UpdatedAt:         formatTime(now),
+	}
+	if got := compactReadyAtForRelease(part, now); got != part.ProgressUpdatedAt {
+		t.Fatalf("compactReadyAtForRelease = %q, want progress_updated_at %q", got, part.ProgressUpdatedAt)
+	}
+}
+
+func TestCompactHeartbeatTimeUsesUpdatedAt(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := Part{
+		JobID:        "job-1",
+		PartID:       "part-1",
+		UpdatedAt:    formatTime(now),
+		CompactingAt: formatTime(now.Add(-time.Hour)),
+	}
+	got, err := compactHeartbeatTime(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(now) {
+		t.Fatalf("compactHeartbeatTime = %s, want %s", got, now)
+	}
+}
+
 func TestSelectCompactBatchPartsRequiresSamePartition(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{

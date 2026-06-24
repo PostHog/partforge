@@ -260,6 +260,24 @@ func TestFinalizableCompactReadyPartsWaitsForThreshold(t *testing.T) {
 	}
 }
 
+func TestFinalizableCompactReadyPartsUsesStableCompactReadyTime(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{
+		{
+			PartID:         "part-compact",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+			UpdatedAt:      now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(selected) != 1 {
+		t.Fatalf("selected = %+v, ok=%t; want finalized compact-ready part", selected, ok)
+	}
+}
+
 func TestCompactRetryCooldownDerivedFromCompactWindow(t *testing.T) {
 	if got := compactRetryCooldown(2 * time.Hour); got != 30*time.Minute {
 		t.Fatalf("compactRetryCooldown(2h) = %s, want 30m", got)
@@ -293,6 +311,19 @@ func TestCompactClaimSplayMaxDerivedFromCompactWindow(t *testing.T) {
 	}
 	if got := compactClaimSplayMax(time.Minute); got != 250*time.Millisecond {
 		t.Fatalf("compactClaimSplayMax(1m) = %s, want 250ms", got)
+	}
+}
+
+func TestCompactLeaseTimingDerivedFromRuntime(t *testing.T) {
+	staleAfter := compactLeaseStaleAfter(2*time.Hour, 90*time.Second)
+	if staleAfter != 2*time.Hour+90*time.Second {
+		t.Fatalf("compactLeaseStaleAfter = %s, want 2h1m30s", staleAfter)
+	}
+	if got := compactLeaseHeartbeatInterval(staleAfter); got != 5*time.Minute {
+		t.Fatalf("compactLeaseHeartbeatInterval = %s, want 5m cap", got)
+	}
+	if got := compactLeaseStaleAfter(time.Minute, 0); got != 5*time.Minute {
+		t.Fatalf("compactLeaseStaleAfter short runtime = %s, want 5m floor", got)
 	}
 }
 

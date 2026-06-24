@@ -101,7 +101,9 @@ The compactor downloads and attaches one finished artifact group at a time. Clic
 
 While waiting for compact destination merges, the compactor can poll for more compatible artifacts. Additional claims require overlap with partitions already active on the local compacting table, so the worker avoids downloading a new artifact that only adds an isolated new partition. The load-more cadence is derived from `-compact-window`.
 
-The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY` with a cooldown derived from `-compact-window`. Remaining compact-ready artifacts are promoted to `FINISHED` after the same compact window once there is no source work, in-progress rewrite, failed work, or active compaction for that job.
+The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY` with a cooldown derived from `-compact-window`. The finalization window is measured from stable `compact_ready_at`, so retrying or releasing a no-op compaction does not restart the clock.
+
+Live compaction workers heartbeat their claimed `COMPACTING` rows. Before claiming more compaction work, workers release `COMPACTING` rows whose heartbeat is stale for the derived lease timeout, currently `-compact-merge-max-runtime` plus `-shutdown-grace-period`. Remaining compact-ready artifacts are promoted to `FINISHED` after the compact window once there is no source work, in-progress rewrite, failed work, or active non-stale compaction for that job.
 
 ## Failed Merge Count
 
