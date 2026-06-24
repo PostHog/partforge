@@ -1195,6 +1195,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		more, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
 			MaxArtifacts:         remainingArtifacts,
 			MaxBytes:             remainingBytes,
+			StrictMaxBytes:       remainingBytes > 0,
 			MinInputParts:        1,
 			JobID:                batch.JobID,
 			Bucket:               batch.Parts[0].Bucket,
@@ -1485,17 +1486,7 @@ func sourceMergeWaitTimeouts(idleTimeout, maxRuntime time.Duration, compactEnabl
 }
 
 func compactRetryCooldown(compactWindow time.Duration) time.Duration {
-	if compactWindow <= 0 {
-		return time.Minute
-	}
-	cooldown := compactWindow / 4
-	if cooldown < time.Minute {
-		return time.Minute
-	}
-	if cooldown > 30*time.Minute {
-		return 30 * time.Minute
-	}
-	return cooldown
+	return time.Minute
 }
 
 func compactLoadMoreInterval(compactWindow time.Duration) time.Duration {

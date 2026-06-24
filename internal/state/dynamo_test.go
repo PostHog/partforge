@@ -118,6 +118,23 @@ func TestSelectCompactBatchPartsAllowsOversizedSingleMultiPartArtifact(t *testin
 	}
 }
 
+func TestSelectCompactBatchPartsRejectsOversizedFirstArtifactWhenStrict(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-1",
+			DestinationActivePartCount: 4,
+			DestinationActivePartBytes: 4096,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 4,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 1, MaxBytes: 2048, StrictMaxBytes: true})
+
+	if len(selected) != 0 {
+		t.Fatalf("selected = %+v, want no oversized part", selected)
+	}
+}
+
 func TestSelectCompactBatchPartsSkipsSingleCooldownCandidate(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected := selectCompactBatchParts(compactGroup{

@@ -659,24 +659,24 @@ func TestCompactWindowExpiredUsesCurrentCompactReadyTime(t *testing.T) {
 	}
 }
 
-func TestCompactRetryCooldownDerivedFromCompactWindow(t *testing.T) {
-	if got := compactRetryCooldown(2 * time.Hour); got != 30*time.Minute {
-		t.Fatalf("compactRetryCooldown(2h) = %s, want 30m", got)
+func TestCompactRetryCooldownIsShortAndIndependentOfCompactWindow(t *testing.T) {
+	if got := compactRetryCooldown(2 * time.Hour); got != time.Minute {
+		t.Fatalf("compactRetryCooldown(2h) = %s, want 1m", got)
 	}
-	if got := compactRetryCooldown(20 * time.Minute); got != 5*time.Minute {
-		t.Fatalf("compactRetryCooldown(20m) = %s, want 5m", got)
+	if got := compactRetryCooldown(20 * time.Minute); got != time.Minute {
+		t.Fatalf("compactRetryCooldown(20m) = %s, want 1m", got)
 	}
 	if got := compactRetryCooldown(0); got != time.Minute {
 		t.Fatalf("compactRetryCooldown(0) = %s, want 1m", got)
 	}
-	if got := compactRetryCooldown(12 * time.Hour); got != 30*time.Minute {
-		t.Fatalf("compactRetryCooldown(12h) = %s, want 30m cap", got)
+	if got := compactRetryCooldown(12 * time.Hour); got != time.Minute {
+		t.Fatalf("compactRetryCooldown(12h) = %s, want 1m", got)
 	}
 }
 
 func TestCompactLoadMoreIntervalDerivedFromCompactWindow(t *testing.T) {
-	if got := compactLoadMoreInterval(2 * time.Hour); got != 30*time.Second {
-		t.Fatalf("compactLoadMoreInterval(2h) = %s, want 30s", got)
+	if got := compactLoadMoreInterval(2 * time.Hour); got != 5*time.Second {
+		t.Fatalf("compactLoadMoreInterval(2h) = %s, want 5s", got)
 	}
 	if got := compactLoadMoreInterval(0); got != 5*time.Second {
 		t.Fatalf("compactLoadMoreInterval(0) = %s, want 5s", got)
@@ -684,8 +684,8 @@ func TestCompactLoadMoreIntervalDerivedFromCompactWindow(t *testing.T) {
 }
 
 func TestCompactClaimSplayMaxDerivedFromCompactWindow(t *testing.T) {
-	if got := compactClaimSplayMax(2 * time.Hour); got != 5*time.Second {
-		t.Fatalf("compactClaimSplayMax(2h) = %s, want 5s", got)
+	if got := compactClaimSplayMax(2 * time.Hour); got != 250*time.Millisecond {
+		t.Fatalf("compactClaimSplayMax(2h) = %s, want 250ms", got)
 	}
 	if got := compactClaimSplayMax(0); got != 0 {
 		t.Fatalf("compactClaimSplayMax(0) = %s, want 0", got)

@@ -141,6 +141,7 @@ func clonePartitionCounts(counts map[string]uint64) map[string]uint64 {
 type CompactClaimOptions struct {
 	MaxArtifacts         int
 	MaxBytes             uint64
+	StrictMaxBytes       bool
 	MinInputParts        uint64
 	ExcludedJobIDs       map[string]struct{}
 	JobID                string
@@ -949,8 +950,10 @@ func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minPa
 			return true
 		}
 		partBytes := part.DestinationActivePartBytes
-		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
-			return true
+		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes {
+			if len(selected) > 0 || opts.StrictMaxBytes {
+				return true
+			}
 		}
 		selected = append(selected, part)
 		inputParts += partitionParts
