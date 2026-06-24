@@ -205,6 +205,16 @@ partforge set-part-state \
 
 `set-part-state` is an admin recovery command. It can select rows by repeated `-part-id` or by current `-status`, and it can target `READY`, `COMPACT_READY`, or `FINISHED`. It clears stale worker ownership, error, cooldown, and compaction-progress fields; targeting `READY` also clears persisted rewrite progress and metrics. The command preserves rewritten artifact metadata when targeting `COMPACT_READY` or `FINISHED`. It uses conditional updates and requires `dynamodb:Query` and `dynamodb:UpdateItem`.
 
+Restart a job's compact-window timer for debugging:
+
+```sh
+partforge reset-compact-timer \
+  -job-id=job-123 \
+  -force
+```
+
+`reset-compact-timer` sets `compact_ready_at` to the current time on every part row in the job, including superseded rows, generated compact rows, originals, and currently compacting rows. It does not change row status, worker ownership, cooldowns, or S3 data. Use it when you intentionally want the job-level compact deadline to become roughly `now + -compact-window`.
+
 Reset a job back to its original uploaded source parts:
 
 ```sh

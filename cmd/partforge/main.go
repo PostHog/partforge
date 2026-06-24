@@ -96,6 +96,8 @@ func run() error {
 		return runRetryFailed(ctx, os.Args[2:])
 	case "set-part-state":
 		return runSetPartState(ctx, os.Args[2:])
+	case "reset-compact-timer":
+		return runResetCompactTimer(ctx, os.Args[2:])
 	case "reset-job":
 		return runResetJob(ctx, os.Args[2:])
 	case "reset-compaction":
@@ -125,6 +127,7 @@ func usage() {
   partforge job-status      [flags]
   partforge retry-failed    [flags]
   partforge set-part-state  [flags]
+  partforge reset-compact-timer [flags]
   partforge reset-job       [flags]
   partforge reset-compaction [flags]
   partforge delete-parts    [flags]
@@ -138,6 +141,7 @@ Commands:
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
   set-part-state    Force selected part rows into a stable state for admin recovery.
+  reset-compact-timer Restart selected compact rows' compact-window timer.
   reset-job         Delete generated compact rows and move original job parts back to READY.
   reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
   delete-parts      Force delete selected DynamoDB part rows from one job.
@@ -1088,11 +1092,27 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			slog.Warn("released stale compacting parts", "stage", "release_stale_compact", "worker_id", cfg.WorkerID, "released", released, "stale_after", cfg.CompactLeaseStaleAfter, "cooldown", retryCooldown)
 		}
 	}
+	finalization := compactFinalizationResult{}
+	if cfg.CompactWindow > 0 {
+		var err error
+		finalization, err = finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
+		if err != nil {
+			return false, err
+		}
+		if finalization.Finalized > 0 {
+			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalization.Finalized)
+			return true, nil
+		}
+		if len(finalization.ExpiredJobIDs) > 0 {
+			slog.Info("skipping compact claims for jobs past compact window", "stage", "claim_compact", "worker_id", cfg.WorkerID, "jobs", len(finalization.ExpiredJobIDs))
+		}
+	}
 	slog.Info("claiming compact-ready batch", "stage", "claim_compact", "worker_id", cfg.WorkerID)
 	batch, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
-		MaxArtifacts:  defaultCompactMaxArtifacts,
-		MaxBytes:      cfg.CompactMaxBytes,
-		MinInputParts: compactMinInputParts,
+		MaxArtifacts:   defaultCompactMaxArtifacts,
+		MaxBytes:       cfg.CompactMaxBytes,
+		MinInputParts:  compactMinInputParts,
+		ExcludedJobIDs: finalization.ExpiredJobIDs,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1102,12 +1122,12 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		return false, err
 	}
 	if batch == nil {
-		finalized, err := finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
+		finalization, err := finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
 		if err != nil {
 			return false, err
 		}
-		if finalized > 0 {
-			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalized)
+		if finalization.Finalized > 0 {
+			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalization.Finalized)
 			return true, nil
 		}
 		return false, nil
@@ -1167,6 +1187,10 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		requiredPartitions := partitionIDsFromRewrite(current.Partitions)
 		if len(requiredPartitions) == 0 {
 			return nil, nil
+		}
+		expired, err := compactJobDeadlineExpired(ctx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
+		if err != nil || expired {
+			return nil, err
 		}
 		more, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
 			MaxArtifacts:         remainingArtifacts,
@@ -1536,32 +1560,44 @@ func compactClaimSplayMax(compactWindow time.Duration) time.Duration {
 	return maxDelay
 }
 
-func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWindow time.Duration, now time.Time) (int, error) {
+type compactFinalizationResult struct {
+	Finalized     int
+	ExpiredJobIDs map[string]struct{}
+}
+
+func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWindow time.Duration, now time.Time) (compactFinalizationResult, error) {
+	result := compactFinalizationResult{ExpiredJobIDs: map[string]struct{}{}}
 	jobIDs, err := store.ListJobIDs(ctx)
 	if err != nil {
-		return 0, err
+		return result, err
 	}
-	finalized := 0
 	for _, jobID := range jobIDs {
 		parts, err := store.ListJobParts(ctx, jobID)
 		if err != nil {
-			return finalized, err
+			return result, err
+		}
+		expired, err := compactWindowExpired(parts, compactWindow, now)
+		if err != nil {
+			return result, err
+		}
+		if expired {
+			result.ExpiredJobIDs[jobID] = struct{}{}
 		}
 		compactReady, ok, err := finalizableCompactReadyParts(parts, compactWindow, now)
 		if err != nil {
-			return finalized, err
+			return result, err
 		}
 		if !ok {
 			continue
 		}
 		for _, part := range compactReady {
 			if err := store.MarkCompactReadyFinished(ctx, part, now); err != nil {
-				return finalized, err
+				return result, err
 			}
-			finalized++
+			result.Finalized++
 		}
 	}
-	return finalized, nil
+	return result, nil
 }
 
 func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duration, now time.Time) ([]state.Part, bool, error) {
@@ -1588,6 +1624,31 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 		return nil, false, nil
 	}
 	return compactReady, true, nil
+}
+
+func compactJobDeadlineExpired(ctx context.Context, store *state.Store, jobID string, compactWindow time.Duration, now time.Time) (bool, error) {
+	if compactWindow <= 0 {
+		return false, nil
+	}
+	parts, err := store.ListJobParts(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	return compactWindowExpired(parts, compactWindow, now)
+}
+
+func compactWindowExpired(parts []state.Part, compactWindow time.Duration, now time.Time) (bool, error) {
+	if compactWindow <= 0 {
+		return true, nil
+	}
+	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
+	if !ok {
+		if reason == "no compact phase timestamp found" {
+			return false, nil
+		}
+		return false, errors.New(reason)
+	}
+	return !now.Before(finalizeAfter), nil
 }
 
 func compactReadySince(part state.Part) (time.Time, error) {
@@ -2032,6 +2093,65 @@ func runSetPartState(ctx context.Context, args []string) error {
 		return writeJSON(os.Stdout, out)
 	}
 	printSetPartStateResult(os.Stdout, out)
+	return nil
+}
+
+func runResetCompactTimer(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("reset-compact-timer", flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id whose compact timer should be reset")
+		force          = fs.Bool("force", false, "required to reset compact timer")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "reset-compact-timer"); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+	if !*force {
+		return errors.New("reset-compact-timer requires -force")
+	}
+
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	if len(jobParts) == 0 {
+		return fmt.Errorf("job %s has no parts", *jobID)
+	}
+
+	now := time.Now().UTC()
+	for _, part := range jobParts {
+		if err := stateStore.ResetCompactTimer(ctx, part, now); err != nil {
+			return err
+		}
+	}
+
+	out := resetCompactTimerOutput{
+		JobID:   *jobID,
+		ResetAt: now.Format(time.RFC3339Nano),
+		Updated: len(jobParts),
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printResetCompactTimerResult(os.Stdout, out)
 	return nil
 }
 
@@ -2801,6 +2921,12 @@ type setPartStateResult struct {
 	PartID string `json:"part_id"`
 	From   string `json:"from"`
 	To     string `json:"to"`
+}
+
+type resetCompactTimerOutput struct {
+	JobID   string `json:"job_id"`
+	ResetAt string `json:"reset_at"`
+	Updated int    `json:"updated"`
 }
 
 type resetMode string
@@ -3897,6 +4023,12 @@ func printSetPartStateResult(out *os.File, result setPartStateOutput) {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", part.PartID, part.From, part.To)
 	}
 	_ = tw.Flush()
+}
+
+func printResetCompactTimerResult(out *os.File, result resetCompactTimerOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "reset_at: %s\n", result.ResetAt)
+	fmt.Fprintf(out, "updated: %d\n", result.Updated)
 }
 
 func printResetStateResult(out *os.File, result resetStateOutput) {

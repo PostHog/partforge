@@ -203,6 +203,39 @@ func TestCompactCandidateGroupsIncludesCooldown(t *testing.T) {
 	}
 }
 
+func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	groups := compactCandidateGroups([]Part{
+		{
+			JobID:                      "job-1",
+			PartID:                     "part-1",
+			Bucket:                     "bucket",
+			DestinationDatabase:        "db",
+			DestinationTable:           "table",
+			DestinationSchema:          "schema",
+			DestinationActivePartCount: 2,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 2,
+			},
+		},
+		{
+			JobID:                      "job-2",
+			PartID:                     "part-2",
+			Bucket:                     "bucket",
+			DestinationDatabase:        "db",
+			DestinationTable:           "table",
+			DestinationSchema:          "schema",
+			DestinationActivePartCount: 2,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 2,
+			},
+		},
+	}, nil, now, CompactClaimOptions{ExcludedJobIDs: map[string]struct{}{"job-1": {}}})
+	if len(groups) != 1 || len(groups[0].parts) != 1 || groups[0].parts[0].JobID != "job-2" {
+		t.Fatalf("groups = %+v, want only non-excluded job-2", groups)
+	}
+}
+
 func TestNewCompactPartSetsCompactReadyAt(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	part := NewCompactPart("job-1", "compact-1", "bucket", "finished/key", "db", "table", "schema", []string{"part-1"}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, now)

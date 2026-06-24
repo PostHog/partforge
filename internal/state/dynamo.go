@@ -142,6 +142,7 @@ type CompactClaimOptions struct {
 	MaxArtifacts         int
 	MaxBytes             uint64
 	MinInputParts        uint64
+	ExcludedJobIDs       map[string]struct{}
 	JobID                string
 	Bucket               string
 	DestinationDatabase  string
@@ -824,6 +825,9 @@ func compactingPartitionIDsByGroup(parts []Part) map[string][]string {
 }
 
 func matchesCompactClaimOptions(part Part, opts CompactClaimOptions) bool {
+	if _, excluded := opts.ExcludedJobIDs[part.JobID]; excluded {
+		return false
+	}
 	if opts.JobID != "" && part.JobID != opts.JobID {
 		return false
 	}
@@ -1582,6 +1586,35 @@ func (s *Store) ForceSetPartStatus(ctx context.Context, part Part, to Status, no
 	})
 	if err != nil {
 		return fmt.Errorf("force set part %s/%s to %s: %w", part.JobID, part.PartID, to, err)
+	}
+	return nil
+}
+
+func (s *Store) ResetCompactTimer(ctx context.Context, part Part, now time.Time) error {
+	if err := validatePart(part); err != nil {
+		return err
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#job_id = :job_id AND #part_id = :part_id",
+		),
+		UpdateExpression: aws.String(
+			"SET compact_ready_at = :now",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#job_id":  "job_id",
+			"#part_id": "part_id",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":job_id":  stringAttr(part.JobID),
+			":now":     stringAttr(formatTime(now)),
+			":part_id": stringAttr(part.PartID),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reset compact timer for %s/%s: %w", part.JobID, part.PartID, err)
 	}
 	return nil
 }

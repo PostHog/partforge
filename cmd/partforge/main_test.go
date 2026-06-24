@@ -620,6 +620,45 @@ func TestFinalizableCompactReadyPartsUsesOldestCompactPhaseTime(t *testing.T) {
 	}
 }
 
+func TestCompactWindowExpiredIgnoresJobsWithoutCompactPhase(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	expired, err := compactWindowExpired([]state.Part{
+		{
+			PartID:    "part-ready",
+			Status:    state.StatusReady,
+			UpdatedAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired {
+		t.Fatal("expected job without compact phase to be treated as not expired")
+	}
+}
+
+func TestCompactWindowExpiredUsesOldestCompactPhaseTime(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	expired, err := compactWindowExpired([]state.Part{
+		{
+			PartID:         "part-original",
+			Status:         state.StatusSuperseded,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		},
+		{
+			PartID:         "compact-fresh",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expired {
+		t.Fatal("expected job compact window to be expired from oldest compact timestamp")
+	}
+}
+
 func TestCompactRetryCooldownDerivedFromCompactWindow(t *testing.T) {
 	if got := compactRetryCooldown(2 * time.Hour); got != 30*time.Minute {
 		t.Fatalf("compactRetryCooldown(2h) = %s, want 30m", got)
