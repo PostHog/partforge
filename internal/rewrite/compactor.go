@@ -35,6 +35,7 @@ type Compactor struct {
 	RestartClickHouse   func(context.Context) error
 	LoadMoreInputs      func(context.Context, CompactLoadState) ([]CompactInput, error)
 	LoadMoreInterval    time.Duration
+	ReportProgress      CompactProgressReporter
 }
 
 type CompactInput struct {
@@ -45,6 +46,13 @@ type CompactInput struct {
 	Rows            uint64
 	Bytes           uint64
 	PartitionCounts map[string]uint64
+}
+
+type CompactProgressReporter func(context.Context, CompactWorkItem, CompactProgressSnapshot) error
+
+type CompactProgressSnapshot struct {
+	InputStats       metrics.PartStats
+	DestinationStats metrics.PartStats
 }
 
 type CompactLoadState struct {
@@ -149,6 +157,9 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	actualInputStats := summarizePartPartitions(actualInputPartitions)
 	inputStats := compactInputStats(attachedInputs, actualInputStats)
 	slog.Info("attached compact input artifacts", "stage", "compact_attach_inputs", "job_id", item.JobID, "part_id", item.OutputPartID, "input_artifacts", len(item.Inputs), "active_parts", actualInputStats.Count, "active_rows", actualInputStats.Rows, "active_bytes_on_disk", actualInputStats.Bytes)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats}); err != nil {
+		return CompactResult{}, err
+	}
 	if inputStats.Count < 2 {
 		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: inputStats, DestinationPartitions: actualInputPartitions, Inputs: attachedInputs}, nil
 	}
@@ -161,9 +172,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	}
 	lastLoadMoreAt := time.Time{}
 	p.mergeWaitHook = func(ctx context.Context, target mergeWaitTarget, snapshot mergePartSnapshot, activeMerges uint64) (bool, error) {
-		if c.LoadMoreInputs == nil {
-			return false, nil
-		}
 		now := time.Now()
 		interval := c.LoadMoreInterval
 		if interval < 0 {
@@ -176,6 +184,13 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		partitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
 		if err != nil {
 			return false, fmt.Errorf("measure compact active part partitions before loading more inputs: %w", err)
+		}
+		stats := summarizePartPartitions(partitions)
+		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: compactInputStats(attachedInputs, stats), DestinationStats: stats}); err != nil {
+			return false, err
+		}
+		if c.LoadMoreInputs == nil {
+			return false, nil
 		}
 		inputs, err := c.LoadMoreInputs(ctx, CompactLoadState{
 			Stats: metrics.PartStats{
@@ -201,8 +216,11 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		if err != nil {
 			return false, fmt.Errorf("measure compact active part partitions after loading more inputs: %w", err)
 		}
-		stats := summarizePartPartitions(partitions)
+		stats = summarizePartPartitions(partitions)
 		if err := c.configureCompactMergeSettings(ctx, item, stats.Bytes); err != nil {
+			return false, err
+		}
+		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: compactInputStats(attachedInputs, stats), DestinationStats: stats}); err != nil {
 			return false, err
 		}
 		slog.Info("loaded more compact input artifacts", "stage", "compact_load_more_inputs", "job_id", item.JobID, "output_part_id", item.OutputPartID, "loaded_inputs", len(inputs), "total_inputs", len(attachedInputs), "active_parts", stats.Count, "active_bytes_on_disk", stats.Bytes)
@@ -225,6 +243,9 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	destStats := summarizePartPartitions(destPartitions)
 	inputStats = compactInputStats(attachedInputs, inputStats)
 	slog.Info("measured compact output parts", "stage", "compact_measure_output", "job_id", item.JobID, "part_id", item.OutputPartID, "input_parts", inputStats.Count, "output_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: destStats}); err != nil {
+		return CompactResult{}, err
+	}
 	if destStats.Count >= inputStats.Count {
 		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: destStats, DestinationPartitions: destPartitions, Inputs: attachedInputs}, nil
 	}
@@ -254,6 +275,13 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		DestinationPartitions: destPartitions,
 		Inputs:                attachedInputs,
 	}, nil
+}
+
+func (c Compactor) reportProgress(ctx context.Context, item CompactWorkItem, snapshot CompactProgressSnapshot) error {
+	if c.ReportProgress == nil {
+		return nil
+	}
+	return c.ReportProgress(ctx, item, snapshot)
 }
 
 func (c Compactor) prepareDestinationTable(ctx context.Context, item CompactWorkItem) error {

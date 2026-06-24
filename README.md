@@ -123,7 +123,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. `job-status` also rolls up `IN_PROGRESS` parts by current rewrite stage, such as `insert_select` and `wait_merges`, and includes the total failed destination merge count recorded by workers. Use `job-status -parts` to include one row per part with the latest persisted rewrite counters, active part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. The state and `IN_PROGRESS` stage tables also show physical input/output ClickHouse parts for those groups. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
 
 Retry one failed part:
 
@@ -181,6 +181,24 @@ partforge retry-failed \
 ```
 
 Use `-force` only when the selected part or whole job should be rewritten from the worker stage.
+
+Reset a job back to its original uploaded source parts:
+
+```sh
+partforge reset-job \
+  -job-id=job-123 \
+  -force
+```
+
+Reset only generated compaction state and rerun compaction from the original rewritten artifacts:
+
+```sh
+partforge reset-compaction \
+  -job-id=job-123 \
+  -force
+```
+
+`reset-job` deletes generated compact state rows and moves original source rows back to `READY`. `reset-compaction` deletes generated compact state rows and moves original rewritten rows back to `COMPACT_READY`. Both commands validate the compaction lineage recorded in `compact_input_part_ids` and `superseded_by`, and both fail if any row has started import. Add `-delete-s3` to also delete reset artifact prefixes: `reset-job -delete-s3` deletes generated compact artifacts and original rewritten `finished/` artifacts, while preserving uploaded `source/` artifacts; `reset-compaction -delete-s3` deletes only generated compact artifacts. Both commands require `dynamodb:Query`, `dynamodb:DeleteItem`, and `dynamodb:UpdateItem`; with `-delete-s3`, they also require S3 list/delete permissions for the recorded artifact prefixes.
 
 Force delete imported state rows from a job without deleting S3 artifacts:
 

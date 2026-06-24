@@ -79,6 +79,15 @@ type Part struct {
 	CompactCooldownUntil string   `dynamodbav:"compact_cooldown_until,omitempty"`
 	SupersededBy         string   `dynamodbav:"superseded_by,omitempty"`
 
+	CompactOutputPartID    string `dynamodbav:"compact_output_part_id,omitempty"`
+	CompactProgressAt      string `dynamodbav:"compact_progress_at,omitempty"`
+	CompactInputPartCount  uint64 `dynamodbav:"compact_input_part_count,omitempty"`
+	CompactInputRows       uint64 `dynamodbav:"compact_input_rows,omitempty"`
+	CompactInputBytes      uint64 `dynamodbav:"compact_input_bytes,omitempty"`
+	CompactOutputPartCount uint64 `dynamodbav:"compact_output_part_count,omitempty"`
+	CompactOutputRows      uint64 `dynamodbav:"compact_output_rows,omitempty"`
+	CompactOutputBytes     uint64 `dynamodbav:"compact_output_bytes,omitempty"`
+
 	ProgressUpdatedAt                string            `dynamodbav:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `dynamodbav:"read_rows,omitempty"`
 	ReadBytes                        uint64            `dynamodbav:"read_bytes,omitempty"`
@@ -473,7 +482,7 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 			":worker":           stringAttr(workerID),
 		}
 		updateExpression := "SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now, compact_ready_at = if_not_exists(compact_ready_at, :compact_ready_at)"
-		remove := []string{"#worker_id", "compacting_at", "#error"}
+		remove := append([]string{"#worker_id", "compacting_at", "#error"}, compactProgressRemoveAttributes()...)
 		if !cooldownUntil.IsZero() {
 			updateExpression += ", compact_cooldown_until = :cooldown_until"
 			values[":cooldown_until"] = stringAttr(formatTime(cooldownUntil))
@@ -528,6 +537,49 @@ func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, w
 	return nil
 }
 
+func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, outputPartID, workerID string, inputStats, outputStats PartStats, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	if strings.TrimSpace(outputPartID) == "" {
+		return errors.New("compact output part id is required")
+	}
+	for _, part := range batch.Parts {
+		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(s.table),
+			Key:       part.key(),
+			ConditionExpression: aws.String(
+				"#status = :compacting AND #worker_id = :worker",
+			),
+			UpdateExpression: aws.String(
+				"SET updated_at = :now, compact_progress_at = :now, compact_output_part_id = :output_part_id, " +
+					"compact_input_part_count = :input_parts, compact_input_rows = :input_rows, compact_input_bytes = :input_bytes, " +
+					"compact_output_part_count = :output_parts, compact_output_rows = :output_rows, compact_output_bytes = :output_bytes",
+			),
+			ExpressionAttributeNames: map[string]string{
+				"#status":    "status",
+				"#worker_id": "worker_id",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":compacting":     stringAttr(string(StatusCompacting)),
+				":input_bytes":    uintAttr(inputStats.Bytes),
+				":input_parts":    uintAttr(inputStats.Count),
+				":input_rows":     uintAttr(inputStats.Rows),
+				":now":            stringAttr(formatTime(now)),
+				":output_bytes":   uintAttr(outputStats.Bytes),
+				":output_part_id": stringAttr(outputPartID),
+				":output_parts":   uintAttr(outputStats.Count),
+				":output_rows":    uintAttr(outputStats.Rows),
+				":worker":         stringAttr(workerID),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("update compact progress for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, staleAfter time.Duration, cooldownUntil time.Time) (int, error) {
 	if staleAfter <= 0 {
 		return 0, fmt.Errorf("compact stale timeout must be greater than zero, got %s", staleAfter)
@@ -571,7 +623,7 @@ func (s *Store) releaseStaleCompactingPart(ctx context.Context, part Part, coold
 		":updated_at":       stringAttr(part.UpdatedAt),
 	}
 	updateExpression := "SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now, compact_ready_at = if_not_exists(compact_ready_at, :compact_ready_at)"
-	remove := []string{"worker_id", "compacting_at", "#error"}
+	remove := append([]string{"worker_id", "compacting_at", "#error"}, compactProgressRemoveAttributes()...)
 	if !cooldownUntil.IsZero() {
 		updateExpression += ", compact_cooldown_until = :cooldown_until"
 		values[":cooldown_until"] = stringAttr(formatTime(cooldownUntil))
@@ -636,7 +688,7 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 					"#status = :compacting AND #worker_id = :worker",
 				),
 				UpdateExpression: aws.String(
-					"SET #status = :superseded, gsi1pk = :gsi1pk, updated_at = :now, superseded_at = :now, superseded_by = :superseded_by REMOVE #worker_id, compacting_at, #error, compact_cooldown_until",
+					"SET #status = :superseded, gsi1pk = :gsi1pk, updated_at = :now, superseded_at = :now, superseded_by = :superseded_by REMOVE #worker_id, compacting_at, #error, compact_cooldown_until, " + strings.Join(compactProgressRemoveAttributes(), ", "),
 				),
 				ExpressionAttributeNames: map[string]string{
 					"#error":     "error",
@@ -1427,6 +1479,122 @@ func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (S
 	return StatusReady, nil
 }
 
+func (s *Store) ResetOriginalPartToReady(ctx context.Context, part Part, now time.Time) error {
+	if err := validateOriginalResetPart(part); err != nil {
+		return err
+	}
+	remove := []string{
+		"#error",
+		"failed_at",
+		"started_at",
+		"finished_at",
+		"compact_ready_at",
+		"compacting_at",
+		"superseded_at",
+		"importing_at",
+		"imported_at",
+		"worker_id",
+		"compact_cooldown_until",
+		"superseded_by",
+		"destination_database",
+		"destination_table",
+		"destination_schema",
+		"compact_generation",
+		"compact_input_part_ids",
+	}
+	remove = append(remove, compactProgressRemoveAttributes()...)
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#job_id = :job_id AND #part_id = :part_id AND updated_at = :updated_at",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE " + strings.Join(remove, ", ") + progressRemoveExpression(),
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":   "error",
+			"#job_id":  "job_id",
+			"#part_id": "part_id",
+			"#status":  "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi1pk":     stringAttr(statusKey(StatusReady)),
+			":job_id":     stringAttr(part.JobID),
+			":now":        stringAttr(formatTime(now)),
+			":part_id":    stringAttr(part.PartID),
+			":ready":      stringAttr(string(StatusReady)),
+			":updated_at": stringAttr(part.UpdatedAt),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reset original part %s/%s to %s: %w", part.JobID, part.PartID, StatusReady, err)
+	}
+	return nil
+}
+
+func (s *Store) ResetOriginalPartToCompactReady(ctx context.Context, part Part, now time.Time) error {
+	if err := validateOriginalResetPart(part); err != nil {
+		return err
+	}
+	remove := []string{
+		"#error",
+		"failed_at",
+		"started_at",
+		"finished_at",
+		"compacting_at",
+		"superseded_at",
+		"importing_at",
+		"imported_at",
+		"worker_id",
+		"compact_cooldown_until",
+		"superseded_by",
+		"compact_input_part_ids",
+	}
+	remove = append(remove, compactProgressRemoveAttributes()...)
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#job_id = :job_id AND #part_id = :part_id AND updated_at = :updated_at",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now, compact_ready_at = :now REMOVE " + strings.Join(remove, ", "),
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":   "error",
+			"#job_id":  "job_id",
+			"#part_id": "part_id",
+			"#status":  "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":compact_ready": stringAttr(string(StatusCompactReady)),
+			":gsi1pk":        stringAttr(statusKey(StatusCompactReady)),
+			":job_id":        stringAttr(part.JobID),
+			":now":           stringAttr(formatTime(now)),
+			":part_id":       stringAttr(part.PartID),
+			":updated_at":    stringAttr(part.UpdatedAt),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reset original part %s/%s to %s: %w", part.JobID, part.PartID, StatusCompactReady, err)
+	}
+	return nil
+}
+
+func validateOriginalResetPart(part Part) error {
+	if err := validatePart(part); err != nil {
+		return err
+	}
+	if len(part.CompactInputPartIDs) > 0 || part.CompactGeneration > 0 {
+		return fmt.Errorf("part %s/%s is a generated compact part, not an original source part", part.JobID, part.PartID)
+	}
+	if strings.TrimSpace(part.UpdatedAt) == "" {
+		return fmt.Errorf("part %s/%s is missing updated_at", part.JobID, part.PartID)
+	}
+	return nil
+}
+
 func (s *Store) claimPart(ctx context.Context, part Part, workerID string, now time.Time) (*Part, error) {
 	nowValue := formatTime(now)
 	out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -1577,6 +1745,19 @@ func partStateKey(jobID, partID string) map[string]types.AttributeValue {
 
 func progressRemoveExpression() string {
 	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, destination_active_partition_counts, destination_failed_merges, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
+}
+
+func compactProgressRemoveAttributes() []string {
+	return []string{
+		"compact_output_part_id",
+		"compact_progress_at",
+		"compact_input_part_count",
+		"compact_input_rows",
+		"compact_input_bytes",
+		"compact_output_part_count",
+		"compact_output_rows",
+		"compact_output_bytes",
+	}
 }
 
 func jobKey(jobID string) string {

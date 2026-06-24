@@ -49,6 +49,83 @@ func TestSummarizeJob(t *testing.T) {
 	}
 }
 
+func TestSummarizeJobPartCounts(t *testing.T) {
+	summary := summarizeJob("job-1", []state.Part{
+		{
+			PartID:                     "part-1",
+			Status:                     state.StatusSuperseded,
+			DestinationActivePartCount: 4,
+			SupersededBy:               "compact-1",
+		},
+		{
+			PartID:                     "part-2",
+			Status:                     state.StatusSuperseded,
+			DestinationActivePartCount: 3,
+			SupersededBy:               "compact-1",
+		},
+		{
+			PartID:                     "compact-1",
+			Status:                     state.StatusCompactReady,
+			CompactGeneration:          1,
+			CompactInputPartIDs:        []string{"part-1", "part-2"},
+			DestinationActivePartCount: 2,
+		},
+		{
+			PartID:                     "part-3",
+			Status:                     state.StatusInProgress,
+			RewriteStage:               "wait_merges",
+			SourceActivePartCount:      1,
+			DestinationActivePartCount: 5,
+		},
+	})
+
+	if summary.InputClickHouseParts != 3 {
+		t.Fatalf("input clickhouse parts = %d, want 3 original source parts", summary.InputClickHouseParts)
+	}
+	if summary.CurrentOutputClickHouseParts != 7 {
+		t.Fatalf("current output clickhouse parts = %d, want compact output plus in-progress output", summary.CurrentOutputClickHouseParts)
+	}
+	compactReady := findStatusPartStats(summary.StatePartStats, state.StatusCompactReady)
+	if compactReady.InputClickHouseParts != 7 || compactReady.OutputClickHouseParts != 2 {
+		t.Fatalf("compact-ready part stats = %+v, want input=7 output=2", compactReady)
+	}
+	inProgress := findStatusPartStats(summary.StatePartStats, state.StatusInProgress)
+	if inProgress.InputClickHouseParts != 1 || inProgress.OutputClickHouseParts != 5 {
+		t.Fatalf("in-progress part stats = %+v, want input=1 output=5", inProgress)
+	}
+}
+
+func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
+	summary := summarizeJob("job-1", []state.Part{
+		{
+			JobID:                  "job-1",
+			PartID:                 "part-1",
+			Status:                 state.StatusCompacting,
+			WorkerID:               "worker-1",
+			CompactOutputPartID:    "compact-1",
+			CompactInputPartCount:  9,
+			CompactOutputPartCount: 4,
+		},
+		{
+			JobID:                  "job-1",
+			PartID:                 "part-2",
+			Status:                 state.StatusCompacting,
+			WorkerID:               "worker-1",
+			CompactOutputPartID:    "compact-1",
+			CompactInputPartCount:  9,
+			CompactOutputPartCount: 4,
+		},
+	})
+
+	if summary.CurrentOutputClickHouseParts != 4 {
+		t.Fatalf("current output clickhouse parts = %d, want compact batch output counted once", summary.CurrentOutputClickHouseParts)
+	}
+	compacting := findStatusPartStats(summary.StatePartStats, state.StatusCompacting)
+	if compacting.Count != 2 || compacting.InputClickHouseParts != 9 || compacting.OutputClickHouseParts != 4 {
+		t.Fatalf("compacting part stats = %+v, want count=2 input=9 output=4", compacting)
+	}
+}
+
 func TestSummarizeJobCountsInProgressStages(t *testing.T) {
 	summary := summarizeJob("job-1", []state.Part{
 		{PartID: "part-1", Status: state.StatusInProgress, RewriteStage: "wait_merges"},
@@ -59,9 +136,9 @@ func TestSummarizeJobCountsInProgressStages(t *testing.T) {
 	})
 
 	want := []inProgressStageCount{
-		{Stage: "insert_select", Count: 2},
-		{Stage: "wait_merges", Count: 1},
-		{Stage: "unknown", Count: 1},
+		{Stage: "insert_select", Count: 2, InputClickHouseParts: 2},
+		{Stage: "wait_merges", Count: 1, InputClickHouseParts: 1},
+		{Stage: "unknown", Count: 1, InputClickHouseParts: 1},
 	}
 	if len(summary.InProgressStages) != len(want) {
 		t.Fatalf("in-progress stages = %+v, want %+v", summary.InProgressStages, want)
@@ -71,6 +148,15 @@ func TestSummarizeJobCountsInProgressStages(t *testing.T) {
 			t.Fatalf("in-progress stage %d = %+v, want %+v", i, summary.InProgressStages[i], want[i])
 		}
 	}
+}
+
+func findStatusPartStats(stats []statusPartStats, status state.Status) statusPartStats {
+	for _, stat := range stats {
+		if stat.Status == status {
+			return stat
+		}
+	}
+	return statusPartStats{}
 }
 
 func TestSelectRetryParts(t *testing.T) {
@@ -212,6 +298,118 @@ func TestSelectImportFinishedParts(t *testing.T) {
 
 	if _, err := selectImportFinishedParts(parts, "part-missing"); err == nil {
 		t.Fatal("expected missing part error")
+	}
+}
+
+func TestBuildResetPlanUsesCompactLineage(t *testing.T) {
+	parts := []state.Part{
+		resetOriginalPart("part-1", state.StatusSuperseded, "compact-1"),
+		resetOriginalPart("part-2", state.StatusSuperseded, "compact-1"),
+		resetOriginalPart("part-3", state.StatusSuperseded, "compact-2"),
+		resetCompactPart("compact-1", state.StatusSuperseded, []string{"part-1", "part-2"}, "compact-2", 1),
+		resetCompactPart("compact-2", state.StatusCompactReady, []string{"compact-1", "part-3"}, "", 2),
+	}
+
+	plan, err := buildResetPlan("job-1", parts, resetModeJob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.TargetStatus != state.StatusReady {
+		t.Fatalf("target status = %s, want READY", plan.TargetStatus)
+	}
+	if got := partIDs(plan.OriginalParts); strings.Join(got, ",") != "part-1,part-2,part-3" {
+		t.Fatalf("originals = %v", got)
+	}
+	if got := partIDs(plan.GeneratedParts); strings.Join(got, ",") != "compact-1,compact-2" {
+		t.Fatalf("generated = %v", got)
+	}
+
+	prefixes := resetS3Prefixes(plan)
+	if got := resetPrefixStrings(prefixes); strings.Join(got, ",") != "bucket:finished/compact-1,bucket:finished/compact-2,bucket:finished/part-1,bucket:finished/part-2,bucket:finished/part-3" {
+		t.Fatalf("reset-job prefixes = %v", got)
+	}
+}
+
+func TestBuildResetCompactionPlanPreservesRewrittenOriginals(t *testing.T) {
+	parts := []state.Part{
+		resetOriginalPart("part-1", state.StatusSuperseded, "compact-1"),
+		resetOriginalPart("part-2", state.StatusSuperseded, "compact-1"),
+		resetCompactPart("compact-1", state.StatusCompactReady, []string{"part-1", "part-2"}, "", 1),
+	}
+
+	plan, err := buildResetPlan("job-1", parts, resetModeCompaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.TargetStatus != state.StatusCompactReady {
+		t.Fatalf("target status = %s, want COMPACT_READY", plan.TargetStatus)
+	}
+	if got := partIDs(plan.OriginalParts); strings.Join(got, ",") != "part-1,part-2" {
+		t.Fatalf("originals = %v", got)
+	}
+	if got := resetPrefixStrings(resetS3Prefixes(plan)); strings.Join(got, ",") != "bucket:finished/compact-1" {
+		t.Fatalf("reset-compaction prefixes = %v", got)
+	}
+}
+
+func TestBuildResetPlanRejectsImportedParts(t *testing.T) {
+	_, err := buildResetPlan("job-1", []state.Part{
+		resetOriginalPart("part-1", state.StatusImported, ""),
+	}, resetModeJob)
+	if err == nil {
+		t.Fatal("expected imported part error")
+	}
+}
+
+func TestBuildResetPlanRejectsFailedImportParts(t *testing.T) {
+	part := resetOriginalPart("part-1", state.StatusFailed, "")
+	part.ImportingAt = "2026-06-24T00:00:00.000000000Z"
+	_, err := buildResetPlan("job-1", []state.Part{part}, resetModeJob)
+	if err == nil {
+		t.Fatal("expected failed import part error")
+	}
+}
+
+func TestBuildResetPlanRejectsMissingCompactInput(t *testing.T) {
+	_, err := buildResetPlan("job-1", []state.Part{
+		resetOriginalPart("part-1", state.StatusCompactReady, ""),
+		resetCompactPart("compact-1", state.StatusCompactReady, []string{"part-missing"}, "", 1),
+	}, resetModeJob)
+	if err == nil {
+		t.Fatal("expected missing input error")
+	}
+}
+
+func TestBuildResetPlanRejectsSupersededMismatch(t *testing.T) {
+	_, err := buildResetPlan("job-1", []state.Part{
+		resetOriginalPart("part-1", state.StatusSuperseded, "compact-other"),
+		resetCompactPart("compact-1", state.StatusCompactReady, []string{"part-1"}, "", 1),
+		resetCompactPart("compact-other", state.StatusCompactReady, []string{"part-2"}, "", 1),
+		resetOriginalPart("part-2", state.StatusSuperseded, "compact-other"),
+	}, resetModeJob)
+	if err == nil {
+		t.Fatal("expected superseded mismatch error")
+	}
+}
+
+func TestBuildResetCompactionRejectsOriginalWithoutRewriteMetadata(t *testing.T) {
+	part := resetOriginalPart("part-1", state.StatusReady, "")
+	part.DestinationDatabase = ""
+	_, err := buildResetPlan("job-1", []state.Part{part}, resetModeCompaction)
+	if err == nil {
+		t.Fatal("expected missing rewrite metadata error")
+	}
+}
+
+func TestBuildResetPlanAllowsMissingSupersededByOutput(t *testing.T) {
+	plan, err := buildResetPlan("job-1", []state.Part{
+		resetOriginalPart("part-1", state.StatusSuperseded, "compact-already-deleted"),
+	}, resetModeJob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.OriginalParts) != 1 || plan.OriginalParts[0].PartID != "part-1" {
+		t.Fatalf("originals = %+v", plan.OriginalParts)
 	}
 }
 
@@ -371,6 +569,60 @@ func TestParseFlagsIgnoresUnknownFlags(t *testing.T) {
 	if !*enabled {
 		t.Fatal("expected enabled flag to be parsed")
 	}
+}
+
+func resetOriginalPart(partID string, status state.Status, supersededBy string) state.Part {
+	return state.Part{
+		JobID:                            "job-1",
+		PartID:                           partID,
+		Status:                           status,
+		Bucket:                           "bucket",
+		SourceKey:                        "source/" + partID,
+		FinishedKey:                      "finished/" + partID,
+		UpdatedAt:                        "2026-06-24T00:00:00.000000000Z",
+		SupersededBy:                     supersededBy,
+		DestinationDatabase:              "db",
+		DestinationTable:                 "table",
+		DestinationSchema:                "CREATE TABLE db.table",
+		DestinationActivePartCount:       1,
+		DestinationActivePartitionCounts: map[string]uint64{"p": 1},
+	}
+}
+
+func resetCompactPart(partID string, status state.Status, inputs []string, supersededBy string, generation int) state.Part {
+	return state.Part{
+		JobID:                            "job-1",
+		PartID:                           partID,
+		Status:                           status,
+		Bucket:                           "bucket",
+		SourceKey:                        "finished/" + partID,
+		FinishedKey:                      "finished/" + partID,
+		UpdatedAt:                        "2026-06-24T00:00:00.000000000Z",
+		CompactGeneration:                generation,
+		CompactInputPartIDs:              inputs,
+		SupersededBy:                     supersededBy,
+		DestinationDatabase:              "db",
+		DestinationTable:                 "table",
+		DestinationSchema:                "CREATE TABLE db.table",
+		DestinationActivePartCount:       1,
+		DestinationActivePartitionCounts: map[string]uint64{"p": 1},
+	}
+}
+
+func partIDs(parts []state.Part) []string {
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		ids = append(ids, part.PartID)
+	}
+	return ids
+}
+
+func resetPrefixStrings(prefixes []jobS3Prefix) []string {
+	out := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		out = append(out, prefix.Bucket+":"+prefix.Prefix)
+	}
+	return out
 }
 
 func TestSelectRetryPartsStale(t *testing.T) {
@@ -656,7 +908,7 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 	for _, want := range []string{
 		"READ_SIZE",
 		"WRITTEN_SIZE",
-		"OUTPUT_PARTS",
+		"OUTPUT_CH_PARTS",
 		"FAILED_MERGES",
 		"SETTLE_WAIT",
 		"1.5 KB",

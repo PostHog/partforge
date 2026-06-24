@@ -94,6 +94,10 @@ func run() error {
 		return runJobStatus(ctx, os.Args[2:])
 	case "retry-failed":
 		return runRetryFailed(ctx, os.Args[2:])
+	case "reset-job":
+		return runResetJob(ctx, os.Args[2:])
+	case "reset-compaction":
+		return runResetCompaction(ctx, os.Args[2:])
 	case "delete-parts":
 		return runDeleteParts(ctx, os.Args[2:])
 	case "delete-job":
@@ -118,6 +122,8 @@ func usage() {
   partforge list-jobs       [flags]
   partforge job-status      [flags]
   partforge retry-failed    [flags]
+  partforge reset-job       [flags]
+  partforge reset-compaction [flags]
   partforge delete-parts    [flags]
   partforge delete-job      [flags]
 
@@ -128,6 +134,8 @@ Commands:
   list-jobs         List job IDs found in the DynamoDB state table.
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
+  reset-job         Delete generated compact rows and move original job parts back to READY.
+  reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
   delete-parts      Force delete selected DynamoDB part rows from one job.
   delete-job        Delete one job's DynamoDB state rows, optionally including S3 artifacts.
   version           Print the build version.
@@ -1180,7 +1188,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	processCtx, compactShutdown := workerProcessContext(ctx, cfg.ShutdownGracePeriod, batch.JobID, outputPartID)
 	processCtx, cancelProcess := context.WithCancel(processCtx)
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess)
-	result, err := processCompactBatch(processCtx, cfg, workItem, loadMoreInputs)
+	result, err := processCompactBatch(processCtx, cfg, workItem, currentBatch, loadMoreInputs)
 	cancelProcess()
 	if heartbeatErr := waitCompactHeartbeat(heartbeatErrCh); heartbeatErr != nil {
 		if err == nil || errors.Is(err, context.Canceled) {
@@ -1247,7 +1255,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	return true, nil
 }
 
-func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, loadMoreInputs func(context.Context, rewrite.CompactLoadState) ([]rewrite.CompactInput, error)) (rewrite.CompactResult, error) {
+func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch, loadMoreInputs func(context.Context, rewrite.CompactLoadState) ([]rewrite.CompactInput, error)) (rewrite.CompactResult, error) {
 	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
 	if err != nil {
 		return rewrite.CompactResult{}, err
@@ -1302,6 +1310,19 @@ func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item r
 			MergeSelectingSleepMS:   cfg.MergeSelectingSleepMS,
 			DefaultCompressionCodec: cfg.DefaultCompressionCodec,
 		},
+	}
+	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
+		stateCtx, cancel := workerStateUpdateContext()
+		defer cancel()
+		return cfg.StateStore.UpdateCompactProgress(stateCtx, compactBatch(), item.OutputPartID, cfg.WorkerID, state.PartStats{
+			Count: snapshot.InputStats.Count,
+			Rows:  snapshot.InputStats.Rows,
+			Bytes: snapshot.InputStats.Bytes,
+		}, state.PartStats{
+			Count: snapshot.DestinationStats.Count,
+			Rows:  snapshot.DestinationStats.Rows,
+			Bytes: snapshot.DestinationStats.Bytes,
+		}, time.Now().UTC())
 	}
 	compactor.RestartClickHouse = func(ctx context.Context) error {
 		if server == nil {
@@ -1908,6 +1929,108 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runResetJob(ctx context.Context, args []string) error {
+	return runResetState(ctx, args, resetModeJob)
+}
+
+func runResetCompaction(ctx context.Context, args []string) error {
+	return runResetState(ctx, args, resetModeCompaction)
+}
+
+func runResetState(ctx context.Context, args []string, mode resetMode) error {
+	fs := flag.NewFlagSet(string(mode), flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id to reset")
+		force          = fs.Bool("force", false, "required to reset selected job state")
+		deleteS3       = fs.Bool("delete-s3", false, "also delete reset artifact S3 prefixes")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		s3Endpoint     = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary    = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, string(mode)); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+	if !*force {
+		return fmt.Errorf("%s requires -force", mode)
+	}
+
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	plan, err := buildResetPlan(*jobID, jobParts, mode)
+	if err != nil {
+		return err
+	}
+	s3Prefixes := resetS3Prefixes(plan)
+
+	if len(plan.GeneratedParts) > 0 {
+		if err := stateStore.DeleteJobParts(ctx, plan.GeneratedParts); err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	for _, part := range plan.OriginalParts {
+		switch mode {
+		case resetModeJob:
+			err = stateStore.ResetOriginalPartToReady(ctx, part, now)
+		case resetModeCompaction:
+			err = stateStore.ResetOriginalPartToCompactReady(ctx, part, now)
+		default:
+			err = fmt.Errorf("unknown reset mode %q", mode)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	var deletedPrefixes []jobS3Prefix
+	if *deleteS3 {
+		copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
+		for _, prefix := range s3Prefixes {
+			slog.Info("deleting reset S3 prefix", "stage", "reset_delete_s3", "job_id", *jobID, "mode", mode, "bucket", prefix.Bucket, "prefix", prefix.Prefix)
+			if err := copier.DeletePrefixIfExists(ctx, prefix.Bucket, prefix.Prefix); err != nil {
+				return fmt.Errorf("delete s3://%s/%s: %w", prefix.Bucket, prefix.Prefix, err)
+			}
+			deletedPrefixes = append(deletedPrefixes, prefix)
+		}
+	}
+
+	out := resetStateOutput{
+		JobID:              *jobID,
+		Mode:               string(mode),
+		TargetStatus:       string(plan.TargetStatus),
+		OriginalsReset:     len(plan.OriginalParts),
+		CompactRowsDeleted: len(plan.GeneratedParts),
+		DeleteS3:           *deleteS3,
+		S3PrefixesDeleted:  deletedPrefixes,
+		Parts:              resetStatePartResults(plan),
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printResetStateResult(os.Stdout, out)
+	return nil
+}
+
 func runDeleteParts(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("delete-parts", flag.ExitOnError)
 	var (
@@ -2480,26 +2603,38 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 }
 
 type jobSummary struct {
-	JobID            string                 `json:"job_id"`
-	Status           string                 `json:"status"`
-	Total            int                    `json:"total"`
-	Counts           map[state.Status]int   `json:"counts"`
-	InProgressStages []inProgressStageCount `json:"in_progress_stages,omitempty"`
-	RewriteCompleted int                    `json:"rewrite_completed"`
-	RewritePercent   float64                `json:"rewrite_percent"`
-	ImportCompleted  int                    `json:"import_completed"`
-	ImportPercent    float64                `json:"import_percent"`
-	ReadRows         uint64                 `json:"read_rows"`
-	ReadBytes        uint64                 `json:"read_bytes"`
-	WrittenRows      uint64                 `json:"written_rows"`
-	WrittenBytes     uint64                 `json:"written_bytes"`
-	FailedMerges     uint64                 `json:"failed_merges"`
-	FailedParts      []failedPart           `json:"failed_parts,omitempty"`
+	JobID                        string                 `json:"job_id"`
+	Status                       string                 `json:"status"`
+	Total                        int                    `json:"total"`
+	Counts                       map[state.Status]int   `json:"counts"`
+	StatePartStats               []statusPartStats      `json:"state_part_stats"`
+	InProgressStages             []inProgressStageCount `json:"in_progress_stages,omitempty"`
+	RewriteCompleted             int                    `json:"rewrite_completed"`
+	RewritePercent               float64                `json:"rewrite_percent"`
+	ImportCompleted              int                    `json:"import_completed"`
+	ImportPercent                float64                `json:"import_percent"`
+	InputClickHouseParts         uint64                 `json:"input_clickhouse_parts"`
+	CurrentOutputClickHouseParts uint64                 `json:"current_output_clickhouse_parts"`
+	ReadRows                     uint64                 `json:"read_rows"`
+	ReadBytes                    uint64                 `json:"read_bytes"`
+	WrittenRows                  uint64                 `json:"written_rows"`
+	WrittenBytes                 uint64                 `json:"written_bytes"`
+	FailedMerges                 uint64                 `json:"failed_merges"`
+	FailedParts                  []failedPart           `json:"failed_parts,omitempty"`
 }
 
 type inProgressStageCount struct {
-	Stage string `json:"stage"`
-	Count int    `json:"count"`
+	Stage                 string `json:"stage"`
+	Count                 int    `json:"count"`
+	InputClickHouseParts  uint64 `json:"input_clickhouse_parts"`
+	OutputClickHouseParts uint64 `json:"output_clickhouse_parts"`
+}
+
+type statusPartStats struct {
+	Status                state.Status `json:"status"`
+	Count                 int          `json:"count"`
+	InputClickHouseParts  uint64       `json:"input_clickhouse_parts"`
+	OutputClickHouseParts uint64       `json:"output_clickhouse_parts"`
 }
 
 type failedPart struct {
@@ -2527,6 +2662,39 @@ type retryResult struct {
 	PartID string `json:"part_id"`
 	From   string `json:"from"`
 	To     string `json:"to"`
+}
+
+type resetMode string
+
+const (
+	resetModeJob        resetMode = "reset-job"
+	resetModeCompaction resetMode = "reset-compaction"
+)
+
+type resetPlan struct {
+	JobID          string
+	Mode           resetMode
+	TargetStatus   state.Status
+	OriginalParts  []state.Part
+	GeneratedParts []state.Part
+}
+
+type resetStateOutput struct {
+	JobID              string            `json:"job_id"`
+	Mode               string            `json:"mode"`
+	TargetStatus       string            `json:"target_status"`
+	OriginalsReset     int               `json:"originals_reset"`
+	CompactRowsDeleted int               `json:"compact_rows_deleted"`
+	DeleteS3           bool              `json:"delete_s3"`
+	S3PrefixesDeleted  []jobS3Prefix     `json:"s3_prefixes_deleted,omitempty"`
+	Parts              []resetPartResult `json:"parts"`
+}
+
+type resetPartResult struct {
+	PartID string `json:"part_id"`
+	From   string `json:"from"`
+	To     string `json:"to,omitempty"`
+	Action string `json:"action"`
 }
 
 type deletePartsOutput struct {
@@ -2558,11 +2726,38 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		counts[status] = 0
 	}
 
+	partsByID := make(map[string]state.Part, len(parts))
+	for _, part := range parts {
+		partsByID[part.PartID] = part
+	}
+
 	var failed []failedPart
-	var readRows, readBytes, writtenRows, writtenBytes, failedMerges uint64
+	var inputClickHouseParts, currentOutputClickHouseParts, readRows, readBytes, writtenRows, writtenBytes, failedMerges uint64
 	stageCounts := map[string]int{}
+	stageInputParts := map[string]uint64{}
+	stageOutputParts := map[string]uint64{}
+	stateInputParts := map[state.Status]uint64{}
+	stateOutputParts := map[state.Status]uint64{}
+	seenCompactProgress := map[string]struct{}{}
 	for _, part := range parts {
 		counts[part.Status]++
+		if !isGeneratedCompactPart(part) {
+			inputClickHouseParts += originalInputPartCount(part)
+		}
+		partInputParts, partOutputParts := partInputOutputPartCounts(part, partsByID)
+		if key, ok := compactProgressRollupKey(part); ok {
+			if _, seen := seenCompactProgress[key]; seen {
+				partInputParts = 0
+				partOutputParts = 0
+			} else {
+				seenCompactProgress[key] = struct{}{}
+			}
+		}
+		stateInputParts[part.Status] += partInputParts
+		stateOutputParts[part.Status] += partOutputParts
+		if isCurrentOutputPartStatus(part.Status) {
+			currentOutputClickHouseParts += partOutputParts
+		}
 		readRows += part.ReadRows
 		readBytes += part.ReadBytes
 		writtenRows += part.WrittenRows
@@ -2574,6 +2769,8 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 				stage = inProgressStageUnknown
 			}
 			stageCounts[stage]++
+			stageInputParts[stage] += partInputParts
+			stageOutputParts[stage] += partOutputParts
 		}
 		if part.Status == state.StatusFailed {
 			failed = append(failed, failedPart{
@@ -2592,25 +2789,41 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusSuperseded] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
 	importCompleted := counts[state.StatusImported]
 	return jobSummary{
-		JobID:            jobID,
-		Status:           overallStatus(total, counts),
-		Total:            total,
-		Counts:           counts,
-		InProgressStages: inProgressStageCounts(stageCounts),
-		RewriteCompleted: rewriteCompleted,
-		RewritePercent:   percent(rewriteCompleted, total),
-		ImportCompleted:  importCompleted,
-		ImportPercent:    percent(importCompleted, total),
-		ReadRows:         readRows,
-		ReadBytes:        readBytes,
-		WrittenRows:      writtenRows,
-		WrittenBytes:     writtenBytes,
-		FailedMerges:     failedMerges,
-		FailedParts:      failed,
+		JobID:                        jobID,
+		Status:                       overallStatus(total, counts),
+		Total:                        total,
+		Counts:                       counts,
+		StatePartStats:               statePartStats(counts, stateInputParts, stateOutputParts),
+		InProgressStages:             inProgressStageCounts(stageCounts, stageInputParts, stageOutputParts),
+		RewriteCompleted:             rewriteCompleted,
+		RewritePercent:               percent(rewriteCompleted, total),
+		ImportCompleted:              importCompleted,
+		ImportPercent:                percent(importCompleted, total),
+		InputClickHouseParts:         inputClickHouseParts,
+		CurrentOutputClickHouseParts: currentOutputClickHouseParts,
+		ReadRows:                     readRows,
+		ReadBytes:                    readBytes,
+		WrittenRows:                  writtenRows,
+		WrittenBytes:                 writtenBytes,
+		FailedMerges:                 failedMerges,
+		FailedParts:                  failed,
 	}
 }
 
-func inProgressStageCounts(counts map[string]int) []inProgressStageCount {
+func statePartStats(counts map[state.Status]int, inputParts, outputParts map[state.Status]uint64) []statusPartStats {
+	stats := make([]statusPartStats, 0, len(statusOrder()))
+	for _, status := range statusOrder() {
+		stats = append(stats, statusPartStats{
+			Status:                status,
+			Count:                 counts[status],
+			InputClickHouseParts:  inputParts[status],
+			OutputClickHouseParts: outputParts[status],
+		})
+	}
+	return stats
+}
+
+func inProgressStageCounts(counts map[string]int, inputParts, outputParts map[string]uint64) []inProgressStageCount {
 	if len(counts) == 0 {
 		return nil
 	}
@@ -2638,11 +2851,70 @@ func inProgressStageCounts(counts map[string]int) []inProgressStageCount {
 	stages := make([]inProgressStageCount, 0, len(orderedStages))
 	for _, stage := range orderedStages {
 		stages = append(stages, inProgressStageCount{
-			Stage: stage,
-			Count: counts[stage],
+			Stage:                 stage,
+			Count:                 counts[stage],
+			InputClickHouseParts:  inputParts[stage],
+			OutputClickHouseParts: outputParts[stage],
 		})
 	}
 	return stages
+}
+
+func originalInputPartCount(part state.Part) uint64 {
+	if part.SourceActivePartCount > 0 {
+		return part.SourceActivePartCount
+	}
+	return 1
+}
+
+func partInputOutputPartCounts(part state.Part, partsByID map[string]state.Part) (uint64, uint64) {
+	if part.Status == state.StatusCompacting && part.CompactInputPartCount > 0 {
+		return part.CompactInputPartCount, part.CompactOutputPartCount
+	}
+	inputParts := partInputPartCount(part, partsByID)
+	outputParts := partOutputPartCount(part)
+	return inputParts, outputParts
+}
+
+func partInputPartCount(part state.Part, partsByID map[string]state.Part) uint64 {
+	if isGeneratedCompactPart(part) {
+		var inputParts uint64
+		for _, inputID := range part.CompactInputPartIDs {
+			input := partsByID[inputID]
+			if input.DestinationActivePartCount > 0 {
+				inputParts += input.DestinationActivePartCount
+				continue
+			}
+			inputParts++
+		}
+		if inputParts > 0 {
+			return inputParts
+		}
+	}
+	return originalInputPartCount(part)
+}
+
+func partOutputPartCount(part state.Part) uint64 {
+	if part.Status == state.StatusReady {
+		return 0
+	}
+	return part.DestinationActivePartCount
+}
+
+func compactProgressRollupKey(part state.Part) (string, bool) {
+	if part.Status != state.StatusCompacting || strings.TrimSpace(part.CompactOutputPartID) == "" || part.CompactInputPartCount == 0 {
+		return "", false
+	}
+	return strings.Join([]string{part.JobID, part.WorkerID, part.CompactOutputPartID}, "\x00"), true
+}
+
+func isCurrentOutputPartStatus(status state.Status) bool {
+	switch status {
+	case state.StatusInProgress, state.StatusCompactReady, state.StatusCompacting, state.StatusFinished, state.StatusImporting, state.StatusImported, state.StatusFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func printJobSummary(out *os.File, summary jobSummary) {
@@ -2651,23 +2923,29 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "parts: %d\n", summary.Total)
 	fmt.Fprintf(out, "rewrite_complete: %d/%d %.1f%%\n", summary.RewriteCompleted, summary.Total, summary.RewritePercent)
 	fmt.Fprintf(out, "import_complete: %d/%d %.1f%%\n", summary.ImportCompleted, summary.Total, summary.ImportPercent)
+	fmt.Fprintf(out, "input_clickhouse_parts: %d\n", summary.InputClickHouseParts)
+	fmt.Fprintf(out, "current_output_clickhouse_parts: %d\n", summary.CurrentOutputClickHouseParts)
 	fmt.Fprintf(out, "read: %d rows %s\n", summary.ReadRows, formatBytes(summary.ReadBytes))
 	fmt.Fprintf(out, "written: %d rows %s\n", summary.WrittenRows, formatBytes(summary.WrittenBytes))
 	fmt.Fprintf(out, "failed_merges: %d\n", summary.FailedMerges)
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "\nSTATE\tCOUNT")
-	for _, status := range statusOrder() {
-		fmt.Fprintf(tw, "%s\t%d\n", status, summary.Counts[status])
+	fmt.Fprintln(tw, "\nSTATE\tCOUNT\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS")
+	stateStats := summary.StatePartStats
+	if len(stateStats) == 0 {
+		stateStats = statePartStats(summary.Counts, nil, nil)
+	}
+	for _, statusStats := range stateStats {
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", statusStats.Status, statusStats.Count, statusStats.InputClickHouseParts, statusStats.OutputClickHouseParts)
 	}
 	_ = tw.Flush()
 
 	if len(summary.InProgressStages) > 0 {
 		fmt.Fprintln(out, "\nIN_PROGRESS STAGES")
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "STAGE\tCOUNT")
+		fmt.Fprintln(tw, "STAGE\tCOUNT\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS")
 		for _, stage := range summary.InProgressStages {
-			fmt.Fprintf(tw, "%s\t%d\n", stage.Stage, stage.Count)
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", stage.Stage, stage.Count, stage.InputClickHouseParts, stage.OutputClickHouseParts)
 		}
 		_ = tw.Flush()
 	}
@@ -2687,13 +2965,18 @@ func printPartRows(out *os.File, parts []state.Part) {
 	if len(parts) == 0 {
 		return
 	}
+	partsByID := make(map[string]state.Part, len(parts))
+	for _, part := range parts {
+		partsByID[part.PartID] = part
+	}
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tOUTPUT_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
+		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
@@ -2704,7 +2987,8 @@ func printPartRows(out *os.File, parts []state.Part) {
 			formatBytes(part.WrittenBytes),
 			part.SourceActivePartRows,
 			part.DestinationActivePartRows,
-			part.DestinationActivePartCount,
+			inputParts,
+			outputParts,
 			part.DestinationFailedMerges,
 			formatSettleWait(part),
 			part.ProgressUpdatedAt,
@@ -2933,6 +3217,219 @@ func staleAfterString(stale bool, staleAfter time.Duration) string {
 	return staleAfter.String()
 }
 
+func buildResetPlan(jobID string, parts []state.Part, mode resetMode) (resetPlan, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return resetPlan{}, errors.New("job id is required")
+	}
+	if len(parts) == 0 {
+		return resetPlan{}, fmt.Errorf("job %s has no state rows", jobID)
+	}
+
+	byID := make(map[string]state.Part, len(parts))
+	var originals []state.Part
+	var generated []state.Part
+	for _, part := range parts {
+		if part.JobID != jobID {
+			return resetPlan{}, fmt.Errorf("part %s belongs to job %q, expected %q", part.PartID, part.JobID, jobID)
+		}
+		if _, ok := byID[part.PartID]; ok {
+			return resetPlan{}, fmt.Errorf("job %s contains duplicate part id %s", jobID, part.PartID)
+		}
+		if part.Status == state.StatusImporting || part.Status == state.StatusImported || strings.TrimSpace(part.ImportingAt) != "" || strings.TrimSpace(part.ImportedAt) != "" {
+			return resetPlan{}, fmt.Errorf("part %s is %s; reset is unsafe after import has started", part.PartID, part.Status)
+		}
+		byID[part.PartID] = part
+		if isGeneratedCompactPart(part) {
+			if len(part.CompactInputPartIDs) == 0 {
+				return resetPlan{}, fmt.Errorf("generated compact part %s has no compact_input_part_ids", part.PartID)
+			}
+			generated = append(generated, part)
+		} else {
+			originals = append(originals, part)
+		}
+	}
+	if len(originals) == 0 {
+		return resetPlan{}, fmt.Errorf("job %s has no original source parts to reset", jobID)
+	}
+	if err := validateResetLineage(byID, generated); err != nil {
+		return resetPlan{}, err
+	}
+	target := state.StatusReady
+	if mode == resetModeCompaction {
+		target = state.StatusCompactReady
+		for _, part := range originals {
+			if err := validateResetCompactionOriginal(part); err != nil {
+				return resetPlan{}, err
+			}
+		}
+	} else if mode != resetModeJob {
+		return resetPlan{}, fmt.Errorf("unknown reset mode %q", mode)
+	}
+
+	sort.Slice(originals, func(i, j int) bool {
+		return originals[i].PartID < originals[j].PartID
+	})
+	sort.Slice(generated, func(i, j int) bool {
+		return generated[i].PartID < generated[j].PartID
+	})
+	return resetPlan{
+		JobID:          jobID,
+		Mode:           mode,
+		TargetStatus:   target,
+		OriginalParts:  originals,
+		GeneratedParts: generated,
+	}, nil
+}
+
+func isGeneratedCompactPart(part state.Part) bool {
+	return len(part.CompactInputPartIDs) > 0 || part.CompactGeneration > 0
+}
+
+func validateResetLineage(byID map[string]state.Part, generated []state.Part) error {
+	for _, output := range generated {
+		seenInputs := map[string]struct{}{}
+		for _, inputID := range output.CompactInputPartIDs {
+			inputID = strings.TrimSpace(inputID)
+			if inputID == "" {
+				return fmt.Errorf("generated compact part %s has an empty compact input id", output.PartID)
+			}
+			if inputID == output.PartID {
+				return fmt.Errorf("generated compact part %s lists itself as an input", output.PartID)
+			}
+			if _, ok := seenInputs[inputID]; ok {
+				return fmt.Errorf("generated compact part %s lists input %s more than once", output.PartID, inputID)
+			}
+			input, ok := byID[inputID]
+			if !ok {
+				return fmt.Errorf("generated compact part %s references missing input part %s", output.PartID, inputID)
+			}
+			if input.SupersededBy != "" && input.SupersededBy != output.PartID {
+				return fmt.Errorf("part %s is superseded by %s but is listed as input to %s", input.PartID, input.SupersededBy, output.PartID)
+			}
+			seenInputs[inputID] = struct{}{}
+		}
+	}
+
+	for _, part := range byID {
+		if strings.TrimSpace(part.SupersededBy) == "" {
+			continue
+		}
+		output, ok := byID[part.SupersededBy]
+		if !ok {
+			continue
+		}
+		if !isGeneratedCompactPart(output) {
+			return fmt.Errorf("part %s is superseded by non-compact part %s", part.PartID, part.SupersededBy)
+		}
+		if !containsPartID(output.CompactInputPartIDs, part.PartID) {
+			return fmt.Errorf("part %s is superseded by %s but is not listed as its compact input", part.PartID, part.SupersededBy)
+		}
+	}
+
+	visiting := map[string]bool{}
+	visited := map[string]bool{}
+	var visit func(string) error
+	visit = func(partID string) error {
+		if visiting[partID] {
+			return fmt.Errorf("compact lineage contains a cycle at part %s", partID)
+		}
+		if visited[partID] {
+			return nil
+		}
+		part := byID[partID]
+		visiting[partID] = true
+		if isGeneratedCompactPart(part) {
+			for _, inputID := range part.CompactInputPartIDs {
+				if err := visit(inputID); err != nil {
+					return err
+				}
+			}
+		}
+		visiting[partID] = false
+		visited[partID] = true
+		return nil
+	}
+	for _, output := range generated {
+		if err := visit(output.PartID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func containsPartID(partIDs []string, partID string) bool {
+	for _, candidate := range partIDs {
+		if candidate == partID {
+			return true
+		}
+	}
+	return false
+}
+
+func validateResetCompactionOriginal(part state.Part) error {
+	if strings.TrimSpace(part.FinishedKey) == "" {
+		return fmt.Errorf("original part %s has no finished_key for reset-compaction", part.PartID)
+	}
+	if strings.TrimSpace(part.DestinationDatabase) == "" || strings.TrimSpace(part.DestinationTable) == "" || strings.TrimSpace(part.DestinationSchema) == "" {
+		return fmt.Errorf("original part %s has not completed rewrite metadata required for reset-compaction", part.PartID)
+	}
+	if part.DestinationActivePartCount > 0 && len(part.DestinationActivePartitionCounts) == 0 {
+		return fmt.Errorf("original part %s has no destination partition counts required for reset-compaction", part.PartID)
+	}
+	return nil
+}
+
+func resetS3Prefixes(plan resetPlan) []jobS3Prefix {
+	seen := map[jobS3Prefix]struct{}{}
+	add := func(part state.Part) {
+		if strings.TrimSpace(part.Bucket) == "" || strings.TrimSpace(part.FinishedKey) == "" {
+			return
+		}
+		seen[jobS3Prefix{Bucket: part.Bucket, Prefix: part.FinishedKey}] = struct{}{}
+	}
+	for _, part := range plan.GeneratedParts {
+		add(part)
+	}
+	if plan.Mode == resetModeJob {
+		for _, part := range plan.OriginalParts {
+			add(part)
+		}
+	}
+
+	prefixes := make([]jobS3Prefix, 0, len(seen))
+	for prefix := range seen {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Slice(prefixes, func(i, j int) bool {
+		if prefixes[i].Bucket == prefixes[j].Bucket {
+			return prefixes[i].Prefix < prefixes[j].Prefix
+		}
+		return prefixes[i].Bucket < prefixes[j].Bucket
+	})
+	return prefixes
+}
+
+func resetStatePartResults(plan resetPlan) []resetPartResult {
+	results := make([]resetPartResult, 0, len(plan.GeneratedParts)+len(plan.OriginalParts))
+	for _, part := range plan.GeneratedParts {
+		results = append(results, resetPartResult{
+			PartID: part.PartID,
+			From:   string(part.Status),
+			Action: "delete_compact_row",
+		})
+	}
+	for _, part := range plan.OriginalParts {
+		results = append(results, resetPartResult{
+			PartID: part.PartID,
+			From:   string(part.Status),
+			To:     string(plan.TargetStatus),
+			Action: "reset_original",
+		})
+	}
+	return results
+}
+
 func jobS3Prefixes(jobID string, parts []state.Part) ([]jobS3Prefix, error) {
 	if strings.TrimSpace(jobID) == "" {
 		return nil, errors.New("job id is required")
@@ -2999,6 +3496,33 @@ func printRetryResults(out *os.File, result retryFailedOutput) {
 	fmt.Fprintln(tw, "\nPART_ID\tFROM\tTO")
 	for _, part := range result.Parts {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", part.PartID, part.From, part.To)
+	}
+	_ = tw.Flush()
+}
+
+func printResetStateResult(out *os.File, result resetStateOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "mode: %s\n", result.Mode)
+	fmt.Fprintf(out, "target_status: %s\n", result.TargetStatus)
+	fmt.Fprintf(out, "originals_reset: %d\n", result.OriginalsReset)
+	fmt.Fprintf(out, "compact_rows_deleted: %d\n", result.CompactRowsDeleted)
+	fmt.Fprintf(out, "delete_s3: %t\n", result.DeleteS3)
+	if len(result.Parts) > 0 {
+		tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "\nPART_ID\tACTION\tFROM\tTO")
+		for _, part := range result.Parts {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", part.PartID, part.Action, part.From, part.To)
+		}
+		_ = tw.Flush()
+	}
+	if len(result.S3PrefixesDeleted) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nS3_PREFIXES_DELETED")
+	fmt.Fprintln(tw, "BUCKET\tPREFIX")
+	for _, prefix := range result.S3PrefixesDeleted {
+		fmt.Fprintf(tw, "%s\t%s\n", prefix.Bucket, prefix.Prefix)
 	}
 	_ = tw.Flush()
 }
