@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,6 +173,43 @@ func TestSummarizeJobCompactFinalizationReadyForSingleUnmergeablePart(t *testing
 			DestinationActivePartCount: 1,
 			DestinationActivePartitionCounts: map[string]uint64{
 				"202606": 1,
+			},
+		},
+	}, jobSummaryOptions{
+		Now:           now,
+		CompactWindow: 2 * time.Hour,
+	})
+
+	if summary.Compact == nil {
+		t.Fatal("expected compact summary")
+	}
+	if summary.Compact.FinalizeStatus != "ready" {
+		t.Fatalf("finalize status = %q, want ready", summary.Compact.FinalizeStatus)
+	}
+	if summary.Compact.FinalizeIn != "0s" {
+		t.Fatalf("finalize in = %q, want 0s", summary.Compact.FinalizeIn)
+	}
+}
+
+func TestSummarizeJobCompactFinalizationReadyForIsolatedPartWithCompactingElsewhere(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	summary := summarizeJobWithOptions("job-1", []state.Part{
+		{
+			PartID:                     "part-1",
+			Status:                     state.StatusCompactReady,
+			CompactReadyAt:             now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			DestinationActivePartCount: 1,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 1,
+			},
+		},
+		{
+			PartID:                     "part-2",
+			Status:                     state.StatusCompacting,
+			UpdatedAt:                  now.Add(-time.Hour).Format(time.RFC3339Nano),
+			DestinationActivePartCount: 4,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202607": 4,
 			},
 		},
 	}, jobSummaryOptions{
@@ -668,7 +706,7 @@ func TestFinalizableCompactReadyPartsDoesNotShortcutMultiPartOutput(t *testing.T
 	}
 }
 
-func TestFinalizableCompactReadyPartsDoesNotShortcutWhenOtherCurrentOutputExists(t *testing.T) {
+func TestFinalizableCompactReadyPartsFinalizesIsolatedPartitionWithOtherCurrentOutput(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected, ok, err := finalizableCompactReadyParts([]state.Part{
 		{
@@ -692,8 +730,88 @@ func TestFinalizableCompactReadyPartsDoesNotShortcutWhenOtherCurrentOutputExists
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !ok || len(selected) != 1 || selected[0].PartID != "part-compact" {
+		t.Fatalf("selected = %+v, ok=%t; want isolated compact-ready part finalized", selected, ok)
+	}
+}
+
+func TestFinalizableCompactReadyPartsFinalizesIsolatedPartitionWithOtherCompactingPartition(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{
+		{
+			PartID:                     "part-compact",
+			Status:                     state.StatusCompactReady,
+			CompactReadyAt:             now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			DestinationActivePartCount: 1,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 1,
+			},
+		},
+		{
+			PartID:                     "part-compacting",
+			Status:                     state.StatusCompacting,
+			DestinationActivePartCount: 4,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202607": 4,
+			},
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(selected) != 1 || selected[0].PartID != "part-compact" {
+		t.Fatalf("selected = %+v, ok=%t; want isolated compact-ready part finalized", selected, ok)
+	}
+}
+
+func TestFinalizableCompactReadyPartsWaitsWhenCompactingPartitionOverlaps(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{
+		{
+			PartID:                     "part-compact",
+			Status:                     state.StatusCompactReady,
+			CompactReadyAt:             now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			DestinationActivePartCount: 1,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 1,
+			},
+		},
+		{
+			PartID:                     "part-compacting",
+			Status:                     state.StatusCompacting,
+			DestinationActivePartCount: 4,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 4,
+			},
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ok || len(selected) != 0 {
-		t.Fatalf("selected = %+v, ok=%t; want compact window wait while another current output exists", selected, ok)
+		t.Fatalf("selected = %+v, ok=%t; want overlapping compacting partition to block", selected, ok)
+	}
+}
+
+func TestFinalizableCompactReadyPartsWaitsWhenReadyPartitionOverlaps(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := func(partID string) state.Part {
+		return state.Part{
+			PartID:                     partID,
+			Status:                     state.StatusCompactReady,
+			CompactReadyAt:             now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			DestinationActivePartCount: 1,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 1,
+			},
+		}
+	}
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{part("part-1"), part("part-2")}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || len(selected) != 0 {
+		t.Fatalf("selected = %+v, ok=%t; want overlapping compact-ready partition to wait", selected, ok)
 	}
 }
 
@@ -991,6 +1109,21 @@ func partIDs(parts []state.Part) []string {
 		ids = append(ids, part.PartID)
 	}
 	return ids
+}
+
+func TestJobStatusVisiblePartsHidesSupersededByDefault(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusSuperseded},
+		{PartID: "part-2", Status: state.StatusCompactReady},
+		{PartID: "part-3", Status: state.StatusFinished},
+	}
+
+	if got := strings.Join(partIDs(jobStatusVisibleParts(parts, false)), ","); got != "part-2,part-3" {
+		t.Fatalf("visible parts = %s, want part-2,part-3", got)
+	}
+	if got := strings.Join(partIDs(jobStatusVisibleParts(parts, true)), ","); got != "part-1,part-2,part-3" {
+		t.Fatalf("visible parts with all = %s, want every part", got)
+	}
 }
 
 func resetPrefixStrings(prefixes []jobS3Prefix) []string {
@@ -1341,6 +1474,38 @@ func TestPrintPartRowsHumanizesBytes(t *testing.T) {
 	}
 	if strings.Contains(got, "READ_BYTES") || strings.Contains(got, "WRITTEN_BYTES") {
 		t.Fatalf("printPartRows output still uses raw byte headers:\n%s", got)
+	}
+}
+
+func TestPrintPartRowsUsesHiddenSupersededInputsForCounts(t *testing.T) {
+	displayParts := []state.Part{
+		{
+			PartID:                     "compact-1",
+			Status:                     state.StatusCompactReady,
+			WorkerID:                   "worker",
+			ReadRows:                   11,
+			ReadBytes:                  12 * 1024,
+			WrittenRows:                13,
+			WrittenBytes:               14 * 1024,
+			SourceActivePartRows:       15,
+			DestinationActivePartRows:  16,
+			DestinationActivePartCount: 2,
+			CompactInputPartIDs:        []string{"part-1", "part-2"},
+		},
+	}
+	allParts := []state.Part{
+		{PartID: "part-1", Status: state.StatusSuperseded, DestinationActivePartCount: 4},
+		{PartID: "part-2", Status: state.StatusSuperseded, DestinationActivePartCount: 3},
+		displayParts[0],
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printPartRowsWithLookup(out, displayParts, allParts)
+	})
+
+	want := regexp.MustCompile(`compact-1\s+COMPACT_READY\s+0\s+worker\s+11\s+12\s+KB\s+13\s+14\s+KB\s+15\s+16\s+7\s+2`)
+	if !want.MatchString(got) {
+		t.Fatalf("printPartRows output missing hidden input counts:\n%s", got)
 	}
 }
 

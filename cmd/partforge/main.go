@@ -1655,7 +1655,7 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	var compactReady []state.Part
 	for _, part := range parts {
 		switch part.Status {
-		case state.StatusReady, state.StatusInProgress, state.StatusCompacting, state.StatusFailed:
+		case state.StatusReady, state.StatusInProgress, state.StatusFailed:
 			return nil, false, nil
 		case state.StatusCompactReady:
 			compactReady = append(compactReady, part)
@@ -1664,8 +1664,11 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	if len(compactReady) == 0 {
 		return nil, false, nil
 	}
-	if singleRemainingUnmergeablePart(parts, compactReady) {
-		return compactReady, true, nil
+	if isolatedUnmergeableCompactReady := isolatedUnmergeableCompactReadyParts(parts, compactReady); len(isolatedUnmergeableCompactReady) > 0 {
+		return isolatedUnmergeableCompactReady, true, nil
+	}
+	if hasCompactingParts(parts) {
+		return nil, false, nil
 	}
 	if compactWindow <= 0 {
 		return compactReady, true, nil
@@ -1680,26 +1683,40 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	return compactReady, true, nil
 }
 
-func singleRemainingUnmergeablePart(parts, compactReady []state.Part) bool {
-	if len(compactReady) != 1 {
-		return false
-	}
-	partitionID, ok := singlePhysicalPartPartition(compactReady[0])
-	if !ok {
-		return false
-	}
-	currentOutputs := 0
+func isolatedUnmergeableCompactReadyParts(parts, compactReady []state.Part) []state.Part {
+	activeCompactPartitionParts := map[string]uint64{}
 	for _, part := range parts {
-		if !isCurrentOutputPartStatus(part.Status) || partOutputPartCount(part) == 0 {
+		if part.Status != state.StatusCompactReady && part.Status != state.StatusCompacting {
 			continue
 		}
-		currentOutputs++
-		partPartitionID, ok := singlePhysicalPartPartition(part)
-		if !ok || partPartitionID != partitionID {
-			return false
+		for partitionID, count := range part.DestinationActivePartitionCounts {
+			if strings.TrimSpace(partitionID) == "" || count == 0 {
+				continue
+			}
+			activeCompactPartitionParts[partitionID] += count
 		}
 	}
-	return currentOutputs == 1
+
+	var out []state.Part
+	for _, part := range compactReady {
+		partitionID, ok := singlePhysicalPartPartition(part)
+		if !ok {
+			continue
+		}
+		if activeCompactPartitionParts[partitionID] == 1 {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func hasCompactingParts(parts []state.Part) bool {
+	for _, part := range parts {
+		if part.Status == state.StatusCompacting {
+			return true
+		}
+	}
+	return false
 }
 
 func singlePhysicalPartPartition(part state.Part) (string, bool) {
@@ -1910,6 +1927,7 @@ func runJobStatus(ctx context.Context, args []string) error {
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 		showParts      = fs.Bool("parts", false, "include per-part state rows")
 		showDetails    = fs.Bool("details", false, "include per-part rewrite stage timing details")
+		showAllParts   = fs.Bool("all", false, "include superseded parts in per-part output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -1940,21 +1958,36 @@ func runJobStatus(ctx context.Context, args []string) error {
 		Now:           time.Now().UTC(),
 		CompactWindow: *compactWindow,
 	})
+	visibleParts := jobStatusVisibleParts(jobParts, *showAllParts)
 	if *jsonOutput {
 		out := jobStatusOutput{Summary: summary}
 		if *showParts || *showDetails {
-			out.Parts = jobParts
+			out.Parts = visibleParts
 		}
 		return writeJSON(os.Stdout, out)
 	}
 	printJobSummary(os.Stdout, summary)
 	if *showParts {
-		printPartRows(os.Stdout, jobParts)
+		printPartRowsWithLookup(os.Stdout, visibleParts, jobParts)
 	}
 	if *showDetails {
-		printPartDetails(os.Stdout, jobParts)
+		printPartDetails(os.Stdout, visibleParts)
 	}
 	return nil
+}
+
+func jobStatusVisibleParts(parts []state.Part, includeAll bool) []state.Part {
+	if includeAll {
+		return parts
+	}
+	visible := make([]state.Part, 0, len(parts))
+	for _, part := range parts {
+		if part.Status == state.StatusSuperseded {
+			continue
+		}
+		visible = append(visible, part)
+	}
+	return visible
 }
 
 func selectImportFinishedParts(finishedParts []state.Part, partID string) ([]state.Part, error) {
@@ -3222,11 +3255,12 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 		summary.Reason = "waiting for compacting work to return compact-ready or finish"
 		return summary
 	}
-	if len(blockers) == 0 && singleRemainingUnmergeablePart(parts, compactReadyParts(parts)) {
+	compactReady := compactReadyParts(parts)
+	if len(compactFinalizationSourceBlockers(counts)) == 0 && len(isolatedUnmergeableCompactReadyParts(parts, compactReady)) > 0 {
 		summary.FinalizeAfter = now.UTC().Format(time.RFC3339Nano)
 		summary.FinalizeIn = "0s"
 		summary.FinalizeStatus = "ready"
-		summary.Reason = "single remaining output part cannot be compacted further"
+		summary.Reason = "one or more compact-ready parts cannot be compacted further"
 		return summary
 	}
 	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
@@ -3266,6 +3300,16 @@ func compactReadyParts(parts []state.Part) []state.Part {
 func compactFinalizationBlockers(counts map[state.Status]int) []statusCount {
 	var blockers []statusCount
 	for _, status := range []state.Status{state.StatusReady, state.StatusInProgress, state.StatusCompacting, state.StatusFailed} {
+		if counts[status] > 0 {
+			blockers = append(blockers, statusCount{Status: status, Count: counts[status]})
+		}
+	}
+	return blockers
+}
+
+func compactFinalizationSourceBlockers(counts map[state.Status]int) []statusCount {
+	var blockers []statusCount
+	for _, status := range []state.Status{state.StatusReady, state.StatusInProgress, state.StatusFailed} {
 		if counts[status] > 0 {
 			blockers = append(blockers, statusCount{Status: status, Count: counts[status]})
 		}
@@ -3473,11 +3517,15 @@ func printCompactSummary(out *os.File, compact *compactJobSummary) {
 }
 
 func printPartRows(out *os.File, parts []state.Part) {
+	printPartRowsWithLookup(out, parts, parts)
+}
+
+func printPartRowsWithLookup(out *os.File, parts []state.Part, lookupParts []state.Part) {
 	if len(parts) == 0 {
 		return
 	}
-	partsByID := make(map[string]state.Part, len(parts))
-	for _, part := range parts {
+	partsByID := make(map[string]state.Part, len(lookupParts))
+	for _, part := range lookupParts {
 		partsByID[part.PartID] = part
 	}
 	now := time.Now().UTC()
