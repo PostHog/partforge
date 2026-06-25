@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -168,6 +168,10 @@ func TestPIDFileUnlockedReportsFcntlLockedFile(t *testing.T) {
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestPIDFileLockHelper", "--", path)
 	cmd.Env = append(os.Environ(), "PARTFORGE_PID_LOCK_HELPER=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +180,7 @@ func TestPIDFileUnlockedReportsFcntlLockedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = stdin.Close()
 		_ = cmd.Wait()
 	})
 
@@ -196,7 +200,7 @@ func TestPIDFileUnlockedReportsFcntlLockedFile(t *testing.T) {
 		t.Fatal("pidFileUnlocked = true, want false while another process holds the lock")
 	}
 
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Wait(); err != nil {
@@ -228,9 +232,7 @@ func TestPIDFileLockHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	fmt.Println("locked")
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM)
-	<-signals
+	_, _ = io.Copy(io.Discard, os.Stdin)
 	lock.Type = syscall.F_UNLCK
 	if err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &lock); err != nil {
 		fmt.Fprintln(os.Stderr, err)
