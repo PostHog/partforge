@@ -108,6 +108,13 @@ jobs:
           tags: |
             ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
             ${{ steps.version.outputs.image }}:latest
+          cache-from: |
+            type=gha,scope=worker-image
+            type=registry,ref=${{ steps.version.outputs.image }}:buildcache
+            type=registry,ref=${{ steps.version.outputs.image }}:latest
+          cache-to: |
+            type=gha,scope=worker-image,mode=max
+            type=registry,ref=${{ steps.version.outputs.image }}:buildcache,mode=max
 
       - name: Create or update release
         env:
