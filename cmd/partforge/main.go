@@ -1536,6 +1536,9 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	if len(compactReady) == 0 {
 		return nil, false, nil
 	}
+	if singleRemainingUnmergeablePart(parts, compactReady) {
+		return compactReady, true, nil
+	}
 	if compactWindow <= 0 {
 		return compactReady, true, nil
 	}
@@ -1547,6 +1550,45 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 		return nil, false, nil
 	}
 	return compactReady, true, nil
+}
+
+func singleRemainingUnmergeablePart(parts, compactReady []state.Part) bool {
+	if len(compactReady) != 1 {
+		return false
+	}
+	partitionID, ok := singlePhysicalPartPartition(compactReady[0])
+	if !ok {
+		return false
+	}
+	currentOutputs := 0
+	for _, part := range parts {
+		if !isCurrentOutputPartStatus(part.Status) || partOutputPartCount(part) == 0 {
+			continue
+		}
+		currentOutputs++
+		partPartitionID, ok := singlePhysicalPartPartition(part)
+		if !ok || partPartitionID != partitionID {
+			return false
+		}
+	}
+	return currentOutputs == 1
+}
+
+func singlePhysicalPartPartition(part state.Part) (string, bool) {
+	if part.DestinationActivePartCount != 1 {
+		return "", false
+	}
+	var partitionID string
+	for id, count := range part.DestinationActivePartitionCounts {
+		if strings.TrimSpace(id) == "" || count == 0 {
+			continue
+		}
+		if count != 1 || partitionID != "" {
+			return "", false
+		}
+		partitionID = id
+	}
+	return partitionID, partitionID != ""
 }
 
 func compactWindowExpired(parts []state.Part, compactWindow time.Duration, now time.Time) (bool, error) {
@@ -3071,6 +3113,13 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 		summary.Reason = "waiting for compacting work to return compact-ready or finish"
 		return summary
 	}
+	if len(blockers) == 0 && singleRemainingUnmergeablePart(parts, compactReadyParts(parts)) {
+		summary.FinalizeAfter = now.UTC().Format(time.RFC3339Nano)
+		summary.FinalizeIn = "0s"
+		summary.FinalizeStatus = "ready"
+		summary.Reason = "single remaining output part cannot be compacted further"
+		return summary
+	}
 	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
 	if !ok {
 		summary.FinalizeStatus = "unknown"
@@ -3093,6 +3142,16 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 	summary.FinalizeIn = "0s"
 	summary.Reason = "next idle worker can finalize compact-ready parts"
 	return summary
+}
+
+func compactReadyParts(parts []state.Part) []state.Part {
+	out := make([]state.Part, 0, len(parts))
+	for _, part := range parts {
+		if part.Status == state.StatusCompactReady {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func compactFinalizationBlockers(counts map[state.Status]int) []statusCount {
@@ -3315,12 +3374,12 @@ func printPartRows(out *os.File, parts []state.Part) {
 	now := time.Now().UTC()
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tCOMPACT_READY_FOR\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tPARTITIONS\tFAILED_MERGES\tSETTLE_WAIT\tCOMPACT_READY_FOR\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
@@ -3333,6 +3392,7 @@ func printPartRows(out *os.File, parts []state.Part) {
 			part.DestinationActivePartRows,
 			inputParts,
 			outputParts,
+			formatPartPartitions(part),
 			part.DestinationFailedMerges,
 			formatSettleWait(part),
 			formatCompactReadyFor(part, now),
@@ -3363,6 +3423,32 @@ func formatCompactReadyFor(part state.Part, now time.Time) string {
 		return "unknown"
 	}
 	return formatElapsedSince(readyAt, now)
+}
+
+func formatPartPartitions(part state.Part) string {
+	switch part.Status {
+	case state.StatusReady, state.StatusInProgress:
+		return ""
+	}
+	partitions := make([]string, 0, len(part.DestinationActivePartitionCounts))
+	for partitionID, count := range part.DestinationActivePartitionCounts {
+		if strings.TrimSpace(partitionID) == "" || count == 0 {
+			continue
+		}
+		partitions = append(partitions, partitionID)
+	}
+	sort.Strings(partitions)
+	if len(partitions) == 0 {
+		return ""
+	}
+	if len(partitions) == 1 {
+		return partitions[0]
+	}
+	values := make([]string, 0, len(partitions))
+	for _, partitionID := range partitions {
+		values = append(values, fmt.Sprintf("%s:%d", partitionID, part.DestinationActivePartitionCounts[partitionID]))
+	}
+	return strings.Join(values, ",")
 }
 
 func printPartDetails(out *os.File, parts []state.Part) {
