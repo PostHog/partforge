@@ -123,7 +123,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts, no-reduction solo retry cooldown count, and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age/cooldown, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
 
 Retry one failed part:
 
@@ -203,7 +203,7 @@ partforge set-part-state \
   -force
 ```
 
-`set-part-state` is an admin recovery command. It can select rows by repeated `-part-id` or by current `-status`, and it can target `READY`, `COMPACT_READY`, or `FINISHED`. It clears stale worker ownership, error, cooldown, and compaction-progress fields; targeting `READY` also clears persisted rewrite progress and metrics. The command preserves rewritten artifact metadata when targeting `COMPACT_READY` or `FINISHED`. It uses conditional updates and requires `dynamodb:Query` and `dynamodb:UpdateItem`.
+`set-part-state` is an admin recovery command. It can select rows by repeated `-part-id` or by current `-status`, and it can target `READY`, `COMPACT_READY`, or `FINISHED`. It clears stale worker ownership, error, and compaction-progress fields; targeting `READY` also clears persisted rewrite progress and metrics. The command preserves rewritten artifact metadata when targeting `COMPACT_READY` or `FINISHED`. It uses conditional updates and requires `dynamodb:Query` and `dynamodb:UpdateItem`.
 
 Restart a job's compact-window timer for debugging:
 
@@ -213,7 +213,7 @@ partforge reset-compact-timer \
   -force
 ```
 
-`reset-compact-timer` sets `compact_ready_at` to the current time and clears no-reduction retry cooldowns on every part row in the job, including superseded rows, generated compact rows, originals, and currently compacting rows. It does not change row status, worker ownership, or S3 data. Use it when you intentionally want the job-level compact deadline to become roughly `now + -compact-window`.
+`reset-compact-timer` sets `compact_ready_at` to the current time on every part row in the job, including superseded rows, generated compact rows, originals, and currently compacting rows. It does not change row status, worker ownership, or S3 data. Use it when you intentionally want the job-level compact deadline to become roughly `now + -compact-window`.
 
 Reset a job back to its original uploaded source parts:
 

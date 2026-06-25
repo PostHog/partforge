@@ -598,7 +598,7 @@ func TestFinalizableCompactReadyPartsUsesStableCompactReadyTime(t *testing.T) {
 	}
 }
 
-func TestFinalizableCompactReadyPartsUsesCurrentCompactReadyTime(t *testing.T) {
+func TestFinalizableCompactReadyPartsUsesCurrentCompactReadyRowTime(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected, ok, err := finalizableCompactReadyParts([]state.Part{
 		{
@@ -607,7 +607,7 @@ func TestFinalizableCompactReadyPartsUsesCurrentCompactReadyTime(t *testing.T) {
 			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 		},
 		{
-			PartID:         "compact-fresh",
+			PartID:         "part-fresh",
 			Status:         state.StatusCompactReady,
 			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
 		},
@@ -616,7 +616,7 @@ func TestFinalizableCompactReadyPartsUsesCurrentCompactReadyTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok || len(selected) != 0 {
-		t.Fatalf("selected = %+v, ok=%t; want fresh compact output to keep compaction window open", selected, ok)
+		t.Fatalf("selected = %+v, ok=%t; want fresh compact-ready row to keep compaction window open", selected, ok)
 	}
 }
 
@@ -637,7 +637,7 @@ func TestCompactWindowExpiredIgnoresJobsWithoutCompactPhase(t *testing.T) {
 	}
 }
 
-func TestCompactWindowExpiredUsesCurrentCompactReadyTime(t *testing.T) {
+func TestCompactWindowExpiredUsesCurrentCompactReadyRowTime(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	expired, err := compactWindowExpired([]state.Part{
 		{
@@ -646,7 +646,7 @@ func TestCompactWindowExpiredUsesCurrentCompactReadyTime(t *testing.T) {
 			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 		},
 		{
-			PartID:         "compact-fresh",
+			PartID:         "part-fresh",
 			Status:         state.StatusCompactReady,
 			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
 		},
@@ -655,35 +655,11 @@ func TestCompactWindowExpiredUsesCurrentCompactReadyTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	if expired {
-		t.Fatal("expected fresh compact output to keep job compact window open")
+		t.Fatal("expected fresh compact-ready row to keep job compact window open")
 	}
 }
 
-func TestCompactRetryCooldownIsShortAndIndependentOfCompactWindow(t *testing.T) {
-	if got := compactRetryCooldown(2 * time.Hour); got != time.Minute {
-		t.Fatalf("compactRetryCooldown(2h) = %s, want 1m", got)
-	}
-	if got := compactRetryCooldown(20 * time.Minute); got != time.Minute {
-		t.Fatalf("compactRetryCooldown(20m) = %s, want 1m", got)
-	}
-	if got := compactRetryCooldown(0); got != time.Minute {
-		t.Fatalf("compactRetryCooldown(0) = %s, want 1m", got)
-	}
-	if got := compactRetryCooldown(12 * time.Hour); got != time.Minute {
-		t.Fatalf("compactRetryCooldown(12h) = %s, want 1m", got)
-	}
-}
-
-func TestCompactLoadMoreIntervalDerivedFromCompactWindow(t *testing.T) {
-	if got := compactLoadMoreInterval(2 * time.Hour); got != 5*time.Second {
-		t.Fatalf("compactLoadMoreInterval(2h) = %s, want 5s", got)
-	}
-	if got := compactLoadMoreInterval(0); got != 5*time.Second {
-		t.Fatalf("compactLoadMoreInterval(0) = %s, want 5s", got)
-	}
-}
-
-func TestCompactClaimSplayMaxDerivedFromCompactWindow(t *testing.T) {
+func TestCompactClaimSplayMaxUsesSmallFixedDelay(t *testing.T) {
 	if got := compactClaimSplayMax(2 * time.Hour); got != 250*time.Millisecond {
 		t.Fatalf("compactClaimSplayMax(2h) = %s, want 250ms", got)
 	}
@@ -692,6 +668,29 @@ func TestCompactClaimSplayMaxDerivedFromCompactWindow(t *testing.T) {
 	}
 	if got := compactClaimSplayMax(time.Minute); got != 250*time.Millisecond {
 		t.Fatalf("compactClaimSplayMax(1m) = %s, want 250ms", got)
+	}
+}
+
+func TestCompactOutputReadyAtUsesLatestInputReadyTime(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	got, err := compactOutputReadyAt([]state.Part{
+		{
+			PartID:         "part-old",
+			Status:         state.StatusCompacting,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		},
+		{
+			PartID:         "part-new",
+			Status:         state.StatusCompacting,
+			CompactReadyAt: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(-2 * time.Hour)
+	if !got.Equal(want) {
+		t.Fatalf("compactOutputReadyAt = %s, want %s", got, want)
 	}
 }
 
@@ -1082,14 +1081,13 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 			state.StatusCompacting:   1,
 		},
 		Compact: &compactJobSummary{
-			ReadyParts:             1,
-			CompactingParts:        1,
-			SoloRetryCooldownParts: 1,
-			Window:                 "2h0m0s",
-			FinalizeStatus:         "blocked",
-			FinalizeAfter:          "2026-06-24T13:30:00Z",
-			FinalizeIn:             "30m0s",
-			BlockedByMessage:       "COMPACTING=1",
+			ReadyParts:       1,
+			CompactingParts:  1,
+			Window:           "2h0m0s",
+			FinalizeStatus:   "blocked",
+			FinalizeAfter:    "2026-06-24T13:30:00Z",
+			FinalizeIn:       "30m0s",
+			BlockedByMessage: "COMPACTING=1",
 		},
 	}
 
@@ -1098,7 +1096,7 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"compact: ready=1 compacting=1 solo_retry_cooldown=1 window=2h0m0s",
+		"compact: ready=1 compacting=1 window=2h0m0s",
 		"compact_finalize: blocked by COMPACTING=1; eligible after 2026-06-24T13:30:00Z (in 30m0s)",
 	} {
 		if !strings.Contains(got, want) {

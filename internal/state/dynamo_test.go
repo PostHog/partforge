@@ -118,27 +118,9 @@ func TestSelectCompactBatchPartsAllowsOversizedSingleMultiPartArtifact(t *testin
 	}
 }
 
-func TestSelectCompactBatchPartsRejectsOversizedFirstArtifactWhenStrict(t *testing.T) {
-	selected := selectCompactBatchParts(compactGroup{parts: []Part{
-		{
-			PartID:                     "part-1",
-			DestinationActivePartCount: 4,
-			DestinationActivePartBytes: 4096,
-			DestinationActivePartitionCounts: map[string]uint64{
-				"202606": 4,
-			},
-		},
-	}}, CompactClaimOptions{MinInputParts: 1, MaxBytes: 2048, StrictMaxBytes: true})
-
-	if len(selected) != 0 {
-		t.Fatalf("selected = %+v, want no oversized part", selected)
-	}
-}
-
-func TestSelectCompactBatchPartsSkipsSingleCooldownCandidate(t *testing.T) {
+func TestSelectCompactBatchPartsIgnoresCooldownField(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected := selectCompactBatchParts(compactGroup{
-		now: now,
 		parts: []Part{
 			{
 				PartID:                     "part-cooldown",
@@ -151,15 +133,14 @@ func TestSelectCompactBatchPartsSkipsSingleCooldownCandidate(t *testing.T) {
 			},
 		},
 	}, CompactClaimOptions{MinInputParts: 2})
-	if len(selected) != 0 {
-		t.Fatalf("selected = %+v, want single cooldown part skipped", selected)
+	if len(selected) != 1 || selected[0].PartID != "part-cooldown" {
+		t.Fatalf("selected = %+v, want cooldown field ignored", selected)
 	}
 }
 
-func TestSelectCompactBatchPartsAllowsCooldownWithFreshCompanion(t *testing.T) {
+func TestSelectCompactBatchPartsIncludesRowsWithCooldownField(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected := selectCompactBatchParts(compactGroup{
-		now: now,
 		parts: []Part{
 			{
 				PartID:                     "part-fresh",
@@ -186,7 +167,7 @@ func TestSelectCompactBatchPartsAllowsCooldownWithFreshCompanion(t *testing.T) {
 	}
 }
 
-func TestCompactCandidateGroupsIncludesCooldown(t *testing.T) {
+func TestCompactCandidateGroupsIncludesRowsWithCooldownField(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	groups := compactCandidateGroups([]Part{
 		{
@@ -214,14 +195,13 @@ func TestCompactCandidateGroupsIncludesCooldown(t *testing.T) {
 				"202606": 2,
 			},
 		},
-	}, nil, now, CompactClaimOptions{})
+	}, nil, CompactClaimOptions{})
 	if len(groups) != 1 || len(groups[0].parts) != 2 || groups[0].parts[0].PartID != "part-cooldown" || groups[0].parts[1].PartID != "part-ready" {
 		t.Fatalf("groups = %+v, want cooldown and ready parts", groups)
 	}
 }
 
 func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
-	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	groups := compactCandidateGroups([]Part{
 		{
 			JobID:                      "job-1",
@@ -247,7 +227,7 @@ func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
 				"202606": 2,
 			},
 		},
-	}, nil, now, CompactClaimOptions{ExcludedJobIDs: map[string]struct{}{"job-1": {}}})
+	}, nil, CompactClaimOptions{ExcludedJobIDs: map[string]struct{}{"job-1": {}}})
 	if len(groups) != 1 || len(groups[0].parts) != 1 || groups[0].parts[0].JobID != "job-2" {
 		t.Fatalf("groups = %+v, want only non-excluded job-2", groups)
 	}
@@ -255,9 +235,13 @@ func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
 
 func TestNewCompactPartSetsCompactReadyAt(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
-	part := NewCompactPart("job-1", "compact-1", "bucket", "finished/key", "db", "table", "schema", []string{"part-1"}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, now)
-	if part.CompactReadyAt != formatTime(now) {
-		t.Fatalf("compact_ready_at = %q, want %q", part.CompactReadyAt, formatTime(now))
+	readyAt := now.Add(-2 * time.Hour)
+	part := NewCompactPart("job-1", "compact-1", "bucket", "finished/key", "db", "table", "schema", []string{"part-1"}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, readyAt, now)
+	if part.CreatedAt != formatTime(now) {
+		t.Fatalf("created_at = %q, want %q", part.CreatedAt, formatTime(now))
+	}
+	if part.CompactReadyAt != formatTime(readyAt) {
+		t.Fatalf("compact_ready_at = %q, want %q", part.CompactReadyAt, formatTime(readyAt))
 	}
 }
 

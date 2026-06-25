@@ -141,7 +141,6 @@ func clonePartitionCounts(counts map[string]uint64) map[string]uint64 {
 type CompactClaimOptions struct {
 	MaxArtifacts         int
 	MaxBytes             uint64
-	StrictMaxBytes       bool
 	MinInputParts        uint64
 	ExcludedJobIDs       map[string]struct{}
 	JobID                string
@@ -250,7 +249,7 @@ func NewPart(jobID, partID, bucket, sourceKey, finishedKey string, now time.Time
 	}
 }
 
-func NewCompactPart(jobID, partID, bucket, finishedKey, database, table, destinationSchema string, inputPartIDs []string, generation int, stats PartStats, partitionCounts map[string]uint64, now time.Time) Part {
+func NewCompactPart(jobID, partID, bucket, finishedKey, database, table, destinationSchema string, inputPartIDs []string, generation int, stats PartStats, partitionCounts map[string]uint64, compactReadyAt time.Time, now time.Time) Part {
 	createdAt := formatTime(now)
 	return Part{
 		PK:                               jobKey(jobID),
@@ -265,7 +264,7 @@ func NewCompactPart(jobID, partID, bucket, finishedKey, database, table, destina
 		FinishedKey:                      finishedKey,
 		CreatedAt:                        createdAt,
 		UpdatedAt:                        createdAt,
-		CompactReadyAt:                   createdAt,
+		CompactReadyAt:                   formatTime(compactReadyAt),
 		DestinationDatabase:              database,
 		DestinationTable:                 table,
 		DestinationSchema:                destinationSchema,
@@ -416,7 +415,7 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 		return nil, fmt.Errorf("query compacting parts: %w", err)
 	}
 
-	groups := compactCandidateGroups(candidates, compacting, now, opts)
+	groups := compactCandidateGroups(candidates, compacting, opts)
 	for _, group := range groups {
 		selected := selectCompactBatchParts(group, opts)
 		if len(selected) == 0 {
@@ -465,7 +464,7 @@ func (s *Store) listPartsByStatusIndex(ctx context.Context, status Status) ([]Pa
 	return parts, nil
 }
 
-func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, cooldownUntil time.Time, now time.Time) error {
+func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("worker id is required")
 	}
@@ -485,12 +484,7 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 		}
 		updateExpression := "SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now, compact_ready_at = if_not_exists(compact_ready_at, :compact_ready_at)"
 		remove := append([]string{"#worker_id", "compacting_at", "#error"}, compactProgressRemoveAttributes()...)
-		if !cooldownUntil.IsZero() {
-			updateExpression += ", compact_cooldown_until = :cooldown_until"
-			values[":cooldown_until"] = stringAttr(formatTime(cooldownUntil))
-		} else {
-			remove = append(remove, "compact_cooldown_until")
-		}
+		remove = append(remove, "compact_cooldown_until")
 		updateExpression += " REMOVE " + strings.Join(remove, ", ")
 
 		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -582,7 +576,7 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	return nil
 }
 
-func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, staleAfter time.Duration, cooldownUntil time.Time) (int, error) {
+func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, staleAfter time.Duration) (int, error) {
 	if staleAfter <= 0 {
 		return 0, fmt.Errorf("compact stale timeout must be greater than zero, got %s", staleAfter)
 	}
@@ -600,7 +594,7 @@ func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, 
 		if staleAt.After(cutoff) {
 			continue
 		}
-		ok, err := s.releaseStaleCompactingPart(ctx, part, cooldownUntil, now)
+		ok, err := s.releaseStaleCompactingPart(ctx, part, now)
 		if err != nil {
 			return released, err
 		}
@@ -611,7 +605,7 @@ func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, 
 	return released, nil
 }
 
-func (s *Store) releaseStaleCompactingPart(ctx context.Context, part Part, cooldownUntil time.Time, now time.Time) (bool, error) {
+func (s *Store) releaseStaleCompactingPart(ctx context.Context, part Part, now time.Time) (bool, error) {
 	names := map[string]string{
 		"#error":  "error",
 		"#status": "status",
@@ -626,12 +620,7 @@ func (s *Store) releaseStaleCompactingPart(ctx context.Context, part Part, coold
 	}
 	updateExpression := "SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now, compact_ready_at = if_not_exists(compact_ready_at, :compact_ready_at)"
 	remove := append([]string{"worker_id", "compacting_at", "#error"}, compactProgressRemoveAttributes()...)
-	if !cooldownUntil.IsZero() {
-		updateExpression += ", compact_cooldown_until = :cooldown_until"
-		values[":cooldown_until"] = stringAttr(formatTime(cooldownUntil))
-	} else {
-		remove = append(remove, "compact_cooldown_until")
-	}
+	remove = append(remove, "compact_cooldown_until")
 	updateExpression += " REMOVE " + strings.Join(remove, ", ")
 
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -748,10 +737,9 @@ type compactGroup struct {
 	key                    string
 	parts                  []Part
 	compactingPartitionIDs []string
-	now                    time.Time
 }
 
-func compactCandidateGroups(parts, compacting []Part, now time.Time, opts CompactClaimOptions) []compactGroup {
+func compactCandidateGroups(parts, compacting []Part, opts CompactClaimOptions) []compactGroup {
 	groupsByKey := map[string][]Part{}
 	var order []string
 	for _, part := range parts {
@@ -786,7 +774,6 @@ func compactCandidateGroups(parts, compacting []Part, now time.Time, opts Compac
 			key:                    key,
 			parts:                  groupParts,
 			compactingPartitionIDs: compactingPartitionsByKey[key],
-			now:                    now,
 		})
 	}
 	return groups
@@ -850,17 +837,6 @@ func matchesCompactClaimOptions(part Part, opts CompactClaimOptions) bool {
 	return true
 }
 
-func compactCooldownActive(part Part, now time.Time) bool {
-	if strings.TrimSpace(part.CompactCooldownUntil) == "" {
-		return false
-	}
-	until, err := time.Parse(timeFormat, part.CompactCooldownUntil)
-	if err != nil {
-		return false
-	}
-	return now.Before(until)
-}
-
 func compactHeartbeatTime(part Part) (time.Time, error) {
 	for _, value := range []string{part.UpdatedAt, part.CompactingAt} {
 		if strings.TrimSpace(value) == "" {
@@ -913,7 +889,7 @@ func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Par
 	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
 	orderedPartitions := append(preferredPartitions, partitionsWithout(partitions, preferredPartitions)...)
 	for _, partitionID := range orderedPartitions {
-		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts, group.now)
+		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts)
 		if len(selected) > 0 {
 			return selected
 		}
@@ -958,7 +934,7 @@ func orderedCandidatePartitions(parts []Part, required []string) []string {
 	return partitions
 }
 
-func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions, now time.Time) []Part {
+func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions) []Part {
 	var selected []Part
 	var inputParts, inputBytes uint64
 	appendCandidate := func(part Part) bool {
@@ -970,36 +946,15 @@ func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minPa
 			return true
 		}
 		partBytes := part.DestinationActivePartBytes
-		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes {
-			if len(selected) > 0 || opts.StrictMaxBytes {
-				return true
-			}
+		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
+			return true
 		}
 		selected = append(selected, part)
 		inputParts += partitionParts
 		inputBytes += partBytes
 		return opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts
 	}
-	stopped := false
 	for _, part := range parts {
-		if compactCooldownActive(part, now) {
-			continue
-		}
-		if appendCandidate(part) {
-			stopped = true
-			break
-		}
-	}
-	if stopped || len(selected) == 0 {
-		if inputParts >= minParts {
-			return selected
-		}
-		return nil
-	}
-	for _, part := range parts {
-		if !compactCooldownActive(part, now) {
-			continue
-		}
 		if appendCandidate(part) {
 			break
 		}
@@ -1069,7 +1024,7 @@ func (s *Store) claimCompactParts(ctx context.Context, parts []Part, workerID st
 		})
 		if err != nil {
 			if len(claimed) > 0 {
-				_ = s.ReleaseCompactBatch(ctx, CompactBatch{JobID: part.JobID, Parts: claimed}, workerID, time.Time{}, now)
+				_ = s.ReleaseCompactBatch(ctx, CompactBatch{JobID: part.JobID, Parts: claimed}, workerID, now)
 			}
 			return nil, fmt.Errorf("claim compact-ready part %s/%s: %w", part.JobID, part.PartID, err)
 		}

@@ -33,8 +33,6 @@ type Compactor struct {
 	MergePollInterval   time.Duration
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
-	LoadMoreInputs      func(context.Context, CompactLoadState) ([]CompactInput, error)
-	LoadMoreInterval    time.Duration
 	ReportProgress      CompactProgressReporter
 }
 
@@ -53,11 +51,6 @@ type CompactProgressReporter func(context.Context, CompactWorkItem, CompactProgr
 type CompactProgressSnapshot struct {
 	InputStats       metrics.PartStats
 	DestinationStats metrics.PartStats
-}
-
-type CompactLoadState struct {
-	Stats      metrics.PartStats
-	Partitions []PartPartitionStats
 }
 
 type CompactWorkItem struct {
@@ -171,64 +164,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	}
 	if err := p.restartClickHouse(ctx, m); err != nil {
 		return CompactResult{}, err
-	}
-	lastLoadMoreAt := time.Time{}
-	p.mergeWaitHook = func(ctx context.Context, target mergeWaitTarget, snapshot mergePartSnapshot, activeMerges uint64) (bool, error) {
-		now := time.Now()
-		interval := c.LoadMoreInterval
-		if interval < 0 {
-			return false, fmt.Errorf("compact load-more interval must be non-negative, got %s", interval)
-		}
-		if interval > 0 && !lastLoadMoreAt.IsZero() && now.Sub(lastLoadMoreAt) < interval {
-			return false, nil
-		}
-		lastLoadMoreAt = now
-		partitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
-		if err != nil {
-			return false, fmt.Errorf("measure compact active part partitions before loading more inputs: %w", err)
-		}
-		stats := summarizePartPartitions(partitions)
-		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: stats}); err != nil {
-			return false, err
-		}
-		if c.LoadMoreInputs == nil {
-			return false, nil
-		}
-		inputs, err := c.LoadMoreInputs(ctx, CompactLoadState{
-			Stats: metrics.PartStats{
-				Count: snapshot.ActiveParts,
-				Bytes: snapshot.TotalBytes,
-			},
-			Partitions: partitions,
-		})
-		if err != nil {
-			return false, err
-		}
-		if len(inputs) == 0 {
-			return false, nil
-		}
-		for _, input := range inputs {
-			workDir := filepath.Join(root, "inputs", fmt.Sprintf("%06d", len(attachedInputs)))
-			attachedStats, err := c.attachFinishedArtifact(ctx, item, input, detached, workDir)
-			if err != nil {
-				return false, err
-			}
-			inputStats = addPartStats(inputStats, attachedStats)
-			attachedInputs = append(attachedInputs, input)
-		}
-		partitions, err = p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
-		if err != nil {
-			return false, fmt.Errorf("measure compact active part partitions after loading more inputs: %w", err)
-		}
-		stats = summarizePartPartitions(partitions)
-		if err := c.configureCompactMergeSettings(ctx, item, stats.Bytes); err != nil {
-			return false, err
-		}
-		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: stats}); err != nil {
-			return false, err
-		}
-		slog.Info("loaded more compact input artifacts", "stage", "compact_load_more_inputs", "job_id", item.JobID, "output_part_id", item.OutputPartID, "loaded_inputs", len(inputs), "total_inputs", len(attachedInputs), "active_parts", stats.Count, "active_bytes_on_disk", stats.Bytes)
-		return true, nil
 	}
 	target := mergeWaitTarget{
 		JobID:    item.JobID,

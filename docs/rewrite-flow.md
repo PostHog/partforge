@@ -24,7 +24,7 @@ graph TD
     M --> N{Output active parts fewer than input active parts?}
     N -- Yes --> O[Upload compacted artifact]
     O --> P[Mark compact inputs SUPERSEDED and output COMPACT_READY]
-    N -- No --> Q[Release compact inputs with derived cooldown]
+    N -- No --> Q[Release compact inputs back to COMPACT_READY]
     K -- No --> R[Finalize COMPACT_READY artifacts past compact window]
     P --> K
     Q --> K
@@ -89,7 +89,7 @@ graph TD
     I -- Yes --> H
 ```
 
-`-merge-idle-timeout` is an inactivity timeout. It is extended when ClickHouse has active destination merges, when the destination part snapshot changes, or when compaction attaches more input artifacts. `-merge-max-runtime` is the hard cap for the whole wait. When worker compaction is enabled, the initial source rewrite merge wait is capped at 5 minutes because later compaction work is responsible for deeper consolidation. The compaction path uses `-compact-merge-idle-timeout` and `-compact-merge-max-runtime` with the same semantics.
+`-merge-idle-timeout` is an inactivity timeout. It is extended when ClickHouse has active destination merges or when the destination part snapshot changes. `-merge-max-runtime` is the hard cap for the whole wait. When worker compaction is enabled, the initial source rewrite merge wait is capped at 5 minutes because later compaction work is responsible for deeper consolidation. The compaction path uses `-compact-merge-idle-timeout` and `-compact-merge-max-runtime` with the same semantics.
 
 If the merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist. Any destination with more than one active output part must keep the same part snapshot idle for the derived settle wait before the worker treats merges as settled.
 
@@ -97,15 +97,13 @@ If the merge wait times out or merge-wait inspection fails, that is not a rewrit
 
 When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then tries to claim `COMPACT_READY` artifacts for the same job, bucket, destination table, and destination schema. The claim picker is partition-aware: it only claims an initial batch when the selected artifacts have enough active parts in at least one shared destination partition, then fills that partition batch up to the configured artifact and byte limits. It does not count unrelated one-part partitions as compactable work. If other workers are already compacting some partitions for the same destination, the picker tries partitions that are not currently compacting first, then falls back to those busy partitions when no other compactable partition exists.
 
-The compactor downloads and attaches one finished artifact group at a time. ClickHouse assigns attached part names, so the worker does not rename parts before attach. Compaction configures MergeTree merge settings, restarts the local ClickHouse with merge tuning, and lets normal background merges choose what to merge.
+The compactor downloads and attaches the whole claimed batch before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. Compaction configures MergeTree merge settings, restarts the local ClickHouse with merge tuning, and lets normal background merges choose what to merge.
 
-While waiting for compact destination merges, the compactor can poll for more compatible artifacts. Additional claims require overlap with partitions already active on the local compacting table, so the worker avoids downloading a new artifact that only adds an isolated new partition. The load-more cadence is derived from `-compact-window`.
-
-The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY` with a short retry cooldown. Cooldown only prevents the row from seeding another identical solo retry; a cooled-down row can still join a batch with fresh compatible work. The finalization window is measured from the newest current `COMPACT_READY` or `COMPACTING` timestamp, so successful compact outputs get another window for deeper compaction while superseded inputs, retries, and no-op releases do not keep moving the deadline. A single artifact larger than `-compact-max-bytes` remains eligible when it already contains enough physical parts to compact; the byte cap only stops adding more artifacts to a batch.
+The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY`. The finalization window is measured from the newest current `COMPACT_READY` or `COMPACTING` timestamp. Successful compact outputs inherit the newest input compact-ready timestamp, so deeper compaction does not extend the job-level window automatically. A single artifact larger than `-compact-max-bytes` remains eligible when it already contains enough physical parts to compact; the byte cap only stops adding more artifacts to a batch.
 
 Live compaction workers heartbeat their claimed `COMPACTING` rows. Before claiming more compaction work, workers release `COMPACTING` rows whose heartbeat is stale for the derived lease timeout, currently `-compact-merge-max-runtime` plus `-shutdown-grace-period`. Once a job's compact window has expired, workers stop claiming new compact work for that job. Remaining compact-ready artifacts are promoted to `FINISHED` once there is no source work, in-progress rewrite, failed work, or active non-stale compaction for that job.
 
-`job-status` physical part counters refer to ClickHouse parts, not PartForge state rows. Source rows count the attached source part or persisted rewritten destination part count. Compact rows count the physical destination parts that fed that compact output. Live `COMPACTING` rows report the physical parts actually attached into the local compact table as input and the latest active local ClickHouse parts as output while merges are still running. The compact summary reports finalization blockers and ETA; `job-status -parts` shows each compact-ready row's age and remaining cooldown.
+`job-status` physical part counters refer to ClickHouse parts, not PartForge state rows. Source rows count the attached source part or persisted rewritten destination part count. Compact rows count the physical destination parts that fed that compact output. Live `COMPACTING` rows report the physical parts actually attached into the local compact table as input and the latest active local ClickHouse parts as output while merges are still running. The compact summary reports finalization blockers and ETA; `job-status -parts` shows each compact-ready row's age.
 
 ## Resetting Compaction State
 
