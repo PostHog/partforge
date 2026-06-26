@@ -42,7 +42,21 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build end-to-end worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: partforge-worker:latest
+          cache-from: |
+            type=gha,scope=worker-image
+
       - name: Run end-to-end tests
+        env:
+          PARTFORGE_E2E_SKIP_BUILD: "1"
         run: ./e2e/run.sh
 
       - name: Clean up end-to-end services

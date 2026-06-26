@@ -112,7 +112,9 @@ mkdir -p "$DATA_DIR"
 chmod -R a+rwx "$ROOT/.e2e"
 
 docker compose down --remove-orphans >/dev/null 2>&1 || true
-CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose build worker
+if [[ "${PARTFORGE_E2E_SKIP_BUILD:-}" != "1" ]]; then
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose build worker
+fi
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose up -d localstack clickhouse
 
 for _ in $(seq 1 60); do
