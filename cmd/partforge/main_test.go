@@ -1912,6 +1912,64 @@ func TestApplyClickHouseClientConfigDefaultsUsesDefaultUserForPasswordOnlyConfig
 	}
 }
 
+func TestBuildClickHousePrometheusTarget(t *testing.T) {
+	tests := []struct {
+		name  string
+		inURL string
+		port  int
+		path  string
+		want  string
+	}{
+		{
+			name:  "localhost",
+			inURL: "http://127.0.0.1:8123/?database=default",
+			port:  9363,
+			path:  "/metrics",
+			want:  "http://127.0.0.1:9363/metrics",
+		},
+		{
+			name:  "ipv6",
+			inURL: "http://[::1]:8123",
+			port:  9363,
+			path:  "/metrics",
+			want:  "http://[::1]:9363/metrics",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildClickHousePrometheusTarget(tt.inURL, tt.port, tt.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("target = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildClickHousePrometheusTargetRejectsInvalidInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		inURL string
+		port  int
+		path  string
+	}{
+		{name: "missing scheme", inURL: "127.0.0.1:8123", port: 9363, path: "/metrics"},
+		{name: "missing host", inURL: "http:///query", port: 9363, path: "/metrics"},
+		{name: "invalid port", inURL: "http://127.0.0.1:8123", port: 0, path: "/metrics"},
+		{name: "invalid path", inURL: "http://127.0.0.1:8123", port: 9363, path: "metrics"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := buildClickHousePrometheusTarget(tt.inURL, tt.port, tt.path)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func writeTestFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

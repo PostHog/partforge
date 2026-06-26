@@ -93,6 +93,48 @@ func TestArgsIncludeMergeSchedulingPolicy(t *testing.T) {
 	}
 }
 
+func TestArgsIncludePrometheusConfig(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Prometheus: PrometheusConfig{Enabled: true, Port: 9363, Endpoint: "/metrics"}}
+	got, err := cfg.args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"server",
+		"--",
+		"--prometheus.port=9363",
+		"--prometheus.endpoint=/metrics",
+		"--prometheus.metrics=true",
+		"--prometheus.asynchronous_metrics=true",
+		"--prometheus.events=true",
+		"--prometheus.errors=true",
+		"--prometheus.histograms=true",
+		"--prometheus.dimensional_metrics=true",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestArgsRejectInvalidPrometheusConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  PrometheusConfig
+	}{
+		{name: "port zero", cfg: PrometheusConfig{Enabled: true, Port: 0, Endpoint: "/metrics"}},
+		{name: "port too high", cfg: PrometheusConfig{Enabled: true, Port: 65536, Endpoint: "/metrics"}},
+		{name: "endpoint without slash", cfg: PrometheusConfig{Enabled: true, Port: 9363, Endpoint: "metrics"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := (Config{Binary: "clickhouse", Prometheus: tt.cfg}).args()
+			if err == nil {
+				t.Fatal("expected invalid prometheus config error")
+			}
+		})
+	}
+}
+
 func TestArgsForClickHouseServerBinaryOmitServerSubcommand(t *testing.T) {
 	cfg := Config{Binary: "clickhouse-server", ConfigFile: "/etc/clickhouse-server/config.xml"}
 	got, err := cfg.args()

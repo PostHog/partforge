@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,6 +41,9 @@ const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
+const defaultClickHousePrometheusPort = 9363
+const defaultClickHousePrometheusPath = "/metrics"
+const defaultClickHousePrometheusScrapeTimeout = 5 * time.Second
 const defaultCompactWindow = 24 * time.Hour
 const defaultCompactMaxArtifacts = 8
 const defaultCompactMaxBytes uint64 = 300 * 1024 * 1024 * 1024
@@ -719,6 +725,9 @@ func runWorker(ctx context.Context, args []string) error {
 		compactMaxBytes           = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
 		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath               = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
+		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "local ClickHouse native Prometheus metrics port")
+		clickHousePrometheusPath  = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "local ClickHouse native Prometheus metrics HTTP path")
+		clickHouseScrapeTimeout   = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local ClickHouse native Prometheus metrics")
 		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 	)
 	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
@@ -755,6 +764,25 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactOptimizeFinalAfter < 0 {
 		return fmt.Errorf("compact-optimize-final-after must be non-negative, got %s", *compactOptimizeFinalAfter)
+	}
+	if *clickHouseScrapeTimeout <= 0 {
+		return fmt.Errorf("clickhouse-prometheus-scrape-timeout must be greater than zero, got %s", *clickHouseScrapeTimeout)
+	}
+	clickHousePrometheusConfig := chproc.PrometheusConfig{}
+	clickHousePrometheusTarget := ""
+	if *metricsAddr != "" {
+		clickHousePrometheusConfig = chproc.PrometheusConfig{
+			Enabled:  true,
+			Port:     *clickHousePrometheusPort,
+			Endpoint: *clickHousePrometheusPath,
+		}
+		if err := validateClickHousePrometheusConfig(clickHousePrometheusConfig); err != nil {
+			return err
+		}
+		clickHousePrometheusTarget, err = buildClickHousePrometheusTarget(*clickHouseURL, *clickHousePrometheusPort, *clickHousePrometheusPath)
+		if err != nil {
+			return fmt.Errorf("build clickhouse prometheus target: %w", err)
+		}
 	}
 	effectiveCompactOptimizeFinalAfter := *compactOptimizeFinalAfter
 	if effectiveCompactOptimizeFinalAfter == 0 {
@@ -842,16 +870,24 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_max_artifacts", defaultCompactMaxArtifacts,
 		"compact_max_bytes", *compactMaxBytes,
 		"compact_min_input_parts", compactMinInputParts,
+		"clickhouse_prometheus_enabled", clickHousePrometheusConfig.Enabled,
+		"clickhouse_prometheus_target", clickHousePrometheusTarget,
+		"clickhouse_prometheus_scrape_timeout", *clickHouseScrapeTimeout,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
+	var prometheusMetrics *metrics.Prometheus
 	if *metricsAddr != "" {
 		slog.Info("starting metrics server", "stage", "start_metrics", "addr", *metricsAddr, "path", *metricsPath)
 		prom := metrics.NewPrometheus()
+		if err := prom.SetClickHouseScrapeTimeout(*clickHouseScrapeTimeout); err != nil {
+			return err
+		}
 		if _, err := metrics.StartServer(ctx, *metricsAddr, *metricsPath, prom.Handler()); err != nil {
 			return fmt.Errorf("start metrics server: %w", err)
 		}
 		recorder = prom
+		prometheusMetrics = prom
 	}
 
 	for {
@@ -875,27 +911,31 @@ func runWorker(ctx context.Context, args []string) error {
 		if part == nil {
 			if roleSettings.Compact {
 				didCompactWork, err := runWorkerCompaction(ctx, workerCompactionConfig{
-					StateStore:                stateStore,
-					WorkerID:                  resolvedWorkerID,
-					WorkDir:                   *workDir,
-					ClickHouseURL:             *clickHouseURL,
-					ClickHouseUser:            *clickHouseUser,
-					ClickHousePassword:        *clickHousePassword,
-					ClickHouseBinary:          *clickHouseBinary,
-					ClickHouseConfigFile:      *clickHouseConfigFile,
-					S5cmdBinary:               *s5cmdBinary,
-					S3Endpoint:                *s3Endpoint,
-					DefaultCompressionCodec:   *defaultCompressionCodec,
-					MergeBackgroundPoolSize:   mergeBackgroundPoolSize,
-					MergeSchedulingPolicy:     mergeTreeSettings.MergeSchedulingPolicy,
-					MergeMaxBlockSize:         mergeTreeSettings.MergeMaxBlockSize,
-					MergeMaxBlockSizeBytes:    mergeTreeSettings.MergeMaxBlockSizeBytes,
-					MergeSelectingSleepMS:     mergeTreeSettings.MergeSelectingSleepMS,
-					CompactWindow:             *compactWindow,
-					CompactOptimizeFinalAfter: effectiveCompactOptimizeFinalAfter,
-					CompactLeaseStaleAfter:    compactStaleAfter,
-					CompactHeartbeatInterval:  compactHeartbeatInterval,
-					CompactMaxBytes:           *compactMaxBytes,
+					StateStore:                 stateStore,
+					WorkerID:                   resolvedWorkerID,
+					WorkDir:                    *workDir,
+					ClickHouseURL:              *clickHouseURL,
+					ClickHouseUser:             *clickHouseUser,
+					ClickHousePassword:         *clickHousePassword,
+					ClickHouseBinary:           *clickHouseBinary,
+					ClickHouseConfigFile:       *clickHouseConfigFile,
+					ClickHousePrometheus:       clickHousePrometheusConfig,
+					ClickHousePrometheusTarget: clickHousePrometheusTarget,
+					S5cmdBinary:                *s5cmdBinary,
+					S3Endpoint:                 *s3Endpoint,
+					DefaultCompressionCodec:    *defaultCompressionCodec,
+					MergeBackgroundPoolSize:    mergeBackgroundPoolSize,
+					MergeSchedulingPolicy:      mergeTreeSettings.MergeSchedulingPolicy,
+					MergeMaxBlockSize:          mergeTreeSettings.MergeMaxBlockSize,
+					MergeMaxBlockSizeBytes:     mergeTreeSettings.MergeMaxBlockSizeBytes,
+					MergeSelectingSleepMS:      mergeTreeSettings.MergeSelectingSleepMS,
+					CompactWindow:              *compactWindow,
+					CompactOptimizeFinalAfter:  effectiveCompactOptimizeFinalAfter,
+					CompactLeaseStaleAfter:     compactStaleAfter,
+					CompactHeartbeatInterval:   compactHeartbeatInterval,
+					CompactMaxBytes:            *compactMaxBytes,
+					Metrics:                    recorder,
+					PrometheusMetrics:          prometheusMetrics,
 				})
 				if err != nil {
 					return err
@@ -956,7 +996,18 @@ func runWorker(ctx context.Context, args []string) error {
 			)
 
 			var server *chproc.Server
+			activateClickHouseMetrics := func() {
+				if prometheusMetrics != nil && clickHousePrometheusTarget != "" {
+					prometheusMetrics.SetClickHouseTarget(clickHousePrometheusTarget)
+				}
+			}
+			clearClickHouseMetrics := func() {
+				if prometheusMetrics != nil {
+					prometheusMetrics.ClearClickHouseTarget(clickHousePrometheusTarget)
+				}
+			}
 			cleanup = func() {
+				clearClickHouseMetrics()
 				if server != nil {
 					slog.Info("stopping local ClickHouse server", "stage", "stop_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
 					if err := server.Stop(); err != nil {
@@ -978,6 +1029,7 @@ func runWorker(ctx context.Context, args []string) error {
 					Password:   *clickHousePassword,
 					Timeout:    90 * time.Second,
 					Tuning:     tuning,
+					Prometheus: clickHousePrometheusConfig,
 				})
 			}
 
@@ -986,6 +1038,7 @@ func runWorker(ctx context.Context, args []string) error {
 			if err != nil {
 				return rewrite.ProcessResult{}, cleanup, err
 			}
+			activateClickHouseMetrics()
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
@@ -1010,6 +1063,7 @@ func runWorker(ctx context.Context, args []string) error {
 				if server == nil {
 					return errors.New("local ClickHouse server is not running")
 				}
+				clearClickHouseMetrics()
 				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
 				if err := server.Stop(); err != nil {
 					return fmt.Errorf("stop clickhouse before restart: %w", err)
@@ -1021,6 +1075,7 @@ func runWorker(ctx context.Context, args []string) error {
 					return err
 				}
 				server = restarted
+				activateClickHouseMetrics()
 				return nil
 			}
 			if *stateProgressInterval > 0 {
@@ -1129,30 +1184,37 @@ func createWorkerRunDirs(workDir string) (workerRunDirs, error) {
 }
 
 type workerCompactionConfig struct {
-	StateStore                *state.Store
-	WorkerID                  string
-	WorkDir                   string
-	ClickHouseURL             string
-	ClickHouseUser            string
-	ClickHousePassword        string
-	ClickHouseBinary          string
-	ClickHouseConfigFile      string
-	S5cmdBinary               string
-	S3Endpoint                string
-	DefaultCompressionCodec   string
-	MergeBackgroundPoolSize   int
-	MergeSchedulingPolicy     string
-	MergeMaxBlockSize         uint64
-	MergeMaxBlockSizeBytes    uint64
-	MergeSelectingSleepMS     uint64
-	CompactWindow             time.Duration
-	CompactOptimizeFinalAfter time.Duration
-	CompactLeaseStaleAfter    time.Duration
-	CompactHeartbeatInterval  time.Duration
-	CompactMaxBytes           uint64
+	StateStore                 *state.Store
+	WorkerID                   string
+	WorkDir                    string
+	ClickHouseURL              string
+	ClickHouseUser             string
+	ClickHousePassword         string
+	ClickHouseBinary           string
+	ClickHouseConfigFile       string
+	ClickHousePrometheus       chproc.PrometheusConfig
+	ClickHousePrometheusTarget string
+	S5cmdBinary                string
+	S3Endpoint                 string
+	DefaultCompressionCodec    string
+	MergeBackgroundPoolSize    int
+	MergeSchedulingPolicy      string
+	MergeMaxBlockSize          uint64
+	MergeMaxBlockSizeBytes     uint64
+	MergeSelectingSleepMS      uint64
+	CompactWindow              time.Duration
+	CompactOptimizeFinalAfter  time.Duration
+	CompactLeaseStaleAfter     time.Duration
+	CompactHeartbeatInterval   time.Duration
+	CompactMaxBytes            uint64
+	Metrics                    metrics.Recorder
+	PrometheusMetrics          *metrics.Prometheus
 }
 
 func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.Noop{}
+	}
 	if delay := compactClaimSplay(cfg.CompactWindow); delay > 0 {
 		slog.Info("waiting before compact claim", "stage", "claim_compact_splay", "worker_id", cfg.WorkerID, "delay", delay)
 		if err := sleepOrDone(ctx, delay); err != nil {
@@ -1275,6 +1337,11 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	processCtx, cancelProcess := context.WithCancel(context.Background())
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess)
+	cfg.Metrics.CompactionStarted(batch.JobID, outputPartID, uint64(len(batch.Parts)), metrics.PartStats{
+		Count: batch.InputPartCount,
+		Rows:  batch.InputRows,
+		Bytes: batch.InputBytes,
+	})
 	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, cfg, workItem, currentBatch, compactDeadline)
 	cleanupCompactNow := func() {
 		if cleanupCompact != nil {
@@ -1304,6 +1371,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			cleanupCompactNow()
 			return true, nil
 		}
+		cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
 		if releaseErr != nil {
 			cleanupCompactNow()
 			return true, fmt.Errorf("compact batch %s/%s failed: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
@@ -1319,6 +1387,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			cleanupCompactNow()
 			return true, releaseErr
 		}
+		cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
 		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
 		if shutdownRequested {
 			slog.Info("worker shutdown requested; stopping after compact batch made no useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
@@ -1366,6 +1435,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		cleanupCompactNow()
 		return true, err
 	}
+	cfg.Metrics.CompactionCompleted(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
 	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(batch.Parts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 	if shutdownRequested {
 		slog.Info("worker shutdown requested; stopping after completed compaction", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
@@ -1383,7 +1453,18 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 	slog.Info("created compact worker run directory", "stage", "compact_prepare_work_dir", "work_dir", cfg.WorkDir, "run_dir", runDirs.Root, "clickhouse_data_dir", runDirs.ClickHouse, "scratch_dir", runDirs.Scratch, "job_id", item.JobID, "output_part_id", item.OutputPartID)
 
 	var server *chproc.Server
+	activateClickHouseMetrics := func() {
+		if cfg.PrometheusMetrics != nil && cfg.ClickHousePrometheusTarget != "" {
+			cfg.PrometheusMetrics.SetClickHouseTarget(cfg.ClickHousePrometheusTarget)
+		}
+	}
+	clearClickHouseMetrics := func() {
+		if cfg.PrometheusMetrics != nil {
+			cfg.PrometheusMetrics.ClearClickHouseTarget(cfg.ClickHousePrometheusTarget)
+		}
+	}
 	cleanup = func() {
+		clearClickHouseMetrics()
 		if server != nil {
 			slog.Info("stopping local ClickHouse server", "stage", "compact_stop_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID)
 			if err := server.Stop(); err != nil {
@@ -1405,6 +1486,7 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 			Password:   cfg.ClickHousePassword,
 			Timeout:    90 * time.Second,
 			Tuning:     tuning,
+			Prometheus: cfg.ClickHousePrometheus,
 		})
 	}
 	slog.Info("starting local ClickHouse server for compaction", "stage", "compact_start_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID)
@@ -1412,6 +1494,7 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 	if err != nil {
 		return rewrite.CompactResult{}, cleanup, err
 	}
+	activateClickHouseMetrics()
 
 	ch := chhttp.Client{URL: cfg.ClickHouseURL, User: cfg.ClickHouseUser, Password: cfg.ClickHousePassword}
 	compactor := rewrite.Compactor{
@@ -1430,6 +1513,8 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 		ShutdownContext: shutdownCtx,
 	}
 	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
+		cfg.Metrics.SetCompactPartStats("input", item.JobID, item.OutputPartID, snapshot.InputStats)
+		cfg.Metrics.SetCompactPartStats("output", item.JobID, item.OutputPartID, snapshot.DestinationStats)
 		stateCtx, cancel := workerStateUpdateContext()
 		defer cancel()
 		return cfg.StateStore.UpdateCompactProgress(stateCtx, compactBatch(), item.OutputPartID, cfg.WorkerID, state.PartStats{
@@ -1446,6 +1531,7 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 		if server == nil {
 			return errors.New("local ClickHouse server is not running")
 		}
+		clearClickHouseMetrics()
 		slog.Info("stopping local ClickHouse server for compact restart", "stage", "compact_restart_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID)
 		if err := server.Stop(); err != nil {
 			return fmt.Errorf("stop clickhouse before compact restart: %w", err)
@@ -1457,6 +1543,7 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 			return err
 		}
 		server = restarted
+		activateClickHouseMetrics()
 		return nil
 	}
 	result, err := compactor.Compact(ctx, item)
@@ -2676,6 +2763,53 @@ type clickHouseClientCredentials struct {
 
 func applyClickHouseClientConfigDefaults(user, password *string) error {
 	return applyClickHouseClientConfigDefaultsFrom(defaultClickHouseClientConfigPath, user, password)
+}
+
+func validateClickHousePrometheusConfig(cfg chproc.PrometheusConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("clickhouse-prometheus-port must be between 1 and 65535, got %d", cfg.Port)
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		return fmt.Errorf("clickhouse-prometheus-path must not be empty")
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		return fmt.Errorf("clickhouse-prometheus-path must start with /, got %q", endpoint)
+	}
+	return nil
+}
+
+func buildClickHousePrometheusTarget(clickHouseURL string, port int, path string) (string, error) {
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("port must be between 1 and 65535, got %d", port)
+	}
+	endpoint := strings.TrimSpace(path)
+	if endpoint == "" {
+		return "", fmt.Errorf("path must not be empty")
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		return "", fmt.Errorf("path must start with /, got %q", endpoint)
+	}
+	u, err := url.Parse(clickHouseURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" {
+		return "", fmt.Errorf("clickhouse URL %q is missing a scheme", clickHouseURL)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("clickhouse URL %q is missing a host", clickHouseURL)
+	}
+	target := url.URL{
+		Scheme: u.Scheme,
+		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:   endpoint,
+	}
+	return target.String(), nil
 }
 
 func applyClickHouseClientConfigDefaultsFrom(path string, user, password *string) error {

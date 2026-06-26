@@ -26,11 +26,18 @@ type Config struct {
 	Password   string
 	Timeout    time.Duration
 	Tuning     Tuning
+	Prometheus PrometheusConfig
 }
 
 type Tuning struct {
 	BackgroundPoolSize    int
 	MergeSchedulingPolicy string
+}
+
+type PrometheusConfig struct {
+	Enabled  bool
+	Port     int
+	Endpoint string
 }
 
 type Server struct {
@@ -121,11 +128,42 @@ func (cfg Config) args() ([]string, error) {
 	if mergeSchedulingPolicy != "" {
 		configOverrides = append(configOverrides, "--background_merges_mutations_scheduling_policy="+mergeSchedulingPolicy)
 	}
+	prometheusOverrides, err := prometheusConfigOverrides(cfg.Prometheus)
+	if err != nil {
+		return nil, err
+	}
+	configOverrides = append(configOverrides, prometheusOverrides...)
 	if len(configOverrides) > 0 {
 		args = append(args, "--")
 		args = append(args, configOverrides...)
 	}
 	return args, nil
+}
+
+func prometheusConfigOverrides(cfg PrometheusConfig) ([]string, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("prometheus port must be between 1 and 65535, got %d", cfg.Port)
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = "/metrics"
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		return nil, fmt.Errorf("prometheus endpoint must start with /, got %q", endpoint)
+	}
+	return []string{
+		fmt.Sprintf("--prometheus.port=%d", cfg.Port),
+		"--prometheus.endpoint=" + endpoint,
+		"--prometheus.metrics=true",
+		"--prometheus.asynchronous_metrics=true",
+		"--prometheus.events=true",
+		"--prometheus.errors=true",
+		"--prometheus.histograms=true",
+		"--prometheus.dimensional_metrics=true",
+	}, nil
 }
 
 func (cfg Config) errorLogPath() string {

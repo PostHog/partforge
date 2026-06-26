@@ -265,6 +265,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 
 	progressManifest := manifest.Manifest{JobID: item.JobID, PartID: item.PartID}
 	stageTracker := newRewriteStageTracker(startedAt, stageProcessPart)
+	defer p.recorder().ClearStageProgress(progressManifest)
 	heartbeat, err := p.startProgressHeartbeat(ctx, progressManifest, stageTracker)
 	if err != nil {
 		return ProcessResult{}, err
@@ -902,6 +903,12 @@ func (p Processor) reportStageProgress(ctx context.Context, m manifest.Manifest,
 
 	now := time.Now()
 	progress := tracker.Start(stage, now)
+	p.recorder().ObserveStageProgress(m, metrics.StageProgress{
+		Stage:                   progress.Stage,
+		StageElapsed:            progress.StageElapsed,
+		TotalElapsed:            progress.TotalElapsed,
+		CompletedStageDurations: progress.CompletedStageDurations,
+	})
 	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
 }
 
@@ -914,6 +921,12 @@ func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest,
 
 	now := time.Now()
 	progress := tracker.Complete(stage, now)
+	p.recorder().ObserveStageProgress(m, metrics.StageProgress{
+		Stage:                   progress.Stage,
+		StageElapsed:            progress.StageElapsed,
+		TotalElapsed:            progress.TotalElapsed,
+		CompletedStageDurations: progress.CompletedStageDurations,
+	})
 	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
 }
 
@@ -925,6 +938,12 @@ func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest,
 	defer tracker.reportMu.Unlock()
 
 	progress := tracker.Snapshot(time.Now())
+	p.recorder().ObserveStageProgress(m, metrics.StageProgress{
+		Stage:                   progress.Stage,
+		StageElapsed:            progress.StageElapsed,
+		TotalElapsed:            progress.TotalElapsed,
+		CompletedStageDurations: progress.CompletedStageDurations,
+	})
 	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
 }
 
