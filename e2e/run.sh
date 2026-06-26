@@ -198,6 +198,7 @@ for i in $(seq 1 6); do
     -s3-endpoint=http://localstack:4566 \
     -dynamodb-endpoint=http://localstack:4566 \
     -compact-window=0s \
+    -compact-optimize-final-after=1s \
     -once 2>&1 | tee "$compact_log"
 
   status="$(

@@ -694,31 +694,32 @@ func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
 func runWorker(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	var (
-		configPath              = fs.String("config", defaultConfigPath, "JSON config file path")
-		region                  = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		s3Endpoint              = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary             = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		stateTable              = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		dynamoEndpoint          = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		clickHouseURL           = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
-		clickHouseUser          = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
-		clickHousePassword      = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		clickHouseBinary        = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
-		clickHouseConfigFile    = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
-		once                    = fs.Bool("once", false, "process one part and exit")
-		pollInterval            = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
-		workerID                = fs.String("worker-id", "", "worker identity recorded on claimed parts")
-		workDir                 = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
-		defaultCompressionCodec = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
-		mergeIdleTimeout        = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
-		mergeMaxRuntime         = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
-		role                    = fs.String("role", string(workerRoleAll), "worker role: all, inserter, or compactor")
-		compact                 = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
-		compactWindow           = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
-		compactMaxBytes         = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
-		metricsAddr             = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
-		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
-		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
+		configPath                = fs.String("config", defaultConfigPath, "JSON config file path")
+		region                    = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		s3Endpoint                = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary               = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		stateTable                = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		dynamoEndpoint            = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		clickHouseURL             = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
+		clickHouseUser            = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
+		clickHousePassword        = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
+		clickHouseBinary          = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
+		clickHouseConfigFile      = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
+		once                      = fs.Bool("once", false, "process one part and exit")
+		pollInterval              = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
+		workerID                  = fs.String("worker-id", "", "worker identity recorded on claimed parts")
+		workDir                   = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
+		defaultCompressionCodec   = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
+		mergeIdleTimeout          = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
+		mergeMaxRuntime           = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
+		role                      = fs.String("role", string(workerRoleAll), "worker role: all, inserter, or compactor")
+		compact                   = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
+		compactWindow             = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
+		compactOptimizeFinalAfter = fs.Duration("compact-optimize-final-after", rewrite.DefaultCompactOptimizeFinalAfter, "how long compaction waits with mergeable idle parts before running OPTIMIZE FINAL; 0 uses the default")
+		compactMaxBytes           = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
+		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
+		metricsPath               = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
+		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 	)
 	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
 	fs.Duration("compact-merge-max-runtime", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
@@ -751,6 +752,13 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactWindow < 0 {
 		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
+	}
+	if *compactOptimizeFinalAfter < 0 {
+		return fmt.Errorf("compact-optimize-final-after must be non-negative, got %s", *compactOptimizeFinalAfter)
+	}
+	effectiveCompactOptimizeFinalAfter := *compactOptimizeFinalAfter
+	if effectiveCompactOptimizeFinalAfter == 0 {
+		effectiveCompactOptimizeFinalAfter = rewrite.DefaultCompactOptimizeFinalAfter
 	}
 	slog.Info(
 		"worker started",
@@ -828,7 +836,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
 		"compact_merge_timeout", *compactWindow,
 		"compact_merge_settle_min_wait", rewrite.DefaultCompactMergeSettleMinWait,
-		"compact_optimize_final_after", rewrite.DefaultCompactOptimizeFinalAfter,
+		"compact_optimize_final_after", effectiveCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
 		"compact_max_artifacts", defaultCompactMaxArtifacts,
@@ -867,26 +875,27 @@ func runWorker(ctx context.Context, args []string) error {
 		if part == nil {
 			if roleSettings.Compact {
 				didCompactWork, err := runWorkerCompaction(ctx, workerCompactionConfig{
-					StateStore:               stateStore,
-					WorkerID:                 resolvedWorkerID,
-					WorkDir:                  *workDir,
-					ClickHouseURL:            *clickHouseURL,
-					ClickHouseUser:           *clickHouseUser,
-					ClickHousePassword:       *clickHousePassword,
-					ClickHouseBinary:         *clickHouseBinary,
-					ClickHouseConfigFile:     *clickHouseConfigFile,
-					S5cmdBinary:              *s5cmdBinary,
-					S3Endpoint:               *s3Endpoint,
-					DefaultCompressionCodec:  *defaultCompressionCodec,
-					MergeBackgroundPoolSize:  mergeBackgroundPoolSize,
-					MergeSchedulingPolicy:    mergeTreeSettings.MergeSchedulingPolicy,
-					MergeMaxBlockSize:        mergeTreeSettings.MergeMaxBlockSize,
-					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
-					MergeSelectingSleepMS:    mergeTreeSettings.MergeSelectingSleepMS,
-					CompactWindow:            *compactWindow,
-					CompactLeaseStaleAfter:   compactStaleAfter,
-					CompactHeartbeatInterval: compactHeartbeatInterval,
-					CompactMaxBytes:          *compactMaxBytes,
+					StateStore:                stateStore,
+					WorkerID:                  resolvedWorkerID,
+					WorkDir:                   *workDir,
+					ClickHouseURL:             *clickHouseURL,
+					ClickHouseUser:            *clickHouseUser,
+					ClickHousePassword:        *clickHousePassword,
+					ClickHouseBinary:          *clickHouseBinary,
+					ClickHouseConfigFile:      *clickHouseConfigFile,
+					S5cmdBinary:               *s5cmdBinary,
+					S3Endpoint:                *s3Endpoint,
+					DefaultCompressionCodec:   *defaultCompressionCodec,
+					MergeBackgroundPoolSize:   mergeBackgroundPoolSize,
+					MergeSchedulingPolicy:     mergeTreeSettings.MergeSchedulingPolicy,
+					MergeMaxBlockSize:         mergeTreeSettings.MergeMaxBlockSize,
+					MergeMaxBlockSizeBytes:    mergeTreeSettings.MergeMaxBlockSizeBytes,
+					MergeSelectingSleepMS:     mergeTreeSettings.MergeSelectingSleepMS,
+					CompactWindow:             *compactWindow,
+					CompactOptimizeFinalAfter: effectiveCompactOptimizeFinalAfter,
+					CompactLeaseStaleAfter:    compactStaleAfter,
+					CompactHeartbeatInterval:  compactHeartbeatInterval,
+					CompactMaxBytes:           *compactMaxBytes,
 				})
 				if err != nil {
 					return err
@@ -1120,26 +1129,27 @@ func createWorkerRunDirs(workDir string) (workerRunDirs, error) {
 }
 
 type workerCompactionConfig struct {
-	StateStore               *state.Store
-	WorkerID                 string
-	WorkDir                  string
-	ClickHouseURL            string
-	ClickHouseUser           string
-	ClickHousePassword       string
-	ClickHouseBinary         string
-	ClickHouseConfigFile     string
-	S5cmdBinary              string
-	S3Endpoint               string
-	DefaultCompressionCodec  string
-	MergeBackgroundPoolSize  int
-	MergeSchedulingPolicy    string
-	MergeMaxBlockSize        uint64
-	MergeMaxBlockSizeBytes   uint64
-	MergeSelectingSleepMS    uint64
-	CompactWindow            time.Duration
-	CompactLeaseStaleAfter   time.Duration
-	CompactHeartbeatInterval time.Duration
-	CompactMaxBytes          uint64
+	StateStore                *state.Store
+	WorkerID                  string
+	WorkDir                   string
+	ClickHouseURL             string
+	ClickHouseUser            string
+	ClickHousePassword        string
+	ClickHouseBinary          string
+	ClickHouseConfigFile      string
+	S5cmdBinary               string
+	S3Endpoint                string
+	DefaultCompressionCodec   string
+	MergeBackgroundPoolSize   int
+	MergeSchedulingPolicy     string
+	MergeMaxBlockSize         uint64
+	MergeMaxBlockSizeBytes    uint64
+	MergeSelectingSleepMS     uint64
+	CompactWindow             time.Duration
+	CompactOptimizeFinalAfter time.Duration
+	CompactLeaseStaleAfter    time.Duration
+	CompactHeartbeatInterval  time.Duration
+	CompactMaxBytes           uint64
 }
 
 func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
@@ -1410,6 +1420,7 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 		WorkDir:             runDirs.Scratch,
 		MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
 		MergeDeadline:       compactDeadline,
+		OptimizeFinalAfter:  cfg.CompactOptimizeFinalAfter,
 		MergeTreeSettings: rewrite.MergeTreeSettings{
 			MergeMaxBlockSize:       cfg.MergeMaxBlockSize,
 			MergeMaxBlockSizeBytes:  cfg.MergeMaxBlockSizeBytes,
