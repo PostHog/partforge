@@ -22,6 +22,7 @@ services:
       - "./e2e/clickhouse/users.d/default-anyhost.xml:/etc/clickhouse-server/users.d/default-anyhost.xml:ro"
 
   worker:
+    image: partforge-worker:latest
     build: .
     depends_on:
       - localstack

@@ -490,7 +490,7 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(s.table),
 			Key:                       part.key(),
-			ConditionExpression:       aws.String("#status = :compacting AND #worker_id = :worker"),
+			ConditionExpression:       aws.String(compactOwnedOrUnownedReadyCondition()),
 			UpdateExpression:          aws.String(updateExpression),
 			ExpressionAttributeNames:  names,
 			ExpressionAttributeValues: values,
@@ -508,22 +508,23 @@ func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, w
 	}
 	for _, part := range batch.Parts {
 		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(s.table),
-			Key:       part.key(),
-			ConditionExpression: aws.String(
-				"#status = :compacting AND #worker_id = :worker",
-			),
+			TableName:           aws.String(s.table),
+			Key:                 part.key(),
+			ConditionExpression: aws.String(compactOwnedOrUnownedReadyCondition()),
 			UpdateExpression: aws.String(
-				"SET updated_at = :now",
+				"SET #status = :compacting, gsi1pk = :gsi1pk, updated_at = :now, compacting_at = if_not_exists(compacting_at, :now), worker_id = :worker REMOVE #error, compact_cooldown_until",
 			),
 			ExpressionAttributeNames: map[string]string{
+				"#error":     "error",
 				"#status":    "status",
 				"#worker_id": "worker_id",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":compacting": stringAttr(string(StatusCompacting)),
-				":now":        stringAttr(formatTime(now)),
-				":worker":     stringAttr(workerID),
+				":compact_ready": stringAttr(string(StatusCompactReady)),
+				":compacting":    stringAttr(string(StatusCompacting)),
+				":gsi1pk":        stringAttr(statusKey(StatusCompacting)),
+				":now":           stringAttr(formatTime(now)),
+				":worker":        stringAttr(workerID),
 			},
 		})
 		if err != nil {
@@ -542,22 +543,24 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	}
 	for _, part := range batch.Parts {
 		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(s.table),
-			Key:       part.key(),
-			ConditionExpression: aws.String(
-				"#status = :compacting AND #worker_id = :worker",
-			),
+			TableName:           aws.String(s.table),
+			Key:                 part.key(),
+			ConditionExpression: aws.String(compactOwnedOrUnownedReadyCondition()),
 			UpdateExpression: aws.String(
-				"SET updated_at = :now, compact_progress_at = :now, compact_output_part_id = :output_part_id, " +
+				"SET #status = :compacting, gsi1pk = :gsi1pk, updated_at = :now, compacting_at = if_not_exists(compacting_at, :now), worker_id = :worker, " +
+					"compact_progress_at = :now, compact_output_part_id = :output_part_id, " +
 					"compact_input_part_count = :input_parts, compact_input_rows = :input_rows, compact_input_bytes = :input_bytes, " +
-					"compact_output_part_count = :output_parts, compact_output_rows = :output_rows, compact_output_bytes = :output_bytes",
+					"compact_output_part_count = :output_parts, compact_output_rows = :output_rows, compact_output_bytes = :output_bytes REMOVE #error, compact_cooldown_until",
 			),
 			ExpressionAttributeNames: map[string]string{
+				"#error":     "error",
 				"#status":    "status",
 				"#worker_id": "worker_id",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":compact_ready":  stringAttr(string(StatusCompactReady)),
 				":compacting":     stringAttr(string(StatusCompacting)),
+				":gsi1pk":         stringAttr(statusKey(StatusCompacting)),
 				":input_bytes":    uintAttr(inputStats.Bytes),
 				":input_parts":    uintAttr(inputStats.Count),
 				":input_rows":     uintAttr(inputStats.Rows),
@@ -673,11 +676,9 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	for _, part := range batch.Parts {
 		items = append(items, types.TransactWriteItem{
 			Update: &types.Update{
-				TableName: aws.String(s.table),
-				Key:       part.key(),
-				ConditionExpression: aws.String(
-					"#status = :compacting AND #worker_id = :worker",
-				),
+				TableName:           aws.String(s.table),
+				Key:                 part.key(),
+				ConditionExpression: aws.String(compactOwnedOrUnownedReadyCondition()),
 				UpdateExpression: aws.String(
 					"SET #status = :superseded, gsi1pk = :gsi1pk, updated_at = :now, superseded_at = :now, superseded_by = :superseded_by REMOVE #worker_id, compacting_at, #error, compact_cooldown_until, " + strings.Join(compactProgressRemoveAttributes(), ", "),
 				),
@@ -687,6 +688,7 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 					"#worker_id": "worker_id",
 				},
 				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":compact_ready": stringAttr(string(StatusCompactReady)),
 					":compacting":    stringAttr(string(StatusCompacting)),
 					":gsi1pk":        stringAttr(statusKey(StatusSuperseded)),
 					":now":           stringAttr(formatTime(now)),
@@ -1908,6 +1910,10 @@ func compactProgressRemoveAttributes() []string {
 		"compact_output_rows",
 		"compact_output_bytes",
 	}
+}
+
+func compactOwnedOrUnownedReadyCondition() string {
+	return "(#status = :compacting AND #worker_id = :worker) OR (#status = :compact_ready AND attribute_not_exists(#worker_id))"
 }
 
 func uniqueStrings(values []string) []string {
