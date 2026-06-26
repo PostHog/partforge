@@ -179,8 +179,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		Table:    item.DestinationTable,
 	}
 	waitForMerges := true
-	waitCtx := phaseCtx
-	cancelWait := func() {}
 	deadlineActive := false
 	if mergeWaitTimeout, ok := compactMergeTimeoutUntil(c.MergeDeadline, time.Now()); ok {
 		deadlineActive = true
@@ -190,13 +188,21 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		} else {
 			p.MergeTimeout = mergeWaitTimeout
 			p.MergeMaxTimeout = mergeWaitTimeout
-			waitCtx, cancelWait = context.WithDeadline(phaseCtx, c.MergeDeadline)
 			slog.Info("using compact window as destination merge timeout", "stage", stageWaitMerges, "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", target.tableSQL(), "timeout", mergeWaitTimeout, "deadline", c.MergeDeadline)
 		}
 	}
 	if waitForMerges {
-		if _, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact"); err != nil {
-			cancelWait()
+		waitCtx := phaseCtx
+		cancelWait := func() {}
+		if deadlineActive {
+			waitCtx, cancelWait = context.WithDeadline(phaseCtx, c.MergeDeadline)
+		}
+		err := func() error {
+			defer cancelWait()
+			_, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact")
+			return err
+		}()
+		if err != nil {
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
@@ -204,8 +210,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			} else {
 				return CompactResult{}, err
 			}
-		} else {
-			cancelWait()
 		}
 	}
 	cancelPhase()
