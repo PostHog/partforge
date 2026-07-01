@@ -124,7 +124,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age, destination partitions, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age, destination partitions, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` queries the status index, so admin IAM needs `dynamodb:Query` on the table's `gsi1` index.
 
 Retry one failed part:
 

@@ -3,11 +3,16 @@ package state
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 )
 
 func TestResolveDynamoRegionKeepsResolvedRegion(t *testing.T) {
@@ -80,6 +85,69 @@ func TestProgressRemoveExpressionCoversRewriteMetadata(t *testing.T) {
 	} {
 		if !strings.Contains(expr, attr) {
 			t.Fatalf("progress remove expression %q missing %s", expr, attr)
+		}
+	}
+}
+
+func TestListJobIDsByStatusQueriesStatusIndex(t *testing.T) {
+	var targets []string
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		target := r.Header.Get("X-Amz-Target")
+		targets = append(targets, target)
+		bodies = append(bodies, string(body))
+		if !strings.HasSuffix(target, ".Query") {
+			t.Errorf("DynamoDB target = %q, want Query", target)
+		}
+		if !strings.Contains(string(body), `"IndexName":"gsi1"`) {
+			t.Errorf("request body missing gsi1 index: %s", string(body))
+		}
+
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		switch {
+		case strings.Contains(string(body), statusKey(StatusCompactReady)):
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-b"}},{"job_id":{"S":"job-a"}}]}`)
+		case strings.Contains(string(body), statusKey(StatusCompacting)):
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-b"}},{"job_id":{"S":"job-c"}}]}`)
+		default:
+			t.Errorf("request body missing expected status: %s", string(body))
+			_, _ = io.WriteString(w, `{"Items":[]}`)
+		}
+	}))
+	defer server.Close()
+
+	store := &Store{
+		client: dynamodb.New(dynamodb.Options{
+			Region:       defaultRegion,
+			Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+			BaseEndpoint: aws.String(server.URL),
+		}),
+		table: "partforge",
+	}
+
+	got, err := store.ListJobIDsByStatus(context.Background(), StatusCompactReady, StatusCompacting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "job-a,job-b,job-c" {
+		t.Fatalf("job IDs = %v, want sorted unique job-a/job-b/job-c", got)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("requests = %d, want 2", len(targets))
+	}
+	for _, target := range targets {
+		if strings.HasSuffix(target, ".Scan") {
+			t.Fatalf("unexpected Scan target: %s", target)
+		}
+	}
+	for _, body := range bodies {
+		if strings.Contains(body, `"Scan"`) {
+			t.Fatalf("unexpected Scan request body: %s", body)
 		}
 	}
 }

@@ -37,6 +37,18 @@ const (
 
 type Status string
 
+var allStatuses = []Status{
+	StatusReady,
+	StatusInProgress,
+	StatusCompactReady,
+	StatusCompacting,
+	StatusSuperseded,
+	StatusFinished,
+	StatusImporting,
+	StatusImported,
+	StatusFailed,
+}
+
 type Config struct {
 	Region   string
 	Endpoint string
@@ -1284,32 +1296,53 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 }
 
 func (s *Store) ListJobIDs(ctx context.Context) ([]string, error) {
-	paginator := dynamodb.NewScanPaginator(s.client, &dynamodb.ScanInput{
-		TableName:            aws.String(s.table),
-		ConsistentRead:       aws.Bool(true),
-		ProjectionExpression: aws.String("#job_id"),
-		ExpressionAttributeNames: map[string]string{
-			"#job_id": "job_id",
-		},
-	})
+	return s.ListJobIDsByStatus(ctx, allStatuses...)
+}
 
+func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]string, error) {
 	seen := map[string]struct{}{}
-	for paginator.HasMorePages() {
-		out, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("scan job ids: %w", err)
+	queried := map[Status]struct{}{}
+	for _, status := range statuses {
+		if strings.TrimSpace(string(status)) == "" {
+			return nil, errors.New("status is required")
 		}
-		for _, item := range out.Items {
-			av, ok := item["job_id"]
-			if !ok {
-				continue
+		if _, ok := queried[status]; ok {
+			continue
+		}
+		queried[status] = struct{}{}
+
+		paginator := dynamodb.NewQueryPaginator(s.client, &dynamodb.QueryInput{
+			TableName:              aws.String(s.table),
+			IndexName:              aws.String(readyIndexName),
+			KeyConditionExpression: aws.String("#gsi1pk = :status"),
+			ProjectionExpression:   aws.String("#job_id"),
+			ExpressionAttributeNames: map[string]string{
+				"#gsi1pk": "gsi1pk",
+				"#job_id": "job_id",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":status": stringAttr(statusKey(status)),
+			},
+			Limit: aws.Int32(100),
+		})
+
+		for paginator.HasMorePages() {
+			out, err := paginator.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("query job ids for status %s: %w", status, err)
 			}
-			value, ok := av.(*types.AttributeValueMemberS)
-			if !ok {
-				return nil, fmt.Errorf("job_id has non-string DynamoDB attribute type")
-			}
-			if value.Value != "" {
-				seen[value.Value] = struct{}{}
+			for _, item := range out.Items {
+				av, ok := item["job_id"]
+				if !ok {
+					continue
+				}
+				value, ok := av.(*types.AttributeValueMemberS)
+				if !ok {
+					return nil, fmt.Errorf("job_id has non-string DynamoDB attribute type")
+				}
+				if value.Value != "" {
+					seen[value.Value] = struct{}{}
+				}
 			}
 		}
 	}

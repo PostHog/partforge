@@ -1753,7 +1753,7 @@ type compactFinalizationResult struct {
 
 func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWindow time.Duration, now time.Time) (compactFinalizationResult, error) {
 	result := compactFinalizationResult{ExpiredJobIDs: map[string]struct{}{}}
-	jobIDs, err := store.ListJobIDs(ctx)
+	jobIDs, err := store.ListJobIDsByStatus(ctx, state.StatusCompactReady)
 	if err != nil {
 		return result, err
 	}
