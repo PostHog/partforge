@@ -109,6 +109,24 @@ func TestArgsIncludeMergeConcurrencyRatio(t *testing.T) {
 	}
 }
 
+func TestArgsIncludeMergePoolFreeEntriesThreshold(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{MergePoolFreeEntriesThreshold: 1}}
+	got, err := cfg.args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"server",
+		"--",
+		"--merge_tree.number_of_free_entries_in_pool_to_lower_max_size_of_merge=1",
+		"--merge_tree.number_of_free_entries_in_pool_to_execute_mutation=1",
+		"--merge_tree.number_of_free_entries_in_pool_to_execute_optimize_entire_partition=1",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestArgsIncludePrometheusConfig(t *testing.T) {
 	cfg := Config{Binary: "clickhouse", Prometheus: PrometheusConfig{Enabled: true, Port: 9363, Endpoint: "/metrics"}}
 	got, err := cfg.args()

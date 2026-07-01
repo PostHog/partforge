@@ -31,9 +31,10 @@ type Config struct {
 }
 
 type Tuning struct {
-	BackgroundPoolSize    int
-	MergeConcurrencyRatio float64
-	MergeSchedulingPolicy string
+	BackgroundPoolSize            int
+	MergeConcurrencyRatio         float64
+	MergeSchedulingPolicy         string
+	MergePoolFreeEntriesThreshold uint64
 }
 
 type PrometheusConfig struct {
@@ -135,6 +136,14 @@ func (cfg Config) args() ([]string, error) {
 	mergeSchedulingPolicy := strings.TrimSpace(cfg.Tuning.MergeSchedulingPolicy)
 	if mergeSchedulingPolicy != "" {
 		configOverrides = append(configOverrides, "--background_merges_mutations_scheduling_policy="+mergeSchedulingPolicy)
+	}
+	if cfg.Tuning.MergePoolFreeEntriesThreshold > 0 {
+		threshold := strconv.FormatUint(cfg.Tuning.MergePoolFreeEntriesThreshold, 10)
+		configOverrides = append(configOverrides,
+			"--merge_tree.number_of_free_entries_in_pool_to_lower_max_size_of_merge="+threshold,
+			"--merge_tree.number_of_free_entries_in_pool_to_execute_mutation="+threshold,
+			"--merge_tree.number_of_free_entries_in_pool_to_execute_optimize_entire_partition="+threshold,
+		)
 	}
 	prometheusOverrides, err := prometheusConfigOverrides(cfg.Prometheus)
 	if err != nil {
