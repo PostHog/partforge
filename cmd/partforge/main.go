@@ -224,7 +224,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL for SHOW CREATE TABLE")
 		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		jobID                 = fs.String("job-id", "", "optional deterministic job id override")
+		jobID                 = fs.String("job-id", "", "optional job id override")
 		bucket                = fs.String("bucket", "", "S3 bucket")
 		prefix                = fs.String("prefix", "partforge", "S3 key prefix")
 		stateTable            = fs.String("state-table", defaultStateTable, "DynamoDB state table")
@@ -314,7 +314,10 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 
 	resolvedJobID := *jobID
 	if resolvedJobID == "" {
-		resolvedJobID = manifest.DeriveJobID(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect)
+		resolvedJobID, err = manifest.NewJobID()
+		if err != nil {
+			return fmt.Errorf("generate job id: %w", err)
+		}
 	}
 	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
 

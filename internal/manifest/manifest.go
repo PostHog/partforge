@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"path"
@@ -75,6 +76,14 @@ func (e Error) Error() string { return string(e) }
 
 func DeriveJobID(database, table, freeze, sourceSchema, destinationSchema, insertSelect string) string {
 	return "job-" + shortHash(database, table, freeze, sourceSchema, destinationSchema, insertSelect)
+}
+
+func NewJobID() (string, error) {
+	var bytes [8]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return "job-" + hex.EncodeToString(bytes[:]), nil
 }
 
 func DerivePartID(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect string) string {
