@@ -301,6 +301,107 @@ func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
 	}
 }
 
+func TestCompactCandidateGroupsSeparateJobs(t *testing.T) {
+	candidates := []Part{
+		compactBatchTestPart("job-a", "part-a1", StatusCompactReady),
+		compactBatchTestPart("job-b", "part-b1", StatusCompactReady),
+		compactBatchTestPart("job-a", "part-a2", StatusCompactReady),
+		compactBatchTestPart("job-b", "part-b2", StatusCompactReady),
+	}
+	compacting := []Part{
+		compactBatchTestPart("job-a", "part-a-busy", StatusCompacting),
+	}
+
+	groups := compactCandidateGroups(candidates, compacting, CompactClaimOptions{})
+	if len(groups) != 2 {
+		t.Fatalf("groups = %+v, want one group per job", groups)
+	}
+	for _, group := range groups {
+		if len(group.parts) != 2 {
+			t.Fatalf("group = %+v, want two parts for one job", group)
+		}
+		jobID := group.parts[0].JobID
+		selected := selectCompactBatchParts(group, CompactClaimOptions{MinInputParts: 2})
+		if len(selected) != 2 {
+			t.Fatalf("selected = %+v, want two parts for job %s", selected, jobID)
+		}
+		for _, part := range selected {
+			if part.JobID != jobID {
+				t.Fatalf("selected = %+v, mixed job %s into %s group", selected, part.JobID, jobID)
+			}
+		}
+		switch jobID {
+		case "job-a":
+			if len(group.compactingPartitionIDs) != 1 || group.compactingPartitionIDs[0] != "partition-a" {
+				t.Fatalf("job-a compacting partitions = %v, want partition-a", group.compactingPartitionIDs)
+			}
+		case "job-b":
+			if len(group.compactingPartitionIDs) != 0 {
+				t.Fatalf("job-b compacting partitions = %v, want none", group.compactingPartitionIDs)
+			}
+		default:
+			t.Fatalf("unexpected job group %s", jobID)
+		}
+	}
+}
+
+func TestCompactBatchFromPartsRejectsMixedJobs(t *testing.T) {
+	_, err := compactBatchFromParts([]Part{
+		compactBatchTestPart("job-a", "part-a", StatusCompacting),
+		compactBatchTestPart("job-b", "part-b", StatusCompacting),
+	})
+	if err == nil {
+		t.Fatal("expected mixed job compact batch error")
+	}
+	if !strings.Contains(err.Error(), "mixes job ids") {
+		t.Fatalf("error = %v, want mixed job ids", err)
+	}
+}
+
+func TestUpdateCompactProgressRejectsMixedJobBatch(t *testing.T) {
+	err := (&Store{}).UpdateCompactProgress(context.Background(), CompactBatch{
+		JobID: "job-a",
+		Parts: []Part{
+			compactBatchTestPart("job-a", "part-a", StatusCompacting),
+			compactBatchTestPart("job-b", "part-b", StatusCompacting),
+		},
+	}, "compact-out", "worker", PartStats{}, PartStats{}, time.Now().UTC())
+	if err == nil {
+		t.Fatal("expected mixed job compact batch error")
+	}
+	if !strings.Contains(err.Error(), "mixes job ids") {
+		t.Fatalf("error = %v, want mixed job ids", err)
+	}
+}
+
+func TestCompleteCompactionRejectsOutputFromDifferentJob(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	input := compactBatchTestPart("job-a", "part-a", StatusCompacting)
+	output := NewCompactPart(
+		"job-b",
+		"compact-out",
+		input.Bucket,
+		"finished/compact-out",
+		input.DestinationDatabase,
+		input.DestinationTable,
+		input.DestinationSchema,
+		[]string{input.PartID},
+		1,
+		PartStats{Count: 1},
+		map[string]uint64{"partition-a": 1},
+		now,
+		now,
+	)
+
+	err := (&Store{}).CompleteCompaction(context.Background(), CompactBatch{JobID: "job-a", Parts: []Part{input}}, output, "worker", now)
+	if err == nil {
+		t.Fatal("expected compact output job mismatch error")
+	}
+	if !strings.Contains(err.Error(), "does not match batch job id") {
+		t.Fatalf("error = %v, want output job mismatch", err)
+	}
+}
+
 func TestNewCompactPartSetsCompactReadyAt(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	readyAt := now.Add(-2 * time.Hour)
@@ -708,5 +809,32 @@ func TestSelectCompactBatchPartsFallsBackToAlreadyCompactingPartition(t *testing
 
 	if len(selected) != 2 || selected[0].PartID != "part-a1" || selected[1].PartID != "part-a2" {
 		t.Fatalf("selected = %+v, want busy partition-a fallback", selected)
+	}
+}
+
+func compactBatchTestPart(jobID, partID string, status Status) Part {
+	now := formatTime(time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC))
+	return Part{
+		PK:                         jobKey(jobID),
+		SK:                         partKey(partID),
+		GSI1PK:                     statusKey(status),
+		GSI1SK:                     statusSortKey(now, jobID, partID),
+		JobID:                      jobID,
+		PartID:                     partID,
+		Status:                     status,
+		Bucket:                     "bucket",
+		SourceKey:                  "source/" + partID,
+		FinishedKey:                "finished/" + partID,
+		CreatedAt:                  now,
+		UpdatedAt:                  now,
+		DestinationDatabase:        "db",
+		DestinationTable:           "table",
+		DestinationSchema:          "schema",
+		DestinationActivePartCount: 1,
+		DestinationActivePartRows:  10,
+		DestinationActivePartBytes: 100,
+		DestinationActivePartitionCounts: map[string]uint64{
+			"partition-a": 1,
+		},
 	}
 }

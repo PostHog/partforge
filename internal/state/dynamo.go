@@ -443,7 +443,12 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 		if err != nil {
 			return nil, err
 		}
-		return compactBatchFromParts(claimed), nil
+		batch, err := compactBatchFromParts(claimed)
+		if err != nil {
+			_ = s.ReleaseCompactBatch(ctx, CompactBatch{JobID: claimed[0].JobID, Parts: claimed}, workerID, now)
+			return nil, err
+		}
+		return batch, nil
 	}
 	return nil, nil
 }
@@ -585,6 +590,9 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	if strings.TrimSpace(outputPartID) == "" {
 		return errors.New("compact output part id is required")
 	}
+	if err := validateCompactBatch(batch); err != nil {
+		return err
+	}
 	for _, part := range batch.Parts {
 		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:           aws.String(s.table),
@@ -691,17 +699,20 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("worker id is required")
 	}
-	if len(batch.Parts) == 0 {
-		return errors.New("compact batch has no input parts")
-	}
 	if len(batch.Parts) > MaxCompactBatchParts {
 		return fmt.Errorf("compact batch has %d input parts, exceeds DynamoDB transaction limit", len(batch.Parts))
+	}
+	if err := validateCompactBatch(batch); err != nil {
+		return err
 	}
 	if err := validatePart(output); err != nil {
 		return err
 	}
 	if output.Status != StatusCompactReady {
 		return fmt.Errorf("compact output %s/%s is %s, expected %s", output.JobID, output.PartID, output.Status, StatusCompactReady)
+	}
+	if err := validateCompactOutputForBatch(batch, output); err != nil {
+		return err
 	}
 
 	outputItem, err := attributevalue.MarshalMap(output)
@@ -1077,6 +1088,14 @@ func partPartitionIDs(part Part) []string {
 }
 
 func (s *Store) claimCompactParts(ctx context.Context, parts []Part, workerID string, now time.Time) ([]Part, error) {
+	if err := validateCompactBatchParts(parts); err != nil {
+		return nil, err
+	}
+	for _, part := range parts {
+		if part.Status != StatusCompactReady {
+			return nil, fmt.Errorf("compact batch part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusCompactReady)
+		}
+	}
 	claimed := make([]Part, 0, len(parts))
 	for _, part := range parts {
 		out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
@@ -1116,9 +1135,12 @@ func (s *Store) claimCompactParts(ctx context.Context, parts []Part, workerID st
 	return claimed, nil
 }
 
-func compactBatchFromParts(parts []Part) *CompactBatch {
+func compactBatchFromParts(parts []Part) (*CompactBatch, error) {
 	if len(parts) == 0 {
-		return nil
+		return nil, nil
+	}
+	if err := validateCompactBatchParts(parts); err != nil {
+		return nil, err
 	}
 	batch := &CompactBatch{
 		JobID: parts[0].JobID,
@@ -1132,7 +1154,75 @@ func compactBatchFromParts(parts []Part) *CompactBatch {
 			batch.Generation = part.CompactGeneration + 1
 		}
 	}
-	return batch
+	return batch, nil
+}
+
+func validateCompactBatch(batch CompactBatch) error {
+	if err := validateCompactBatchParts(batch.Parts); err != nil {
+		return err
+	}
+	if strings.TrimSpace(batch.JobID) == "" {
+		return errors.New("compact batch job id is required")
+	}
+	if batch.JobID != batch.Parts[0].JobID {
+		return fmt.Errorf("compact batch job id %q does not match input job id %q", batch.JobID, batch.Parts[0].JobID)
+	}
+	return nil
+}
+
+func validateCompactBatchParts(parts []Part) error {
+	if len(parts) == 0 {
+		return errors.New("compact batch has no input parts")
+	}
+	first := parts[0]
+	if err := validateCompactBatchPart(first); err != nil {
+		return err
+	}
+	for _, part := range parts[1:] {
+		if err := validateCompactBatchPart(part); err != nil {
+			return err
+		}
+		if part.JobID != first.JobID {
+			return fmt.Errorf("compact batch mixes job ids %q and %q", first.JobID, part.JobID)
+		}
+		if part.Bucket != first.Bucket {
+			return fmt.Errorf("compact batch for job %s mixes buckets %q and %q", first.JobID, first.Bucket, part.Bucket)
+		}
+		if part.DestinationDatabase != first.DestinationDatabase ||
+			part.DestinationTable != first.DestinationTable ||
+			part.DestinationSchema != first.DestinationSchema {
+			return fmt.Errorf("compact batch for job %s mixes destinations", first.JobID)
+		}
+	}
+	return nil
+}
+
+func validateCompactBatchPart(part Part) error {
+	if err := validatePart(part); err != nil {
+		return err
+	}
+	if strings.TrimSpace(part.DestinationDatabase) == "" ||
+		strings.TrimSpace(part.DestinationTable) == "" ||
+		strings.TrimSpace(part.DestinationSchema) == "" {
+		return fmt.Errorf("compact batch part %s/%s is missing destination database, table, or schema", part.JobID, part.PartID)
+	}
+	return nil
+}
+
+func validateCompactOutputForBatch(batch CompactBatch, output Part) error {
+	input := batch.Parts[0]
+	if output.JobID != batch.JobID {
+		return fmt.Errorf("compact output job id %q does not match batch job id %q", output.JobID, batch.JobID)
+	}
+	if output.Bucket != input.Bucket {
+		return fmt.Errorf("compact output %s/%s bucket %q does not match input bucket %q", output.JobID, output.PartID, output.Bucket, input.Bucket)
+	}
+	if output.DestinationDatabase != input.DestinationDatabase ||
+		output.DestinationTable != input.DestinationTable ||
+		output.DestinationSchema != input.DestinationSchema {
+		return fmt.Errorf("compact output %s/%s destination does not match batch destination", output.JobID, output.PartID)
+	}
+	return nil
 }
 
 func (s *Store) MarkFinished(ctx context.Context, part Part, workerID, finishedKey string, now time.Time) error {
