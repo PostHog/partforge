@@ -6,7 +6,7 @@ PartForge rewrites a large ClickHouse table into a new schema without loading th
 
 - **Off-cluster** — the heavy `INSERT ... SELECT` runs in throwaway worker containers, each with its own local ClickHouse; the production cluster only does a cheap `FREEZE` up front and `ATTACH PART` at the end.
 - **Parallel and horizontally scalable** — each part is an independent unit of work; add workers to go faster.
-- **Resumable** — every part's state lives in DynamoDB, so an interrupted job picks up where it left off and failed parts can be retried.
+- **Resumable** — every part's state lives in Postgres, so an interrupted job picks up where it left off and failed parts can be retried.
 
 ## When to use it
 
@@ -22,7 +22,7 @@ Use it for row-local schema changes on tables too large to rewrite in place — 
 
 ## How it works
 
-Four stages. State moves through DynamoDB; part data moves through S3 (via `s5cmd`).
+Four stages. State moves through Postgres; part data moves through S3 (via `s5cmd`).
 
 ```
 FREEZE (you)           upload-freeze         worker                    import-finished
@@ -101,11 +101,11 @@ docker run --rm ghcr.io/posthog/partforge:latest worker
 partforge import-finished -database=dst_db -table=events_new -job-id=<job-id>
 ```
 
-`upload-freeze` prints the `job-id`; `-job-name` is optional and is shown by `list-jobs`. For LocalStack add `-s3-endpoint=http://localhost:4566 -dynamodb-endpoint=http://localhost:4566` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
+`upload-freeze` prints the `job-id`; `-job-name` is optional and is shown by `list-jobs`. For local compose add `-s3-endpoint=http://localhost:4566 -postgres-url='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable'` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
 
 For multiple shards with the same destination schema and insert-select, run the first `upload-freeze` with the SQL files and later shards with `-copy-sql-from-job=<first-job-id>`.
 
-Part state lifecycle (tracked in DynamoDB, so a job is resumable):
+Part state lifecycle (tracked in Postgres, so a job is resumable):
 
 ```
 READY -> IN_PROGRESS -> COMPACT_READY <-> COMPACTING -> FINISHED -> IMPORTING -> IMPORTED
@@ -115,7 +115,7 @@ READY -> IN_PROGRESS -> COMPACT_READY <-> COMPACTING -> FINISHED -> IMPORTING ->
 ## Documentation
 
 - [docs/setup.md](docs/setup.md) — requirements, configuration, and running the four stages by hand
-- [docs/dynamodb.md](docs/dynamodb.md) — the DynamoDB state table: schema, creation, and IAM
+- [docs/postgres.md](docs/postgres.md) — the Postgres state store: schema, connection, and IAM auth
 - [docs/deployment.md](docs/deployment.md) — running workers on ECS with IAM roles, and scaling
 - [docs/operations.md](docs/operations.md) — worker flags, metrics, and admin/recovery commands
 - [docs/development.md](docs/development.md) — building, testing, and project layout

@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="$ROOT/.e2e/clickhouse-data"
-STATE_TABLE="partforge"
 CH_HTTP_HOST="http://127.0.0.1:18123"
 CH_HTTP_DOCKER="http://clickhouse:8123"
+POSTGRES_URL="postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable"
 JOB_ID="e2e-job"
 JOB_NAME="E2E import"
 
@@ -116,7 +116,7 @@ docker compose down --remove-orphans >/dev/null 2>&1 || true
 if [[ "${PARTFORGE_E2E_SKIP_BUILD:-}" != "1" ]]; then
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose build worker
 fi
-CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose up -d localstack clickhouse
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose up -d localstack postgres clickhouse
 
 for _ in $(seq 1 60); do
   if curl -fsS "$CH_HTTP_HOST/?query=SELECT%201" >/dev/null 2>&1; then
@@ -127,25 +127,20 @@ done
 curl -fsS "$CH_HTTP_HOST/?query=SELECT%201" >/dev/null
 
 for _ in $(seq 1 60); do
-  if docker compose exec -T localstack awslocal dynamodb list-tables >/dev/null 2>&1; then
+  if docker compose exec -T localstack awslocal s3 ls >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 docker compose exec -T localstack awslocal s3 mb s3://partforge >/dev/null 2>&1 || true
-docker compose exec -T localstack awslocal dynamodb create-table \
-  --table-name "$STATE_TABLE" \
-  --attribute-definitions \
-    AttributeName=pk,AttributeType=S \
-    AttributeName=sk,AttributeType=S \
-    AttributeName=gsi1pk,AttributeType=S \
-    AttributeName=gsi1sk,AttributeType=S \
-  --key-schema \
-    AttributeName=pk,KeyType=HASH \
-    AttributeName=sk,KeyType=RANGE \
-  --global-secondary-indexes \
-    '[{"IndexName":"gsi1","KeySchema":[{"AttributeName":"gsi1pk","KeyType":"HASH"},{"AttributeName":"gsi1sk","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]' \
-  --billing-mode PAY_PER_REQUEST >/dev/null 2>&1 || true
+
+for _ in $(seq 1 60); do
+  if docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null
 
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 
@@ -179,12 +174,12 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -job-id="$JOB_ID" \
   -job-name="$JOB_NAME" \
   -s3-endpoint=http://localstack:4566 \
-  -dynamodb-endpoint=http://localstack:4566
+  -postgres-url="$POSTGRES_URL"
 
 job_list="$(
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     list-jobs \
-    -dynamodb-endpoint=http://localstack:4566
+    -postgres-url="$POSTGRES_URL"
 )"
 if ! grep -F "E2E import" <<<"$job_list" >/dev/null; then
   echo "list-jobs did not include job name; output:" >&2
@@ -198,7 +193,7 @@ for i in $(seq 1 "$part_count"); do
     worker \
     -role=inserter \
     -s3-endpoint=http://localstack:4566 \
-    -dynamodb-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
 done
@@ -209,7 +204,7 @@ for i in $(seq 1 6); do
     worker \
     -role=compactor \
     -s3-endpoint=http://localstack:4566 \
-    -dynamodb-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL" \
     -compact-window=0s \
     -compact-optimize-final-after=1s \
     -once 2>&1 | tee "$compact_log"
@@ -218,7 +213,7 @@ for i in $(seq 1 6); do
     CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
       job-status \
       -job-id="$JOB_ID" \
-      -dynamodb-endpoint=http://localstack:4566 |
+      -postgres-url="$POSTGRES_URL" |
       sed -n 's/^status: //p'
   )"
   if [[ "$status" == "READY_FOR_IMPORT" ]]; then
@@ -248,7 +243,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -job-id="$JOB_ID" \
   -clickhouse-url="$CH_HTTP_DOCKER" \
   -s3-endpoint=http://localstack:4566 \
-  -dynamodb-endpoint=http://localstack:4566
+  -postgres-url="$POSTGRES_URL"
 
 docker compose exec -T clickhouse clickhouse-client --query \
   "SELECT id, name, amount_text, event_date, migrated FROM dst.events_new ORDER BY id FORMAT TSV" \
@@ -261,6 +256,6 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   -job-id="$JOB_ID" \
   -delete-s3 \
   -s3-endpoint=http://localstack:4566 \
-  -dynamodb-endpoint=http://localstack:4566
+  -postgres-url="$POSTGRES_URL"
 
 echo "e2e passed with $part_count frozen parts"

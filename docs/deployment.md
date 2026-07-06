@@ -6,15 +6,15 @@ The image is a single Ubuntu container with `clickhouse-server`, `clickhouse-cli
 
 ## Recommended: workers on ECS with an IAM task role
 
-Run the workers as an ECS service and give the task an **IAM role** scoped to the S3 bucket and the DynamoDB table. This is the recommended setup:
+Run the workers as an ECS service and give the task an **IAM role** scoped to the S3 bucket and the RDS/Aurora PostgreSQL database user. This is the recommended setup:
 
 - **No static credentials.** The AWS SDK picks up temporary credentials from the ECS task role via the container credentials endpoint. Do not bake access keys into the image or config.
-- **Region resolves from the environment.** Set `AWS_REGION` (or `-aws-region`); otherwise it falls back through AWS config, IMDS, then `us-east-1`.
-- **Scale by replicas.** More worker tasks = more parts in flight. There is no coordinator to scale — workers claim independently from DynamoDB.
+- **Region resolves from the environment.** Set `AWS_REGION` or pass `-aws-region` when `-postgres-iam-auth` is enabled.
+- **Scale by replicas.** More worker tasks = more parts in flight. There is no coordinator to scale; workers claim independently from Postgres.
 
 ### Task IAM policy
 
-Combine the S3 and DynamoDB permissions. DynamoDB detail (including tighter per-role variants) is in [dynamodb.md](dynamodb.md).
+Combine the S3 permissions with `rds-db:connect` for the Postgres database user. Database setup details are in [postgres.md](postgres.md).
 
 ```json
 {
@@ -22,18 +22,8 @@ Combine the S3 and DynamoDB permissions. DynamoDB detail (including tighter per-
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": [
-        "dynamodb:Query",
-        "dynamodb:Scan",
-        "dynamodb:PutItem",
-        "dynamodb:UpdateItem",
-        "dynamodb:DeleteItem",
-        "dynamodb:TransactWriteItems"
-      ],
-      "Resource": [
-        "arn:aws:dynamodb:us-east-1:123456789012:table/partforge",
-        "arn:aws:dynamodb:us-east-1:123456789012:table/partforge/index/*"
-      ]
+      "Action": "rds-db:connect",
+      "Resource": "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOP/partforge"
     },
     {
       "Effect": "Allow",
@@ -77,4 +67,4 @@ See [operations.md](operations.md) for the full flag set and metrics.
 - **`upload-freeze`** must run where it can read the source ClickHouse data disks reported by `system.disks`.
 - **`import-finished`** must run where its work-dir shares a filesystem with the destination table's `detached` directory (parts are moved, not copied).
 
-Both still need the same S3 + DynamoDB access as the workers.
+Both still need the same S3 and Postgres access as the workers.

@@ -29,12 +29,12 @@ Core metrics:
 
 Read/write counters update live while the `INSERT SELECT` runs, polled from the local ClickHouse `system.processes` for the rewrite query id. Active-part gauges come from `system.parts` while those parts are attached.
 
-Workers also write a per-part progress heartbeat to DynamoDB every `15s` (`-state-progress-interval`, `0` disables) so `job-status` reflects progress even during S3 transfer stages.
+Workers also write a per-part progress heartbeat to Postgres every `15s` (`-state-progress-interval`, `0` disables) so `job-status` reflects progress even during S3 transfer stages.
 
 ## Inspecting jobs
 
 ```sh
-partforge list-jobs                 # jobs with status, part counts, submitted/updated timestamps, optional names (uses the gsi1 index)
+partforge list-jobs                 # jobs with status, part counts, submitted/updated timestamps, optional names
 partforge job-status -job-id=job-123
 ```
 
@@ -52,8 +52,8 @@ All take `-job-id`. Most use conditional updates and take `-force` where a guard
 | `reset-compact-timer` | Restart the job's compact-window timer (sets `compact_ready_at` to now on every row). |
 | `reset-job` | Delete generated compact rows and move originals back to `READY` (full re-rewrite). `-delete-s3` also removes generated + rewritten artifacts (keeps uploaded `source/`). |
 | `reset-compaction` | Delete generated compact rows and move rewritten originals back to `COMPACT_READY` (re-compact only). `-delete-s3` removes generated compact artifacts. |
-| `delete-parts` | Force-delete selected DynamoDB rows only — never touches S3 or already-attached data. |
-| `delete-job` | Delete a job's DynamoDB rows; `-delete-s3` also deletes `s3://bucket/<prefix>/jobs/<job-id>/*`. |
+| `delete-parts` | Force-delete selected Postgres state rows only — never touches S3 or already-attached data. |
+| `delete-job` | Delete a job's Postgres state rows; `-delete-s3` also deletes `s3://bucket/<prefix>/jobs/<job-id>/*`. |
 | `version` | Print the build version. |
 
 Notes:

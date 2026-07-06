@@ -4,27 +4,27 @@ Requirements, configuration, and how to run the four stages by hand. For the hig
 
 ## Requirements
 
-- **Go 1.24+** — to build the CLI (`go build -o partforge ./cmd/partforge`).
+- **Go 1.25+** — to build the CLI (`go build -o partforge ./cmd/partforge`).
 - **Docker + Docker Compose** — to build/run the worker image and the local stack.
 - **`s5cmd`** on `PATH` for any command that moves S3 data as a local binary (`-s5cmd-binary` to override). The worker image bundles it.
-- **A DynamoDB table** with a `gsi1` GSI and an **S3 bucket** — see [dynamodb.md](dynamodb.md). LocalStack provides both for local runs.
+- **A Postgres database** for state and an **S3 bucket** for artifacts — see [postgres.md](postgres.md). Local compose provides both for local runs.
 - **ClickHouse** — a source to freeze from and a destination to import into. The worker brings its own ClickHouse (default server version `26.3.10.60`, baked into the image).
 
-## Local stack (LocalStack)
+## Local stack
 
 ```sh
-docker compose up -d localstack
+docker compose up -d localstack postgres
 ```
 
-This creates the `partforge` S3 bucket and DynamoDB table (via `localstack/init/`). Point commands at it with:
+This creates the `partforge` S3 bucket in LocalStack and starts a local Postgres database. Point commands at them with:
 
 ```
 -s3-endpoint=http://localhost:4566
--dynamodb-endpoint=http://localhost:4566
--state-table=partforge
+-postgres-url='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable'
+-state-table=partforge_state
 ```
 
-Against real AWS you omit the two endpoint flags; the SDK resolves the region and credentials from the environment.
+Against real AWS S3 you omit `-s3-endpoint`. For RDS/Aurora PostgreSQL with IAM auth, use `-postgres-iam-auth` and a passwordless `-postgres-url`; the SDK resolves credentials from the environment.
 
 ## Configuration
 
@@ -33,8 +33,9 @@ Every command reads defaults from `/etc/partforge/config.json` when it exists; o
 ```json
 {
   "s3_endpoint": "http://localhost:4566",
-  "dynamodb_endpoint": "http://localhost:4566",
-  "state_table": "partforge",
+  "postgres_url": "postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable",
+  "postgres_iam_auth": false,
+  "state_table": "partforge_state",
   "bucket": "partforge",
   "prefix": "partforge",
   "s5cmd_binary": "s5cmd",
@@ -52,7 +53,7 @@ Every command reads defaults from `/etc/partforge/config.json` when it exists; o
 
 Resolution order for the two settings that aren't plain flags:
 
-- **DynamoDB region:** `-aws-region` → JSON config → AWS env/shared config → EC2 IMDS → `us-east-1`.
+- **Postgres IAM region:** `-aws-region` → JSON config → AWS env/shared config → `us-east-1`. Used only when `-postgres-iam-auth` is set.
 - **ClickHouse connection:** CLI flags → JSON config → `/etc/clickhouse-client/config.xml` → built-in defaults.
 
 ## Running a migration by hand
@@ -136,7 +137,7 @@ partforge upload-freeze \
   -bucket=partforge \
   -job-name="events migration 001" \
   -s3-endpoint=http://localhost:4566 \
-  -dynamodb-endpoint=http://localhost:4566
+  -postgres-url='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable'
 ```
 
 It prints a generated `job-id` (or pass `-job-id` to set one). `-job-name` is optional and is shown by `list-jobs`. S3-backed ClickHouse disks are rejected — only local disks are handled. It uploads parts concurrently (`-upload-concurrency`, default = detected CPU count) and auto-sizes `s5cmd`'s worker pool per process (`-s5cmd-numworkers`).
@@ -154,10 +155,10 @@ docker run --rm \
   ghcr.io/<owner>/partforge:latest \
   worker \
   -s3-endpoint=http://localstack:4566 \
-  -dynamodb-endpoint=http://localstack:4566
+  -postgres-url='postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable'
 ```
 
-Against LocalStack, `docker compose up worker` runs the same image wired to the compose network. Run as many workers as you like. See [operations.md](operations.md) for the worker flags (`-role`, `-work-dir`, compaction limits) and metrics, and [deployment.md](deployment.md) for running them on ECS.
+Against the local compose stack, `docker compose up worker` runs the same image wired to S3 and Postgres on the compose network. Run as many workers as you like. See [operations.md](operations.md) for the worker flags (`-role`, `-work-dir`, compaction limits) and metrics, and [deployment.md](deployment.md) for running them on ECS.
 
 ### 5. import-finished
 
@@ -170,7 +171,7 @@ partforge import-finished \
   -job-id=<job-id> \
   -clickhouse-url=http://destination:8123 \
   -s3-endpoint=http://localhost:4566 \
-  -dynamodb-endpoint=http://localhost:4566
+  -postgres-url='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable'
 ```
 
 Notes:

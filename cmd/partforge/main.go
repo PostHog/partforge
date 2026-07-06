@@ -40,7 +40,7 @@ import (
 )
 
 const defaultClickHouseURL = "http://127.0.0.1:8123"
-const defaultStateTable = "partforge"
+const defaultStateTable = "partforge_state"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 const defaultClickHousePrometheusPort = 9363
@@ -196,10 +196,10 @@ func usage() {
   partforge delete-job      [flags]
 
 Commands:
-  upload-freeze     Upload frozen source part directories to S3 and register DynamoDB work.
-  worker            Claim DynamoDB work, rewrite source parts with local ClickHouse, and upload finished artifacts.
+  upload-freeze     Upload frozen source part directories to S3 and register Postgres work.
+  worker            Claim Postgres work, rewrite source parts with local ClickHouse, and upload finished artifacts.
   import-finished   Attach finished artifacts into the final ClickHouse table with safe part renames.
-  list-jobs         List job IDs found in the DynamoDB state table.
+  list-jobs         List job IDs found in the Postgres state table.
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
   set-part-state    Force selected part rows into a stable state for admin recovery.
@@ -207,8 +207,8 @@ Commands:
   reset-compact-timer Restart selected compact rows' compact-window timer.
   reset-job         Delete generated compact rows and move original job parts back to READY.
   reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
-  delete-parts      Force delete selected DynamoDB part rows from one job.
-  delete-job        Delete one job's DynamoDB state rows, optionally including S3 artifacts.
+  delete-parts      Force delete selected Postgres part rows from one job.
+  delete-job        Delete one job's Postgres state rows, optionally including S3 artifacts.
   version           Print the build version.
 `)
 }
@@ -230,13 +230,14 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		jobName               = fs.String("job-name", "", "optional readable job name")
 		bucket                = fs.String("bucket", "", "S3 bucket")
 		prefix                = fs.String("prefix", "partforge", "S3 key prefix")
-		stateTable            = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region                = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		stateTable            = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region                = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
 		s3Endpoint            = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
 		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
 		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers per upload process; <=0 auto-scales from upload-concurrency")
 		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source parts to upload concurrently; <=0 uses detected CPU count")
-		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		postgresURL           = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth       = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -275,16 +276,17 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		if stateStore != nil {
 			return stateStore, nil
 		}
-		slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+		slog.Info("initializing Postgres state store", "stage", "init_state", "state_table", *stateTable)
 		store, err := state.New(ctx, state.Config{
 			Region:   *region,
-			Endpoint: *dynamoEndpoint,
+			Endpoint: *postgresURL,
+			IAMAuth:  *postgresIAMAuth,
 			Table:    *stateTable,
 		})
 		if err != nil {
 			return nil, err
 		}
-		slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+		slog.Info("initialized Postgres state store", "stage", "init_state", "state_table", *stateTable)
 		stateStore = store
 		return stateStore, nil
 	}
@@ -811,11 +813,12 @@ func runWorker(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	var (
 		configPath                = fs.String("config", defaultConfigPath, "JSON config file path")
-		region                    = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		region                    = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
 		s3Endpoint                = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
 		s5cmdBinary               = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		stateTable                = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		dynamoEndpoint            = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		stateTable                = fs.String("state-table", defaultStateTable, "Postgres state table")
+		postgresURL               = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth           = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
 		clickHouseURL             = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
 		clickHouseUser            = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword        = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
@@ -839,7 +842,7 @@ func runWorker(ctx context.Context, args []string) error {
 		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "local ClickHouse native Prometheus metrics port")
 		clickHousePrometheusPath  = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "local ClickHouse native Prometheus metrics HTTP path")
 		clickHouseScrapeTimeout   = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local ClickHouse native Prometheus metrics")
-		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
+		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to Postgres; <=0 disables progress writes")
 	)
 	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
 	fs.Duration("compact-merge-max-runtime", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
@@ -914,16 +917,17 @@ func runWorker(ctx context.Context, args []string) error {
 		"insert_enabled", roleSettings.Insert,
 		"compact_enabled", roleSettings.Compact,
 	)
-	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initializing Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
 		return err
 	}
-	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initialized Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	resolvedWorkerID, err := resolveWorkerID(*workerID)
 	if err != nil {
 		return err
@@ -2056,11 +2060,12 @@ func runImportFinished(ctx context.Context, args []string) error {
 		table              = fs.String("table", "", "final destination table")
 		jobID              = fs.String("job-id", "", "job id to import")
 		partID             = fs.String("part-id", "", "optional finished part id to import")
-		stateTable         = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region             = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		stateTable         = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region             = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
 		s3Endpoint         = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
 		s5cmdBinary        = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		dynamoEndpoint     = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		postgresURL        = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth    = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
 		clickHouseURL      = fs.String("clickhouse-url", defaultClickHouseURL, "destination ClickHouse HTTP URL")
 		clickHouseUser     = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
@@ -2089,16 +2094,17 @@ func runImportFinished(ctx context.Context, args []string) error {
 		"work_dir", *workDir,
 		"require_empty", *requireEmpty,
 	)
-	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initializing Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
 		return err
 	}
-	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initialized Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	slog.Info("listing finished parts", "stage", "list_finished_parts", "job_id", *jobID)
 	finishedParts, err := stateStore.ListFinishedParts(ctx, *jobID)
 	if err != nil {
@@ -2159,11 +2165,12 @@ func runImportFinished(ctx context.Context, args []string) error {
 func runListJobs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list-jobs", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2173,7 +2180,8 @@ func runListJobs(ctx context.Context, args []string) error {
 	}
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2267,16 +2275,17 @@ func formatListJobProgress(done, total int) string {
 func runJobStatus(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("job-status", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id to inspect")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		compactWindow  = fs.Duration("compact-window", defaultCompactWindow, "worker compact window used to report compact finalization ETA")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
-		showParts      = fs.Bool("parts", false, "include per-part state rows")
-		showDetails    = fs.Bool("details", false, "include per-part rewrite stage timing details")
-		showAllParts   = fs.Bool("all", false, "include superseded parts in per-part output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id to inspect")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		compactWindow   = fs.Duration("compact-window", defaultCompactWindow, "worker compact window used to report compact finalization ETA")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		showParts       = fs.Bool("parts", false, "include per-part state rows")
+		showDetails     = fs.Bool("details", false, "include per-part rewrite stage timing details")
+		showAllParts    = fs.Bool("all", false, "include superseded parts in per-part output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2293,7 +2302,8 @@ func runJobStatus(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2363,9 +2373,10 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		staleAfter        = fs.Duration("stale-after", defaultRetryStaleAfter, "minimum age of progress_updated_at for -stale")
 		includeInProgress = fs.Bool("include-in-progress", false, "also retry IN_PROGRESS parts by returning them to READY")
 		force             = fs.Bool("force", false, "retry selected parts regardless of current state")
-		stateTable        = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region            = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint    = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		stateTable        = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region            = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL       = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth   = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
 		jsonOutput        = fs.Bool("json", false, "print JSON output")
 	)
 	if err := parseFlags(fs, args); err != nil {
@@ -2402,7 +2413,8 @@ func runRetryFailed(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2469,16 +2481,17 @@ func runResetJob(ctx context.Context, args []string) error {
 func runSetPartState(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("set-part-state", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id containing parts to update")
-		partIDs        partIDListFlag
-		status         = fs.String("status", "", "update parts currently in this exact state, e.g. COMPACTING")
-		toStatus       = fs.String("to-status", "", "target stable state: READY, COMPACT_READY, or FINISHED")
-		force          = fs.Bool("force", false, "required to update selected part rows")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id containing parts to update")
+		partIDs         partIDListFlag
+		status          = fs.String("status", "", "update parts currently in this exact state, e.g. COMPACTING")
+		toStatus        = fs.String("to-status", "", "target stable state: READY, COMPACT_READY, or FINISHED")
+		force           = fs.Bool("force", false, "required to update selected part rows")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	fs.Var(&partIDs, "part-id", "specific part id to update; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2513,7 +2526,8 @@ func runSetPartState(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2563,16 +2577,17 @@ func runSetPartState(ctx context.Context, args []string) error {
 func runFinalizeCompaction(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("finalize-compaction", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id containing compacting parts")
-		partIDs        partIDListFlag
-		outputPartID   = fs.String("output-part-id", "", "compact output part id from worker logs or compact progress")
-		all            = fs.Bool("all", false, "request finalization for all COMPACTING rows in the job")
-		force          = fs.Bool("force", false, "required to request compaction finalization")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id containing compacting parts")
+		partIDs         partIDListFlag
+		outputPartID    = fs.String("output-part-id", "", "compact output part id from worker logs or compact progress")
+		all             = fs.Bool("all", false, "request finalization for all COMPACTING rows in the job")
+		force           = fs.Bool("force", false, "required to request compaction finalization")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	fs.Var(&partIDs, "part-id", "specific COMPACTING state part id to finalize; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2603,7 +2618,8 @@ func runFinalizeCompaction(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2655,13 +2671,14 @@ func runFinalizeCompaction(ctx context.Context, args []string) error {
 func runResetCompactTimer(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("reset-compact-timer", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id whose compact timer should be reset")
-		force          = fs.Bool("force", false, "required to reset compact timer")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id whose compact timer should be reset")
+		force           = fs.Bool("force", false, "required to reset compact timer")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2678,7 +2695,8 @@ func runResetCompactTimer(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2718,16 +2736,17 @@ func runResetCompaction(ctx context.Context, args []string) error {
 func runResetState(ctx context.Context, args []string, mode resetMode) error {
 	fs := flag.NewFlagSet(string(mode), flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id to reset")
-		force          = fs.Bool("force", false, "required to reset selected job state")
-		deleteS3       = fs.Bool("delete-s3", false, "also delete reset artifact S3 prefixes")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		s3Endpoint     = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary    = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id to reset")
+		force           = fs.Bool("force", false, "required to reset selected job state")
+		deleteS3        = fs.Bool("delete-s3", false, "also delete reset artifact S3 prefixes")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		s3Endpoint      = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2744,7 +2763,8 @@ func runResetState(ctx context.Context, args []string, mode resetMode) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2812,16 +2832,17 @@ func runResetState(ctx context.Context, args []string, mode resetMode) error {
 func runDeleteParts(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("delete-parts", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id containing parts to delete")
-		partIDs        partIDListFlag
-		status         = fs.String("status", "", "delete parts in this exact state, e.g. IMPORTED")
-		all            = fs.Bool("all", false, "delete every part row in the job")
-		force          = fs.Bool("force", false, "required to delete selected part rows")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id containing parts to delete")
+		partIDs         partIDListFlag
+		status          = fs.String("status", "", "delete parts in this exact state, e.g. IMPORTED")
+		all             = fs.Bool("all", false, "delete every part row in the job")
+		force           = fs.Bool("force", false, "required to delete selected part rows")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	fs.Var(&partIDs, "part-id", "specific part id to delete; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2852,7 +2873,8 @@ func runDeleteParts(ctx context.Context, args []string) error {
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
@@ -2899,15 +2921,16 @@ func runDeleteParts(ctx context.Context, args []string) error {
 func runDeleteJob(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("delete-job", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id to delete")
-		deleteS3       = fs.Bool("delete-s3", false, "also delete this job's S3 artifacts")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		s3Endpoint     = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary    = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID           = fs.String("job-id", "", "job id to delete")
+		deleteS3        = fs.Bool("delete-s3", false, "also delete this job's S3 artifacts")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		s3Endpoint      = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print JSON output")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2920,16 +2943,17 @@ func runDeleteJob(ctx context.Context, args []string) error {
 	}
 
 	slog.Info("delete-job started", "stage", "start", "job_id", *jobID, "delete_s3", *deleteS3)
-	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initializing Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
-		Endpoint: *dynamoEndpoint,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
 		Table:    *stateTable,
 	})
 	if err != nil {
 		return err
 	}
-	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("initialized Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	slog.Info("listing job parts", "stage", "list_job_parts", "job_id", *jobID)
 	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
 	if err != nil {

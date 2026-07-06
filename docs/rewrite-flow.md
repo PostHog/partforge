@@ -12,12 +12,12 @@ graph TD
     B --> C[Scan frozen part directories]
     C --> D[Write manifest.json into each source part]
     D --> E[Upload raw source part prefixes to S3]
-    D --> F[Create DynamoDB READY records]
+    D --> F[Create Postgres READY rows]
     E --> G[worker claims READY part]
     F --> G
     G --> H[Rewrite part in local ClickHouse]
     H --> I[Upload finished destination part tarballs to S3]
-    I --> J[Mark DynamoDB record COMPACT_READY]
+    I --> J[Mark Postgres row COMPACT_READY]
     J --> K{Worker compaction available?}
     K -- Yes --> L[Attach multiple finished artifacts locally]
     L --> M[Let ClickHouse merge compacted destination parts]
@@ -28,11 +28,11 @@ graph TD
     K -- No --> R[Finalize COMPACT_READY artifacts past compact window]
     P --> K
     Q --> K
-    R --> S[Mark DynamoDB records FINISHED]
+    R --> S[Mark Postgres rows FINISHED]
     S --> T[import-finished downloads finished artifacts]
     T --> U[Move parts into final table detached directory]
     U --> V[ALTER TABLE ... ATTACH PART]
-    V --> W[Mark DynamoDB record IMPORTED]
+    V --> W[Mark Postgres row IMPORTED]
 ```
 
 ## Worker Part Flow

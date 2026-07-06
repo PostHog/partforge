@@ -3,12 +3,12 @@
 ARG S5CMD_VERSION=v2.3.0
 FROM --platform=$TARGETPLATFORM peakcom/s5cmd:${S5CMD_VERSION} AS s5cmd
 
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS go-deps
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS go-deps
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
 
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
 WORKDIR /src
 ARG TARGETOS
 ARG TARGETARCH

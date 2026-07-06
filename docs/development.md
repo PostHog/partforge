@@ -14,7 +14,7 @@ go test ./...
 
 `AGENTS.md` lists `go mod tidy && go test ./... && ./e2e/run.sh` as the required pre-commit check.
 
-The e2e script stands up LocalStack + a ClickHouse container, builds the worker image, and runs the full pipeline against `e2e/sql/`, diffing the result against `e2e/expected.tsv`. It builds the image each run; set `PARTFORGE_E2E_SKIP_BUILD=1` to reuse an existing `partforge-worker:latest`.
+The e2e script stands up LocalStack, Postgres, and a ClickHouse container, builds the worker image, and runs the full pipeline against `e2e/sql/`, diffing the result against `e2e/expected.tsv`. It builds the image each run; set `PARTFORGE_E2E_SKIP_BUILD=1` to reuse an existing `partforge-worker:latest`.
 
 ## Build
 
@@ -32,7 +32,7 @@ internal/
   manifest/        per-part manifest.json; job/part ID derivation
   artifact/        write manifests; build/extract part tarballs
   s3copy/          s5cmd wrapper for directory/glob transfers
-  state/           DynamoDB state store — claims, transitions, compaction batches, admin ops
+  state/           Postgres state store — claims, transitions, compaction batches, admin ops
   chproc/          start/stop the local clickhouse-server child process
   chhttp/          ClickHouse HTTP client
   ddl/             CREATE TABLE normalization (Replicated* -> plain MergeTree)

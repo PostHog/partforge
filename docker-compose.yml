@@ -7,11 +7,20 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
-      SERVICES: s3,dynamodb
+      SERVICES: s3
     ports:
       - "4566:4566"
     volumes:
       - "./localstack/init:/etc/localstack/init/ready.d:ro"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: partforge
+      POSTGRES_PASSWORD: partforge
+      POSTGRES_DB: partforge
+    ports:
+      - "15432:5432"
 
   clickhouse:
     image: clickhouse/clickhouse-server:26.3.10.60
@@ -26,6 +35,7 @@ services:
     build: .
     depends_on:
       - localstack
+      - postgres
     ports:
       - "2112:2112"
     environment:
@@ -35,4 +45,4 @@ services:
     command:
       - worker
       - -s3-endpoint=http://localstack:4566
-      - -dynamodb-endpoint=http://localstack:4566
+      - -postgres-url=postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable
