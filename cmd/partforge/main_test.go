@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,9 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PostHog/partforge/internal/artifact"
 	"github.com/PostHog/partforge/internal/freeze"
+	"github.com/PostHog/partforge/internal/manifest"
 	"github.com/PostHog/partforge/internal/metrics"
 	"github.com/PostHog/partforge/internal/rewrite"
+	"github.com/PostHog/partforge/internal/s3copy"
 	"github.com/PostHog/partforge/internal/state"
 )
 
@@ -1715,6 +1719,82 @@ func TestUploadPartsInParallelCancelsOnError(t *testing.T) {
 	}
 }
 
+func TestValidateUploadFreezeSQLInputs(t *testing.T) {
+	for _, tt := range []struct {
+		name                  string
+		destinationSchemaFile string
+		insertSelectFile      string
+		copySQLFromJob        string
+		wantErr               string
+	}{
+		{name: "files", destinationSchemaFile: "dest.sql", insertSelectFile: "insert.sql"},
+		{name: "copy", copySQLFromJob: "job-1"},
+		{name: "missing insert", destinationSchemaFile: "dest.sql", wantErr: "destination-schema-file and insert-select-file"},
+		{name: "mixed", destinationSchemaFile: "dest.sql", insertSelectFile: "insert.sql", copySQLFromJob: "job-1", wantErr: "copy-sql-from-job cannot be used"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUploadFreezeSQLInputs(tt.destinationSchemaFile, tt.insertSelectFile, tt.copySQLFromJob)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestFirstOriginalSourcePartSkipsGeneratedCompactParts(t *testing.T) {
+	got, ok := firstOriginalSourcePart([]state.Part{
+		{PartID: "compact-1", CompactGeneration: 1},
+		{PartID: "part-1", SourceKey: "source/part-1"},
+	})
+	if !ok {
+		t.Fatal("expected original part")
+	}
+	if got.PartID != "part-1" {
+		t.Fatalf("part = %q, want part-1", got.PartID)
+	}
+}
+
+func TestReadSQLBundleFromSourceManifest(t *testing.T) {
+	sourceDir := t.TempDir()
+	want := manifest.SQLBundle{
+		SourceSchema:      "CREATE TABLE src.events (id UInt64) ENGINE = MergeTree ORDER BY id",
+		DestinationSchema: "CREATE TABLE dst.events (id UInt64) ENGINE = MergeTree ORDER BY id",
+		InsertSelect:      "INSERT INTO dst.events SELECT id FROM src.events",
+	}
+	if err := artifact.WriteManifest(sourceDir, manifest.Manifest{
+		Version: manifest.Version,
+		JobID:   "job-1",
+		PartID:  "part-1",
+		Freeze:  "freeze-1",
+		Source:  manifest.TableRef{Database: "src", Table: "events"},
+		Dest:    manifest.TableRef{Database: "dst", Table: "events"},
+		Part:    manifest.SourcePart{Disk: "default", Name: "all_1_1_0", RelativePath: "store/all_1_1_0"},
+		SQL:     want,
+		S3:      manifest.S3Refs{Bucket: "bucket", SourceKey: "source/part-1", FinishedKey: "finished/part-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSQLBundleFromSourceManifest(context.Background(), s3copy.Copier{Binary: fakeS5cmdCopyFile(t, filepath.Join(sourceDir, artifact.ManifestName))}, state.Part{
+		JobID:     "job-1",
+		PartID:    "part-1",
+		Bucket:    "bucket",
+		SourceKey: "source/part-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DestinationSchema != want.DestinationSchema || got.InsertSelect != want.InsertSelect {
+		t.Fatalf("sql = %+v, want destination and insert from %+v", got, want)
+	}
+}
+
 func TestResolveS5cmdNumWorkers(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -2046,4 +2126,22 @@ func captureFileOutput(t *testing.T, write func(*os.File)) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func fakeS5cmdCopyFile(t *testing.T, source string) string {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	script := fmt.Sprintf(`#!/bin/sh
+for last do :; done
+cp %s "$last"
+`, shellQuote(source))
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

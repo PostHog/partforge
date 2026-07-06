@@ -103,6 +103,8 @@ partforge import-finished -database=dst_db -table=events_new -job-id=<job-id>
 
 `upload-freeze` prints the `job-id`; `-job-name` is optional and is shown by `list-jobs`. For LocalStack add `-s3-endpoint=http://localhost:4566 -dynamodb-endpoint=http://localhost:4566` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
 
+For multiple shards with the same destination schema and insert-select, run the first `upload-freeze` with the SQL files and later shards with `-copy-sql-from-job=<first-job-id>`.
+
 Part state lifecycle (tracked in DynamoDB, so a job is resumable):
 
 ```

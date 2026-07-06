@@ -57,6 +57,13 @@ func (c Copier) DownloadPrefix(ctx context.Context, bucket, prefix, localDir str
 	return c.runS5cmd(ctx, c.copyArgs(s3URI(bucket, prefix)+"/*", withTrailingSeparator(localDir)), nil)
 }
 
+func (c Copier) DownloadFile(ctx context.Context, bucket, key, localPath string) error {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return err
+	}
+	return c.runS5cmd(ctx, c.copyArgs(s3URI(bucket, key), localPath), nil)
+}
+
 func (c Copier) DeletePrefix(ctx context.Context, bucket, prefix string) error {
 	target, err := deletePrefixTarget(bucket, prefix)
 	if err != nil {

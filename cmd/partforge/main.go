@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -221,6 +222,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		freezeName            = fs.String("freeze", "", "ALTER TABLE ... FREEZE WITH NAME value")
 		destinationSchemaFile = fs.String("destination-schema-file", "", "file containing full CREATE TABLE for destination")
 		insertSelectFile      = fs.String("insert-select-file", "", "file containing INSERT INTO destination SELECT ... FROM source")
+		copySQLFromJob        = fs.String("copy-sql-from-job", "", "copy destination schema and insert-select from an existing job id")
 		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL for SHOW CREATE TABLE")
 		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
@@ -246,8 +248,11 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *database == "" || *table == "" || *freezeName == "" || *destinationSchemaFile == "" || *insertSelectFile == "" || *bucket == "" {
-		return errors.New("database, table, freeze, destination-schema-file, insert-select-file, and bucket are required")
+	if *database == "" || *table == "" || *freezeName == "" || *bucket == "" {
+		return errors.New("database, table, freeze, and bucket are required")
+	}
+	if err := validateUploadFreezeSQLInputs(*destinationSchemaFile, *insertSelectFile, *copySQLFromJob); err != nil {
+		return err
 	}
 	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
 	if err != nil {
@@ -265,16 +270,29 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		"prefix", *prefix,
 	)
 
-	slog.Info("reading SQL files", "stage", "read_sql_files", "destination_schema_file", *destinationSchemaFile, "insert_select_file", *insertSelectFile)
-	destinationSchema, err := readRequiredFile(*destinationSchemaFile)
+	var stateStore *state.Store
+	getStateStore := func() (*state.Store, error) {
+		if stateStore != nil {
+			return stateStore, nil
+		}
+		slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+		store, err := state.New(ctx, state.Config{
+			Region:   *region,
+			Endpoint: *dynamoEndpoint,
+			Table:    *stateTable,
+		})
+		if err != nil {
+			return nil, err
+		}
+		slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+		stateStore = store
+		return stateStore, nil
+	}
+
+	destinationSchema, insertSelect, err := readUploadFreezeSQL(ctx, *destinationSchemaFile, *insertSelectFile, *copySQLFromJob, getStateStore, s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint})
 	if err != nil {
 		return err
 	}
-	insertSelect, err := readRequiredFile(*insertSelectFile)
-	if err != nil {
-		return err
-	}
-	slog.Info("read SQL files", "stage", "read_sql_files", "destination_schema_bytes", len(destinationSchema), "insert_select_bytes", len(insertSelect))
 
 	ch := chhttp.Client{
 		URL:      *clickHouseURL,
@@ -323,16 +341,10 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
 	resolvedJobName := strings.TrimSpace(*jobName)
 
-	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
-	stateStore, err := state.New(ctx, state.Config{
-		Region:   *region,
-		Endpoint: *dynamoEndpoint,
-		Table:    *stateTable,
-	})
+	stateStore, err = getStateStore()
 	if err != nil {
 		return err
 	}
-	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	var uploadedBytes uint64
 	uploadedParts := 0
 	effectiveConcurrency := min(resolvedUploadConcurrency, len(scannedParts))
@@ -436,6 +448,91 @@ type uploadFreezePartParams struct {
 	PartsTotal        int
 	StateStore        *state.Store
 	Copier            s3copy.Copier
+}
+
+type stateStoreGetter func() (*state.Store, error)
+
+func validateUploadFreezeSQLInputs(destinationSchemaFile, insertSelectFile, copySQLFromJob string) error {
+	copySQLFromJob = strings.TrimSpace(copySQLFromJob)
+	if copySQLFromJob != "" {
+		if destinationSchemaFile != "" || insertSelectFile != "" {
+			return errors.New("copy-sql-from-job cannot be used with destination-schema-file or insert-select-file")
+		}
+		return nil
+	}
+	if destinationSchemaFile == "" || insertSelectFile == "" {
+		return errors.New("destination-schema-file and insert-select-file are required unless copy-sql-from-job is set")
+	}
+	return nil
+}
+
+func readUploadFreezeSQL(ctx context.Context, destinationSchemaFile, insertSelectFile, copySQLFromJob string, getStateStore stateStoreGetter, copier s3copy.Copier) (string, string, error) {
+	if strings.TrimSpace(copySQLFromJob) != "" {
+		slog.Info("copying SQL from existing job", "stage", "copy_sql_from_job", "source_job_id", copySQLFromJob)
+		store, err := getStateStore()
+		if err != nil {
+			return "", "", err
+		}
+		sql, err := copySQLBundleFromJob(ctx, store, copier, copySQLFromJob)
+		if err != nil {
+			return "", "", err
+		}
+		slog.Info("copied SQL from existing job", "stage", "copy_sql_from_job", "source_job_id", copySQLFromJob, "destination_schema_bytes", len(sql.DestinationSchema), "insert_select_bytes", len(sql.InsertSelect))
+		return sql.DestinationSchema, sql.InsertSelect, nil
+	}
+
+	slog.Info("reading SQL files", "stage", "read_sql_files", "destination_schema_file", destinationSchemaFile, "insert_select_file", insertSelectFile)
+	destinationSchema, err := readRequiredFile(destinationSchemaFile)
+	if err != nil {
+		return "", "", err
+	}
+	insertSelect, err := readRequiredFile(insertSelectFile)
+	if err != nil {
+		return "", "", err
+	}
+	slog.Info("read SQL files", "stage", "read_sql_files", "destination_schema_bytes", len(destinationSchema), "insert_select_bytes", len(insertSelect))
+	return destinationSchema, insertSelect, nil
+}
+
+func copySQLBundleFromJob(ctx context.Context, store *state.Store, copier s3copy.Copier, jobID string) (manifest.SQLBundle, error) {
+	parts, err := store.ListJobParts(ctx, strings.TrimSpace(jobID))
+	if err != nil {
+		return manifest.SQLBundle{}, err
+	}
+	part, ok := firstOriginalSourcePart(parts)
+	if !ok {
+		return manifest.SQLBundle{}, fmt.Errorf("job %s has no original source parts to copy SQL from", jobID)
+	}
+	return readSQLBundleFromSourceManifest(ctx, copier, part)
+}
+
+func firstOriginalSourcePart(parts []state.Part) (state.Part, bool) {
+	for _, part := range parts {
+		if !isGeneratedCompactPart(part) {
+			return part, true
+		}
+	}
+	return state.Part{}, false
+}
+
+func readSQLBundleFromSourceManifest(ctx context.Context, copier s3copy.Copier, part state.Part) (manifest.SQLBundle, error) {
+	dir, err := os.MkdirTemp("", "partforge-sql-*")
+	if err != nil {
+		return manifest.SQLBundle{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	if err := copier.DownloadFile(ctx, part.Bucket, path.Join(part.SourceKey, artifact.ManifestName), filepath.Join(dir, artifact.ManifestName)); err != nil {
+		return manifest.SQLBundle{}, fmt.Errorf("download source manifest for %s/%s: %w", part.JobID, part.PartID, err)
+	}
+	m, err := artifact.ReadManifest(dir)
+	if err != nil {
+		return manifest.SQLBundle{}, fmt.Errorf("read source manifest for %s/%s: %w", part.JobID, part.PartID, err)
+	}
+	if m.JobID != part.JobID || m.PartID != part.PartID {
+		return manifest.SQLBundle{}, fmt.Errorf("source manifest for %s/%s contains %s/%s", part.JobID, part.PartID, m.JobID, m.PartID)
+	}
+	return m.SQL, nil
 }
 
 type uploadPartFunc func(context.Context, int, uploadPartTask) (uploadPartResult, error)

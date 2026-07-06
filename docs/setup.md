@@ -141,6 +141,8 @@ partforge upload-freeze \
 
 It prints a generated `job-id` (or pass `-job-id` to set one). `-job-name` is optional and is shown by `list-jobs`. S3-backed ClickHouse disks are rejected — only local disks are handled. It uploads parts concurrently (`-upload-concurrency`, default = detected CPU count) and auto-sizes `s5cmd`'s worker pool per process (`-s5cmd-numworkers`).
 
+For shard fanout, run the first shard with `-destination-schema-file` and `-insert-select-file`, then run later shards with `-copy-sql-from-job=<first-job-id>` instead of copying those SQL files to every host. `upload-freeze` reads the prior job's source manifest from S3 and reuses only its destination schema and insert-select; it still captures the current shard's source schema with `SHOW CREATE TABLE`.
+
 ### 4. worker
 
 The worker claims a `READY` part, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact finished artifacts before promoting them to `FINISHED`.

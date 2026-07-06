@@ -94,6 +94,19 @@ func TestDownloadPrefixRetriesCopyCommand(t *testing.T) {
 	}
 }
 
+func TestDownloadFileRetriesCopyCommand(t *testing.T) {
+	binary, attemptsFile := fakeS5cmd(t, 3)
+	localPath := filepath.Join(t.TempDir(), "download", "manifest.json")
+
+	copier := Copier{Binary: binary}
+	if err := copier.DownloadFile(context.Background(), "bucket", "prefix/manifest.json", localPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAttemptCount(t, attemptsFile); got != 4 {
+		t.Fatalf("attempts = %d, want 4", got)
+	}
+}
+
 func TestUploadGlobRetriesCopyCommand(t *testing.T) {
 	binary, attemptsFile := fakeS5cmd(t, 3)
 
