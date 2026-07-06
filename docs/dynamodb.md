@@ -3,7 +3,7 @@
 PartForge tracks every part of every job as a row in a single DynamoDB table. This is the source of truth for the pipeline: workers claim work with conditional updates, transition parts through their lifecycle, and record progress and compaction lineage here. Because all state lives in DynamoDB, jobs are resumable and can be driven by many workers at once.
 
 The table holds no bulk data — only per-part metadata and pointers to the S3 artifacts. Part data itself lives in S3.
-Rows may include `job_name` when `upload-freeze -job-name` is used; `list-jobs` displays it with the job ID.
+Rows may include `job_name` when `upload-freeze -job-name` is used; `list-jobs` displays it with job status, counts, and timestamps.
 
 ## Schema
 

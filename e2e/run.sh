@@ -186,7 +186,7 @@ job_list="$(
     list-jobs \
     -dynamodb-endpoint=http://localstack:4566
 )"
-if ! grep -F $'e2e-job\tE2E import' <<<"$job_list" >/dev/null; then
+if ! grep -F "E2E import" <<<"$job_list" >/dev/null; then
   echo "list-jobs did not include job name; output:" >&2
   echo "$job_list" >&2
   exit 1

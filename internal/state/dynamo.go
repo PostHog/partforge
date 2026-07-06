@@ -125,8 +125,12 @@ type Part struct {
 }
 
 type Job struct {
-	JobID string `json:"job_id"`
-	Name  string `json:"name,omitempty"`
+	JobID       string         `json:"job_id"`
+	Name        string         `json:"name,omitempty"`
+	Total       int            `json:"total"`
+	Counts      map[Status]int `json:"counts,omitempty"`
+	SubmittedAt string         `json:"submitted_at,omitempty"`
+	UpdatedAt   string         `json:"updated_at,omitempty"`
 }
 
 type QueryProgress struct {
@@ -1427,11 +1431,13 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 			TableName:              aws.String(s.table),
 			IndexName:              aws.String(readyIndexName),
 			KeyConditionExpression: aws.String("#gsi1pk = :status"),
-			ProjectionExpression:   aws.String("#job_id, #job_name"),
+			ProjectionExpression:   aws.String("#job_id, #job_name, #created_at, #updated_at"),
 			ExpressionAttributeNames: map[string]string{
-				"#gsi1pk":   "gsi1pk",
-				"#job_id":   "job_id",
-				"#job_name": "job_name",
+				"#gsi1pk":     "gsi1pk",
+				"#job_id":     "job_id",
+				"#job_name":   "job_name",
+				"#created_at": "created_at",
+				"#updated_at": "updated_at",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":status": stringAttr(statusKey(status)),
@@ -1460,19 +1466,33 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 				if err != nil {
 					return nil, err
 				}
+				createdAt, err := optionalStringAttr(item, "created_at")
+				if err != nil {
+					return nil, err
+				}
+				updatedAt, err := optionalStringAttr(item, "updated_at")
+				if err != nil {
+					return nil, err
+				}
 				existing := jobsByID[value.Value]
 				if existing.JobID == "" {
-					jobsByID[value.Value] = Job{JobID: value.Value, Name: name}
-					continue
+					existing = Job{JobID: value.Value, Name: name, Counts: map[Status]int{}}
 				}
 				if existing.Name == "" && name != "" {
 					existing.Name = name
-					jobsByID[value.Value] = existing
-					continue
 				}
 				if existing.Name != "" && name != "" && existing.Name != name {
 					return nil, fmt.Errorf("job %s has conflicting job_name values %q and %q", value.Value, existing.Name, name)
 				}
+				existing.Total++
+				existing.Counts[status]++
+				if createdAt != "" && (existing.SubmittedAt == "" || createdAt < existing.SubmittedAt) {
+					existing.SubmittedAt = createdAt
+				}
+				if updatedAt != "" && updatedAt > existing.UpdatedAt {
+					existing.UpdatedAt = updatedAt
+				}
+				jobsByID[value.Value] = existing
 			}
 		}
 	}

@@ -1449,20 +1449,49 @@ func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
 func TestPrintJobsIncludesNames(t *testing.T) {
 	got := captureFileOutput(t, func(out *os.File) {
 		printJobs(out, []state.Job{
-			{JobID: "job-a", Name: "Backfill A"},
-			{JobID: "job-b"},
+			{
+				JobID:       "job-a",
+				Name:        "Backfill A",
+				Total:       3,
+				Counts:      map[state.Status]int{state.StatusReady: 2, state.StatusFinished: 1},
+				SubmittedAt: "2026-06-24T00:00:00.000000000Z",
+				UpdatedAt:   "2026-06-24T01:00:00.000000000Z",
+			},
+			{JobID: "job-b", Total: 1, Counts: map[state.Status]int{state.StatusFailed: 1}},
 		})
 	})
 
-	if got != "job-a\tBackfill A\njob-b\n" {
-		t.Fatalf("printJobs output = %q", got)
+	for _, want := range []string{
+		"JOB_ID",
+		"STATUS",
+		"PARTS",
+		"SUBMITTED_AT",
+		"UPDATED_AT",
+		"COUNTS",
+		"job-a",
+		"Backfill A",
+		"READY",
+		"READY=2, FINISHED=1",
+		"job-b",
+		"FAILED",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobs output missing %q:\n%s", want, got)
+		}
 	}
 }
 
 func TestBuildListJobsOutputPreservesJobIDList(t *testing.T) {
 	got := buildListJobsOutput([]state.Job{
-		{JobID: "job-a", Name: "Backfill A"},
-		{JobID: "job-b"},
+		{
+			JobID:       "job-a",
+			Name:        "Backfill A",
+			Total:       3,
+			Counts:      map[state.Status]int{state.StatusFinished: 2, state.StatusImported: 1},
+			SubmittedAt: "2026-06-24T00:00:00.000000000Z",
+			UpdatedAt:   "2026-06-24T01:00:00.000000000Z",
+		},
+		{JobID: "job-b", Total: 1, Counts: map[state.Status]int{state.StatusReady: 1}},
 	})
 
 	if strings.Join(got.Jobs, ",") != "job-a,job-b" {
@@ -1470,6 +1499,15 @@ func TestBuildListJobsOutputPreservesJobIDList(t *testing.T) {
 	}
 	if len(got.JobNames) != 1 || got.JobNames["job-a"] != "Backfill A" {
 		t.Fatalf("job names = %+v", got.JobNames)
+	}
+	if len(got.Details) != 2 {
+		t.Fatalf("job details = %+v", got.Details)
+	}
+	if got.Details[0].Status != "READY_FOR_IMPORT" || got.Details[0].PartsTotal != 3 || got.Details[0].RewriteCompleted != 3 || got.Details[0].ImportCompleted != 1 || got.Details[0].SubmittedAt == "" || got.Details[0].UpdatedAt == "" {
+		t.Fatalf("job-a detail = %+v", got.Details[0])
+	}
+	if got.Details[1].Status != "READY" || got.Details[1].PartsTotal != 1 {
+		t.Fatalf("job-b detail = %+v", got.Details[1])
 	}
 }
 

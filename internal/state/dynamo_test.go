@@ -162,9 +162,9 @@ func TestListJobsByStatusReturnsNames(t *testing.T) {
 		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 		switch {
 		case strings.Contains(string(body), statusKey(StatusReady)):
-			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-b"},"job_name":{"S":"Backfill B"}},{"job_id":{"S":"job-a"}}]}`)
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-b"},"job_name":{"S":"Backfill B"},"created_at":{"S":"2026-06-24T00:05:00.000000000Z"},"updated_at":{"S":"2026-06-24T00:10:00.000000000Z"}},{"job_id":{"S":"job-a"},"created_at":{"S":"2026-06-24T00:02:00.000000000Z"},"updated_at":{"S":"2026-06-24T00:03:00.000000000Z"}}]}`)
 		case strings.Contains(string(body), statusKey(StatusFailed)):
-			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-a"},"job_name":{"S":"Backfill A"}}]}`)
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-a"},"job_name":{"S":"Backfill A"},"created_at":{"S":"2026-06-24T00:01:00.000000000Z"},"updated_at":{"S":"2026-06-24T00:20:00.000000000Z"}}]}`)
 		default:
 			t.Errorf("request body missing expected status: %s", string(body))
 			_, _ = io.WriteString(w, `{"Items":[]}`)
@@ -187,6 +187,12 @@ func TestListJobsByStatusReturnsNames(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].JobID != "job-a" || got[0].Name != "Backfill A" || got[1].JobID != "job-b" || got[1].Name != "Backfill B" {
 		t.Fatalf("jobs = %+v, want sorted jobs with names", got)
+	}
+	if got[0].Total != 2 || got[0].Counts[StatusReady] != 1 || got[0].Counts[StatusFailed] != 1 || got[0].SubmittedAt != "2026-06-24T00:01:00.000000000Z" || got[0].UpdatedAt != "2026-06-24T00:20:00.000000000Z" {
+		t.Fatalf("job-a summary = %+v", got[0])
+	}
+	if got[1].Total != 1 || got[1].Counts[StatusReady] != 1 || got[1].SubmittedAt != "2026-06-24T00:05:00.000000000Z" || got[1].UpdatedAt != "2026-06-24T00:10:00.000000000Z" {
+		t.Fatalf("job-b summary = %+v", got[1])
 	}
 }
 

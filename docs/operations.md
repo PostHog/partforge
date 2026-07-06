@@ -34,11 +34,11 @@ Workers also write a per-part progress heartbeat to DynamoDB every `15s` (`-stat
 ## Inspecting jobs
 
 ```sh
-partforge list-jobs                 # job IDs and optional names in the state table (uses the gsi1 index)
+partforge list-jobs                 # jobs with status, part counts, submitted/updated timestamps, optional names (uses the gsi1 index)
 partforge job-status -job-id=job-123
 ```
 
-Both accept `-json`; `list-jobs -json` keeps `jobs` as job IDs and adds `job_names` when names are set. `job-status -parts` adds per-row detail (persisted rewrite counters, compact-ready age, destination partitions, active part stats, `FAILED_MERGES`); `job-status -details` adds each part's current stage and per-stage timings. The physical part counters (`input_clickhouse_parts`, `current_output_clickhouse_parts`) refer to ClickHouse parts, not state rows.
+Both accept `-json`; `list-jobs -json` keeps `jobs` as job IDs, adds `job_names` when names are set, and includes `job_details` for status/progress/timestamps. `job-status -parts` adds per-row detail (persisted rewrite counters, compact-ready age, destination partitions, active part stats, `FAILED_MERGES`); `job-status -details` adds each part's current stage and per-stage timings. The physical part counters (`input_clickhouse_parts`, `current_output_clickhouse_parts`) refer to ClickHouse parts, not state rows.
 
 ## Admin and recovery commands
 

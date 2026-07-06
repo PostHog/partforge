@@ -2191,13 +2191,17 @@ func runListJobs(ctx context.Context, args []string) error {
 }
 
 func buildListJobsOutput(jobs []state.Job) listJobsOutput {
-	out := listJobsOutput{Jobs: make([]string, 0, len(jobs))}
+	out := listJobsOutput{
+		Jobs:    make([]string, 0, len(jobs)),
+		Details: make([]listJobDetail, 0, len(jobs)),
+	}
 	jobNames := map[string]string{}
 	for _, job := range jobs {
 		out.Jobs = append(out.Jobs, job.JobID)
 		if job.Name != "" {
 			jobNames[job.JobID] = job.Name
 		}
+		out.Details = append(out.Details, buildListJobDetail(job))
 	}
 	if len(jobNames) > 0 {
 		out.JobNames = jobNames
@@ -2206,13 +2210,58 @@ func buildListJobsOutput(jobs []state.Job) listJobsOutput {
 }
 
 func printJobs(out *os.File, jobs []state.Job) {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tPARTS\tREWRITE\tIMPORT\tSUBMITTED_AT\tUPDATED_AT\tNAME\tCOUNTS")
 	for _, job := range jobs {
-		if job.Name == "" {
-			fmt.Fprintln(out, job.JobID)
+		detail := buildListJobDetail(job)
+		fmt.Fprintf(
+			tw,
+			"%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			detail.JobID,
+			detail.Status,
+			detail.PartsTotal,
+			formatListJobProgress(detail.RewriteCompleted, detail.PartsTotal),
+			formatListJobProgress(detail.ImportCompleted, detail.PartsTotal),
+			detail.SubmittedAt,
+			detail.UpdatedAt,
+			detail.Name,
+			formatStatusCounts(detail.StatusCounts),
+		)
+	}
+	_ = tw.Flush()
+}
+
+func buildListJobDetail(job state.Job) listJobDetail {
+	rewriteCompleted := job.Counts[state.StatusCompactReady] + job.Counts[state.StatusCompacting] + job.Counts[state.StatusSuperseded] + job.Counts[state.StatusFinished] + job.Counts[state.StatusImporting] + job.Counts[state.StatusImported]
+	importCompleted := job.Counts[state.StatusImported]
+	return listJobDetail{
+		JobID:            job.JobID,
+		Name:             job.Name,
+		Status:           overallStatus(job.Total, job.Counts),
+		PartsTotal:       job.Total,
+		RewriteCompleted: rewriteCompleted,
+		RewritePercent:   percent(rewriteCompleted, job.Total),
+		ImportCompleted:  importCompleted,
+		ImportPercent:    percent(importCompleted, job.Total),
+		SubmittedAt:      job.SubmittedAt,
+		UpdatedAt:        job.UpdatedAt,
+		StatusCounts:     listJobStatusCounts(job.Counts),
+	}
+}
+
+func listJobStatusCounts(counts map[state.Status]int) []statusCount {
+	out := make([]statusCount, 0, len(statusOrder()))
+	for _, status := range statusOrder() {
+		if counts[status] == 0 {
 			continue
 		}
-		fmt.Fprintf(out, "%s\t%s\n", job.JobID, job.Name)
+		out = append(out, statusCount{Status: status, Count: counts[status]})
 	}
+	return out
+}
+
+func formatListJobProgress(done, total int) string {
+	return fmt.Sprintf("%d/%d %.1f%%", done, total, percent(done, total))
 }
 
 func runJobStatus(ctx context.Context, args []string) error {
@@ -3439,6 +3488,21 @@ type jobStatusOutput struct {
 type listJobsOutput struct {
 	Jobs     []string          `json:"jobs"`
 	JobNames map[string]string `json:"job_names,omitempty"`
+	Details  []listJobDetail   `json:"job_details"`
+}
+
+type listJobDetail struct {
+	JobID            string        `json:"job_id"`
+	Name             string        `json:"name,omitempty"`
+	Status           string        `json:"status"`
+	PartsTotal       int           `json:"parts_total"`
+	RewriteCompleted int           `json:"rewrite_completed"`
+	RewritePercent   float64       `json:"rewrite_percent"`
+	ImportCompleted  int           `json:"import_completed"`
+	ImportPercent    float64       `json:"import_percent"`
+	SubmittedAt      string        `json:"submitted_at,omitempty"`
+	UpdatedAt        string        `json:"updated_at,omitempty"`
+	StatusCounts     []statusCount `json:"status_counts,omitempty"`
 }
 
 type retryFailedOutput struct {
