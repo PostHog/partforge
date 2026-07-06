@@ -134,11 +134,12 @@ partforge upload-freeze \
   -destination-schema-file=dest.sql \
   -insert-select-file=insert.sql \
   -bucket=partforge \
+  -job-name="events migration 001" \
   -s3-endpoint=http://localhost:4566 \
   -dynamodb-endpoint=http://localhost:4566
 ```
 
-It prints a generated `job-id` (or pass `-job-id` to set one). S3-backed ClickHouse disks are rejected — only local disks are handled. It uploads parts concurrently (`-upload-concurrency`, default = detected CPU count) and auto-sizes `s5cmd`'s worker pool per process (`-s5cmd-numworkers`).
+It prints a generated `job-id` (or pass `-job-id` to set one). `-job-name` is optional and is shown by `list-jobs`. S3-backed ClickHouse disks are rejected — only local disks are handled. It uploads parts concurrently (`-upload-concurrency`, default = detected CPU count) and auto-sizes `s5cmd`'s worker pool per process (`-s5cmd-numworkers`).
 
 ### 4. worker
 

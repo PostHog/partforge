@@ -66,6 +66,7 @@ type Part struct {
 	GSI1PK         string `dynamodbav:"gsi1pk"`
 	GSI1SK         string `dynamodbav:"gsi1sk"`
 	JobID          string `dynamodbav:"job_id"`
+	JobName        string `dynamodbav:"job_name,omitempty"`
 	PartID         string `dynamodbav:"part_id"`
 	Status         Status `dynamodbav:"status"`
 	Bucket         string `dynamodbav:"bucket"`
@@ -121,6 +122,11 @@ type Part struct {
 	RewriteStageElapsedMs            int64             `dynamodbav:"rewrite_stage_elapsed_ms,omitempty"`
 	RewriteTotalElapsedMs            int64             `dynamodbav:"rewrite_total_elapsed_ms,omitempty"`
 	RewriteStageDurationsMs          map[string]int64  `dynamodbav:"rewrite_stage_durations_ms,omitempty"`
+}
+
+type Job struct {
+	JobID string `json:"job_id"`
+	Name  string `json:"name,omitempty"`
 }
 
 type QueryProgress struct {
@@ -1389,8 +1395,24 @@ func (s *Store) ListJobIDs(ctx context.Context) ([]string, error) {
 	return s.ListJobIDsByStatus(ctx, allStatuses...)
 }
 
+func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
+	return s.ListJobsByStatus(ctx, allStatuses...)
+}
+
 func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]string, error) {
-	seen := map[string]struct{}{}
+	jobs, err := s.ListJobsByStatus(ctx, statuses...)
+	if err != nil {
+		return nil, err
+	}
+	jobIDs := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		jobIDs = append(jobIDs, job.JobID)
+	}
+	return jobIDs, nil
+}
+
+func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job, error) {
+	jobsByID := map[string]Job{}
 	queried := map[Status]struct{}{}
 	for _, status := range statuses {
 		if strings.TrimSpace(string(status)) == "" {
@@ -1405,10 +1427,11 @@ func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]s
 			TableName:              aws.String(s.table),
 			IndexName:              aws.String(readyIndexName),
 			KeyConditionExpression: aws.String("#gsi1pk = :status"),
-			ProjectionExpression:   aws.String("#job_id"),
+			ProjectionExpression:   aws.String("#job_id, #job_name"),
 			ExpressionAttributeNames: map[string]string{
-				"#gsi1pk": "gsi1pk",
-				"#job_id": "job_id",
+				"#gsi1pk":   "gsi1pk",
+				"#job_id":   "job_id",
+				"#job_name": "job_name",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":status": stringAttr(statusKey(status)),
@@ -1430,19 +1453,38 @@ func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]s
 				if !ok {
 					return nil, fmt.Errorf("job_id has non-string DynamoDB attribute type")
 				}
-				if value.Value != "" {
-					seen[value.Value] = struct{}{}
+				if value.Value == "" {
+					continue
+				}
+				name, err := optionalStringAttr(item, "job_name")
+				if err != nil {
+					return nil, err
+				}
+				existing := jobsByID[value.Value]
+				if existing.JobID == "" {
+					jobsByID[value.Value] = Job{JobID: value.Value, Name: name}
+					continue
+				}
+				if existing.Name == "" && name != "" {
+					existing.Name = name
+					jobsByID[value.Value] = existing
+					continue
+				}
+				if existing.Name != "" && name != "" && existing.Name != name {
+					return nil, fmt.Errorf("job %s has conflicting job_name values %q and %q", value.Value, existing.Name, name)
 				}
 			}
 		}
 	}
 
-	jobIDs := make([]string, 0, len(seen))
-	for jobID := range seen {
-		jobIDs = append(jobIDs, jobID)
+	jobs := make([]Job, 0, len(jobsByID))
+	for _, job := range jobsByID {
+		jobs = append(jobs, job)
 	}
-	sort.Strings(jobIDs)
-	return jobIDs, nil
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].JobID < jobs[j].JobID
+	})
+	return jobs, nil
 }
 
 func (s *Store) ListJobParts(ctx context.Context, jobID string) ([]Part, error) {
@@ -2041,6 +2083,18 @@ func unmarshalPart(item map[string]types.AttributeValue) (*Part, error) {
 
 func (p Part) key() map[string]types.AttributeValue {
 	return partStateKey(p.JobID, p.PartID)
+}
+
+func optionalStringAttr(item map[string]types.AttributeValue, name string) (string, error) {
+	av, ok := item[name]
+	if !ok {
+		return "", nil
+	}
+	value, ok := av.(*types.AttributeValueMemberS)
+	if !ok {
+		return "", fmt.Errorf("%s has non-string DynamoDB attribute type", name)
+	}
+	return value.Value, nil
 }
 
 func partStateKey(jobID, partID string) map[string]types.AttributeValue {

@@ -152,6 +152,44 @@ func TestListJobIDsByStatusQueriesStatusIndex(t *testing.T) {
 	}
 }
 
+func TestListJobsByStatusReturnsNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		switch {
+		case strings.Contains(string(body), statusKey(StatusReady)):
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-b"},"job_name":{"S":"Backfill B"}},{"job_id":{"S":"job-a"}}]}`)
+		case strings.Contains(string(body), statusKey(StatusFailed)):
+			_, _ = io.WriteString(w, `{"Items":[{"job_id":{"S":"job-a"},"job_name":{"S":"Backfill A"}}]}`)
+		default:
+			t.Errorf("request body missing expected status: %s", string(body))
+			_, _ = io.WriteString(w, `{"Items":[]}`)
+		}
+	}))
+	defer server.Close()
+
+	store := &Store{
+		client: dynamodb.New(dynamodb.Options{
+			Region:       defaultRegion,
+			Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+			BaseEndpoint: aws.String(server.URL),
+		}),
+		table: "partforge",
+	}
+
+	got, err := store.ListJobsByStatus(context.Background(), StatusReady, StatusFailed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].JobID != "job-a" || got[0].Name != "Backfill A" || got[1].JobID != "job-b" || got[1].Name != "Backfill B" {
+		t.Fatalf("jobs = %+v, want sorted jobs with names", got)
+	}
+}
+
 func TestSelectCompactBatchPartsAllowsSingleMultiPartArtifact(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{

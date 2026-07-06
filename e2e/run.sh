@@ -7,6 +7,7 @@ STATE_TABLE="partforge"
 CH_HTTP_HOST="http://127.0.0.1:18123"
 CH_HTTP_DOCKER="http://clickhouse:8123"
 JOB_ID="e2e-job"
+JOB_NAME="E2E import"
 
 cd "$ROOT"
 
@@ -176,8 +177,20 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -bucket=partforge \
   -prefix=e2e \
   -job-id="$JOB_ID" \
+  -job-name="$JOB_NAME" \
   -s3-endpoint=http://localstack:4566 \
   -dynamodb-endpoint=http://localstack:4566
+
+job_list="$(
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    list-jobs \
+    -dynamodb-endpoint=http://localstack:4566
+)"
+if ! grep -F $'e2e-job\tE2E import' <<<"$job_list" >/dev/null; then
+  echo "list-jobs did not include job name; output:" >&2
+  echo "$job_list" >&2
+  exit 1
+fi
 
 for i in $(seq 1 "$part_count"); do
   worker_log="$ROOT/.e2e/worker-${i}.log"

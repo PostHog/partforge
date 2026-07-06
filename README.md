@@ -91,7 +91,8 @@ clickhouse-client --query "ALTER TABLE src_db.events FREEZE WITH NAME 'migration
 partforge upload-freeze \
   -database=src_db -table=events -freeze=migration_001 \
   -destination-schema-file=dest.sql -insert-select-file=insert.sql \
-  -bucket=partforge
+  -bucket=partforge \
+  -job-name="events migration 001"
 
 # c. Rewrite — run as many worker containers as you want
 docker run --rm ghcr.io/posthog/partforge:latest worker
@@ -100,7 +101,7 @@ docker run --rm ghcr.io/posthog/partforge:latest worker
 partforge import-finished -database=dst_db -table=events_new -job-id=<job-id>
 ```
 
-`upload-freeze` prints the `job-id`. For LocalStack add `-s3-endpoint=http://localhost:4566 -dynamodb-endpoint=http://localhost:4566` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
+`upload-freeze` prints the `job-id`; `-job-name` is optional and is shown by `list-jobs`. For LocalStack add `-s3-endpoint=http://localhost:4566 -dynamodb-endpoint=http://localhost:4566` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
 
 Part state lifecycle (tracked in DynamoDB, so a job is resumable):
 

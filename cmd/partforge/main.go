@@ -225,6 +225,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
 		jobID                 = fs.String("job-id", "", "optional job id override")
+		jobName               = fs.String("job-name", "", "optional readable job name")
 		bucket                = fs.String("bucket", "", "S3 bucket")
 		prefix                = fs.String("prefix", "partforge", "S3 key prefix")
 		stateTable            = fs.String("state-table", defaultStateTable, "DynamoDB state table")
@@ -320,6 +321,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		}
 	}
 	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
+	resolvedJobName := strings.TrimSpace(*jobName)
 
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -352,6 +354,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	}
 	uploadParams := uploadFreezePartParams{
 		JobID:             resolvedJobID,
+		JobName:           resolvedJobName,
 		FreezeName:        *freezeName,
 		Source:            manifest.TableRef{Database: *database, Table: *table},
 		Dest:              destinationTableRef,
@@ -421,6 +424,7 @@ type uploadPartResult struct {
 
 type uploadFreezePartParams struct {
 	JobID             string
+	JobName           string
 	FreezeName        string
 	Source            manifest.TableRef
 	Dest              manifest.TableRef
@@ -601,6 +605,7 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 	)
 
 	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
+	partState.JobName = params.JobName
 	slog.Info("registering source part", "stage", "register_parts", "job_id", params.JobID, "worker_id", workerID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
 	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
 		return uploadPartResult{}, fmt.Errorf("create state for %s: %w", sourceKey, err)
@@ -1458,6 +1463,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		Rows:  result.DestinationStats.Rows,
 		Bytes: result.DestinationStats.Bytes,
 	}, partitionCountsFromRewrite(result.DestinationPartitions), compactReadyAt, time.Now().UTC())
+	output.JobName = batch.Parts[0].JobName
 	stateCtx, cancel := workerStateUpdateContext()
 	err = cfg.StateStore.CompleteCompaction(stateCtx, currentBatch(), output, cfg.WorkerID, time.Now().UTC())
 	cancel()
@@ -2076,17 +2082,40 @@ func runListJobs(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	jobIDs, err := stateStore.ListJobIDs(ctx)
+	jobs, err := stateStore.ListJobs(ctx)
 	if err != nil {
 		return err
 	}
 	if *jsonOutput {
-		return writeJSON(os.Stdout, map[string][]string{"jobs": jobIDs})
+		return writeJSON(os.Stdout, buildListJobsOutput(jobs))
 	}
-	for _, jobID := range jobIDs {
-		fmt.Println(jobID)
-	}
+	printJobs(os.Stdout, jobs)
 	return nil
+}
+
+func buildListJobsOutput(jobs []state.Job) listJobsOutput {
+	out := listJobsOutput{Jobs: make([]string, 0, len(jobs))}
+	jobNames := map[string]string{}
+	for _, job := range jobs {
+		out.Jobs = append(out.Jobs, job.JobID)
+		if job.Name != "" {
+			jobNames[job.JobID] = job.Name
+		}
+	}
+	if len(jobNames) > 0 {
+		out.JobNames = jobNames
+	}
+	return out
+}
+
+func printJobs(out *os.File, jobs []state.Job) {
+	for _, job := range jobs {
+		if job.Name == "" {
+			fmt.Fprintln(out, job.JobID)
+			continue
+		}
+		fmt.Fprintf(out, "%s\t%s\n", job.JobID, job.Name)
+	}
 }
 
 func runJobStatus(ctx context.Context, args []string) error {
@@ -3308,6 +3337,11 @@ type failedPart struct {
 type jobStatusOutput struct {
 	Summary jobSummary   `json:"summary"`
 	Parts   []state.Part `json:"parts,omitempty"`
+}
+
+type listJobsOutput struct {
+	Jobs     []string          `json:"jobs"`
+	JobNames map[string]string `json:"job_names,omitempty"`
 }
 
 type retryFailedOutput struct {

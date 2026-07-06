@@ -1442,6 +1442,33 @@ func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
 	}
 }
 
+func TestPrintJobsIncludesNames(t *testing.T) {
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobs(out, []state.Job{
+			{JobID: "job-a", Name: "Backfill A"},
+			{JobID: "job-b"},
+		})
+	})
+
+	if got != "job-a\tBackfill A\njob-b\n" {
+		t.Fatalf("printJobs output = %q", got)
+	}
+}
+
+func TestBuildListJobsOutputPreservesJobIDList(t *testing.T) {
+	got := buildListJobsOutput([]state.Job{
+		{JobID: "job-a", Name: "Backfill A"},
+		{JobID: "job-b"},
+	})
+
+	if strings.Join(got.Jobs, ",") != "job-a,job-b" {
+		t.Fatalf("jobs = %v", got.Jobs)
+	}
+	if len(got.JobNames) != 1 || got.JobNames["job-a"] != "Backfill A" {
+		t.Fatalf("job names = %+v", got.JobNames)
+	}
+}
+
 func TestPrintJobSummaryIncludesInProgressStages(t *testing.T) {
 	summary := jobSummary{
 		JobID:  "job-1",
