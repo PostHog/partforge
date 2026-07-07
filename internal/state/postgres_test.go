@@ -156,6 +156,33 @@ func TestCompactCandidateGroupsSkipsExcludedJobs(t *testing.T) {
 	}
 }
 
+func TestValidatePartRejectsPartialSourceRef(t *testing.T) {
+	part := NewPart("job-1", "part-1", "bucket", "source/part-1", "finished/part-1", time.Now().UTC())
+	part.SourceJobID = "job-source"
+
+	err := validatePart(part)
+	if err == nil {
+		t.Fatal("expected partial source ref error")
+	}
+	if !strings.Contains(err.Error(), "source_job_id and source_part_id") {
+		t.Fatalf("error = %v, want source ref error", err)
+	}
+}
+
+func TestValidatePartRejectsSelfSourceRef(t *testing.T) {
+	part := NewPart("job-1", "part-1", "bucket", "source/part-1", "finished/part-1", time.Now().UTC())
+	part.SourceJobID = part.JobID
+	part.SourcePartID = part.PartID
+
+	err := validatePart(part)
+	if err == nil {
+		t.Fatal("expected self source ref error")
+	}
+	if !strings.Contains(err.Error(), "cannot reference itself") {
+		t.Fatalf("error = %v, want self source ref error", err)
+	}
+}
+
 func TestCompactCandidateGroupsSeparateJobs(t *testing.T) {
 	candidates := []Part{
 		compactBatchTestPart("job-a", "part-a1", StatusCompactReady),

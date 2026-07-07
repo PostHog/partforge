@@ -7,6 +7,7 @@ CH_HTTP_HOST="http://127.0.0.1:18123"
 CH_HTTP_DOCKER="http://clickhouse:8123"
 POSTGRES_URL="postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable"
 JOB_ID="e2e-job"
+COPY_JOB_ID="e2e-copy-job"
 JOB_NAME="E2E import"
 
 cd "$ROOT"
@@ -186,6 +187,35 @@ if ! grep -F "E2E import" <<<"$job_list" >/dev/null; then
   echo "$job_list" >&2
   exit 1
 fi
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
+  --workdir /work \
+  -v "$ROOT:/work:ro" \
+  worker \
+  upload-freeze \
+  -copy-parts-from-job="$JOB_ID" \
+  -destination-schema-file=e2e/sql/destination.sql \
+  -insert-select-file=e2e/sql/insert.sql \
+  -bucket=partforge \
+  -prefix=e2e \
+  -job-id="$COPY_JOB_ID" \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+
+if CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$JOB_ID" \
+  -delete-s3 \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"; then
+  echo "delete-job unexpectedly deleted a source job with copied source references" >&2
+  exit 1
+fi
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$COPY_JOB_ID" \
+  -postgres-url="$POSTGRES_URL"
 
 for i in $(seq 1 "$part_count"); do
   worker_log="$ROOT/.e2e/worker-${i}.log"

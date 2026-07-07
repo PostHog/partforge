@@ -70,10 +70,10 @@ var commandHelps = []commandHelp{
 	{
 		Name:    "upload-freeze",
 		Usage:   "[flags]",
-		Summary: "Scan a named ClickHouse FREEZE, upload frozen source parts to S3, and create READY work rows in Postgres.",
-		Details: `Run this on a host that can read the source ClickHouse disk paths from system.disks. The command writes a manifest into every frozen part, uploads each raw source part directory, and records the source schema plus destination SQL for workers.
+		Summary: "Scan a named ClickHouse FREEZE or reuse uploaded source parts, then create READY work rows in Postgres.",
+		Details: `Run this on a host that can read the source ClickHouse disk paths from system.disks. The command writes a manifest into every frozen part, uploads each raw source part directory, and records the source schema plus destination SQL for workers. With -copy-parts-from-job, it skips local disk scanning and reuses that job's uploaded source parts.
 
-Required: -database, -table, -freeze, -bucket, and either both -destination-schema-file and -insert-select-file or -copy-sql-from-job.`,
+Required: -bucket, either both -destination-schema-file and -insert-select-file or -copy-sql-from-job, and either -copy-parts-from-job or all of -database, -table, and -freeze.`,
 	},
 	{
 		Name:    "worker",
@@ -400,6 +400,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		destinationSchemaFile = fs.String("destination-schema-file", "", "path to SQL file containing the full destination CREATE TABLE")
 		insertSelectFile      = fs.String("insert-select-file", "", "path to SQL file containing INSERT INTO destination SELECT ... FROM source")
 		copySQLFromJob        = fs.String("copy-sql-from-job", "", "existing job id to copy destination schema and insert-select SQL from")
+		copyPartsFromJob      = fs.String("copy-parts-from-job", "", "existing job id whose uploaded source parts should be reused")
 		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL used for SHOW CREATE TABLE and disk discovery")
 		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP username")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
@@ -426,14 +427,14 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *database == "" || *table == "" || *freezeName == "" || *bucket == "" {
-		return errors.New("database, table, freeze, and bucket are required")
+	copyPartsJobID := strings.TrimSpace(*copyPartsFromJob)
+	if *bucket == "" {
+		return errors.New("bucket is required")
+	}
+	if copyPartsJobID == "" && (*database == "" || *table == "" || *freezeName == "") {
+		return errors.New("database, table, and freeze are required unless copy-parts-from-job is set")
 	}
 	if err := validateUploadFreezeSQLInputs(*destinationSchemaFile, *insertSelectFile, *copySQLFromJob); err != nil {
-		return err
-	}
-	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
-	if err != nil {
 		return err
 	}
 
@@ -446,6 +447,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		"freeze", *freezeName,
 		"bucket", *bucket,
 		"prefix", *prefix,
+		"copy_parts_from_job", copyPartsJobID,
 	)
 
 	var stateStore *state.Store
@@ -472,6 +474,47 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	destinationTableRef, err := destinationTableRefFromSchema(destinationSchema)
+	if err != nil {
+		return err
+	}
+
+	resolvedJobID := *jobID
+	if resolvedJobID == "" {
+		resolvedJobID, err = manifest.NewJobID()
+		if err != nil {
+			return fmt.Errorf("generate job id: %w", err)
+		}
+	}
+	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
+	resolvedJobName := strings.TrimSpace(*jobName)
+
+	if copyPartsJobID != "" {
+		stateStore, err = getStateStore()
+		if err != nil {
+			return err
+		}
+		copied, err := registerSourcePartsFromJob(ctx, stateStore, s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}, copyPartsJobID, copySourcePartsParams{
+			JobID:             resolvedJobID,
+			JobName:           resolvedJobName,
+			Dest:              destinationTableRef,
+			DestinationSchema: destinationSchema,
+			InsertSelect:      insertSelect,
+			Bucket:            *bucket,
+			Prefix:            *prefix,
+		})
+		if err != nil {
+			return err
+		}
+		elapsed := time.Since(startedAt)
+		slog.Info("upload-freeze complete", "stage", "complete", "job_id", resolvedJobID, "copy_parts_from_job", copyPartsJobID, "parts", copied, "elapsed", elapsed)
+		return nil
+	}
+
+	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
+	if err != nil {
+		return err
+	}
 
 	ch := chhttp.Client{
 		URL:      *clickHouseURL,
@@ -490,10 +533,6 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	if _, err := ddl.NormalizeCreateTable(sourceSchema); err != nil {
 		return fmt.Errorf("source schema is not supported by worker: %w", err)
 	}
-	destinationTableRef, err := destinationTableRefFromSchema(destinationSchema)
-	if err != nil {
-		return err
-	}
 	slog.Info("validated source schema and destination table", "stage", "validate_schemas", "destination_schema_table", chhttp.TableSQL(destinationTableRef.Database, destinationTableRef.Table))
 
 	slog.Info("discovering local ClickHouse disks", "stage", "discover_disks")
@@ -509,16 +548,6 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 	slog.Info("found frozen parts", "stage", "scan_freeze", "parts", len(scannedParts), "parts_by_disk", formatPartCountsByDisk(disks, scannedParts))
-
-	resolvedJobID := *jobID
-	if resolvedJobID == "" {
-		resolvedJobID, err = manifest.NewJobID()
-		if err != nil {
-			return fmt.Errorf("generate job id: %w", err)
-		}
-	}
-	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
-	resolvedJobName := strings.TrimSpace(*jobName)
 
 	stateStore, err = getStateStore()
 	if err != nil {
@@ -685,33 +714,121 @@ func copySQLBundleFromJob(ctx context.Context, store *state.Store, copier s3copy
 	return readSQLBundleFromSourceManifest(ctx, copier, part)
 }
 
-func firstOriginalSourcePart(parts []state.Part) (state.Part, bool) {
+func originalSourceParts(parts []state.Part) []state.Part {
+	var out []state.Part
 	for _, part := range parts {
 		if !isGeneratedCompactPart(part) {
-			return part, true
+			out = append(out, part)
 		}
 	}
-	return state.Part{}, false
+	return out
+}
+
+func firstOriginalSourcePart(parts []state.Part) (state.Part, bool) {
+	parts = originalSourceParts(parts)
+	if len(parts) == 0 {
+		return state.Part{}, false
+	}
+	return parts[0], true
 }
 
 func readSQLBundleFromSourceManifest(ctx context.Context, copier s3copy.Copier, part state.Part) (manifest.SQLBundle, error) {
-	dir, err := os.MkdirTemp("", "partforge-sql-*")
+	m, err := readSourceManifest(ctx, copier, part)
 	if err != nil {
 		return manifest.SQLBundle{}, err
+	}
+	sql := m.SQL
+	if strings.TrimSpace(part.DestinationSchema) != "" && strings.TrimSpace(part.InsertSelect) != "" {
+		sql.DestinationSchema = part.DestinationSchema
+		sql.InsertSelect = part.InsertSelect
+	}
+	return sql, nil
+}
+
+func readSourceManifest(ctx context.Context, copier s3copy.Copier, part state.Part) (manifest.Manifest, error) {
+	dir, err := os.MkdirTemp("", "partforge-sql-*")
+	if err != nil {
+		return manifest.Manifest{}, err
 	}
 	defer os.RemoveAll(dir)
 
 	if err := copier.DownloadFile(ctx, part.Bucket, path.Join(part.SourceKey, artifact.ManifestName), filepath.Join(dir, artifact.ManifestName)); err != nil {
-		return manifest.SQLBundle{}, fmt.Errorf("download source manifest for %s/%s: %w", part.JobID, part.PartID, err)
+		return manifest.Manifest{}, fmt.Errorf("download source manifest for %s/%s: %w", part.JobID, part.PartID, err)
 	}
 	m, err := artifact.ReadManifest(dir)
 	if err != nil {
-		return manifest.SQLBundle{}, fmt.Errorf("read source manifest for %s/%s: %w", part.JobID, part.PartID, err)
+		return manifest.Manifest{}, fmt.Errorf("read source manifest for %s/%s: %w", part.JobID, part.PartID, err)
 	}
-	if m.JobID != part.JobID || m.PartID != part.PartID {
-		return manifest.SQLBundle{}, fmt.Errorf("source manifest for %s/%s contains %s/%s", part.JobID, part.PartID, m.JobID, m.PartID)
+	sourceJobID, sourcePartID := sourcePartRef(part)
+	if m.JobID != sourceJobID || m.PartID != sourcePartID {
+		return manifest.Manifest{}, fmt.Errorf("source manifest for %s/%s contains %s/%s", part.JobID, part.PartID, m.JobID, m.PartID)
 	}
-	return m.SQL, nil
+	if m.S3.Bucket != part.Bucket || m.S3.SourceKey != part.SourceKey {
+		return manifest.Manifest{}, fmt.Errorf("source manifest for %s/%s does not match state S3 reference", part.JobID, part.PartID)
+	}
+	return m, nil
+}
+
+func sourcePartRef(part state.Part) (string, string) {
+	if strings.TrimSpace(part.SourceJobID) != "" {
+		return part.SourceJobID, part.SourcePartID
+	}
+	return part.JobID, part.PartID
+}
+
+type copySourcePartsParams struct {
+	JobID             string
+	JobName           string
+	Dest              manifest.TableRef
+	DestinationSchema string
+	InsertSelect      string
+	Bucket            string
+	Prefix            string
+}
+
+func registerSourcePartsFromJob(ctx context.Context, store *state.Store, copier s3copy.Copier, sourceJobID string, params copySourcePartsParams) (int, error) {
+	sourceJobID = strings.TrimSpace(sourceJobID)
+	if sourceJobID == "" {
+		return 0, errors.New("copy-parts-from-job is required")
+	}
+	if sourceJobID == params.JobID {
+		return 0, errors.New("copy-parts-from-job cannot reference the new job id")
+	}
+	parts, err := store.ListJobParts(ctx, sourceJobID)
+	if err != nil {
+		return 0, err
+	}
+	sourceParts := originalSourceParts(parts)
+	if len(sourceParts) == 0 {
+		return 0, fmt.Errorf("job %s has no original source parts to copy parts from", sourceJobID)
+	}
+
+	for _, sourcePart := range sourceParts {
+		if sourcePart.Bucket != params.Bucket {
+			return 0, fmt.Errorf("source part %s/%s is in bucket %q, expected %q", sourcePart.JobID, sourcePart.PartID, sourcePart.Bucket, params.Bucket)
+		}
+		m, err := readSourceManifest(ctx, copier, sourcePart)
+		if err != nil {
+			return 0, err
+		}
+		if m.Source.Database == params.Dest.Database && m.Source.Table == params.Dest.Table {
+			return 0, fmt.Errorf("source and destination table names must differ inside the worker")
+		}
+		partID := manifest.DerivePartID(m.Part.Disk, m.Part.RelativePath, m.Part.Name, m.SQL.SourceSchema, params.DestinationSchema, params.InsertSelect)
+		sourceOwnerJobID, sourceOwnerPartID := sourcePartRef(sourcePart)
+		part := state.NewPart(params.JobID, partID, params.Bucket, sourcePart.SourceKey, manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID), time.Now().UTC())
+		part.JobName = params.JobName
+		part.SourceJobID = sourceOwnerJobID
+		part.SourcePartID = sourceOwnerPartID
+		part.DestinationDatabase = params.Dest.Database
+		part.DestinationTable = params.Dest.Table
+		part.DestinationSchema = params.DestinationSchema
+		part.InsertSelect = params.InsertSelect
+		if err := store.CreatePart(ctx, part); err != nil {
+			return 0, fmt.Errorf("create copied source part state for %s/%s from %s/%s: %w", part.JobID, part.PartID, sourceOwnerJobID, sourceOwnerPartID, err)
+		}
+	}
+	return len(sourceParts), nil
 }
 
 type uploadPartFunc func(context.Context, int, uploadPartTask) (uploadPartResult, error)
@@ -1277,11 +1394,18 @@ func runWorker(ctx context.Context, args []string) error {
 		)
 
 		workItem := rewrite.WorkItem{
-			Bucket:    part.Bucket,
-			SourceKey: part.SourceKey,
-			JobID:     part.JobID,
-			PartID:    part.PartID,
-			Attempt:   part.Attempts,
+			Bucket:              part.Bucket,
+			SourceKey:           part.SourceKey,
+			FinishedKey:         part.FinishedKey,
+			JobID:               part.JobID,
+			PartID:              part.PartID,
+			SourceJobID:         part.SourceJobID,
+			SourcePartID:        part.SourcePartID,
+			DestinationDatabase: part.DestinationDatabase,
+			DestinationTable:    part.DestinationTable,
+			DestinationSchema:   part.DestinationSchema,
+			InsertSelect:        part.InsertSelect,
+			Attempt:             part.Attempts,
 		}
 		processCtx, partShutdown := workerProcessContext(ctx, part.JobID, part.PartID)
 		result, cleanupPart, err := func() (rewrite.ProcessResult, func(), error) {
@@ -3154,6 +3278,13 @@ func runDeleteJob(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	slog.Info("deleting job state rows", "stage", "delete_state", "job_id", *jobID, "parts", len(jobParts))
+	deleteLockedS3 := func() error {
+		if !*deleteS3 {
+			return nil
+		}
 		copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
 		for _, prefix := range deletedPrefixes {
 			slog.Info("deleting job S3 prefix", "stage", "delete_s3", "job_id", *jobID, "bucket", prefix.Bucket, "prefix", prefix.Prefix)
@@ -3162,10 +3293,9 @@ func runDeleteJob(ctx context.Context, args []string) error {
 			}
 			slog.Info("deleted job S3 prefix", "stage", "delete_s3", "job_id", *jobID, "bucket", prefix.Bucket, "prefix", prefix.Prefix)
 		}
+		return nil
 	}
-
-	slog.Info("deleting job state rows", "stage", "delete_state", "job_id", *jobID, "parts", len(jobParts))
-	if err := stateStore.DeleteJobParts(ctx, jobParts); err != nil {
+	if err := stateStore.DeleteJobPartsAfterLock(ctx, jobParts, deleteLockedS3); err != nil {
 		return err
 	}
 	slog.Info("deleted job state rows", "stage", "delete_state", "job_id", *jobID, "parts", len(jobParts))
@@ -4815,7 +4945,11 @@ func jobS3Prefixes(jobID string, parts []state.Part) ([]jobS3Prefix, error) {
 		if part.JobID != jobID {
 			return nil, fmt.Errorf("part %s belongs to job %q, expected %q", part.PartID, part.JobID, jobID)
 		}
-		for _, key := range []string{part.SourceKey, part.FinishedKey} {
+		keys := []string{part.FinishedKey}
+		if strings.TrimSpace(part.SourceJobID) == "" {
+			keys = append(keys, part.SourceKey)
+		}
+		for _, key := range keys {
 			prefix, err := jobPrefixFromKey(jobID, key)
 			if err != nil {
 				return nil, err

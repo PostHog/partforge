@@ -130,11 +130,48 @@ type StageProgress struct {
 }
 
 type WorkItem struct {
-	Bucket    string
-	SourceKey string
-	JobID     string
-	PartID    string
-	Attempt   int
+	Bucket              string
+	SourceKey           string
+	FinishedKey         string
+	JobID               string
+	PartID              string
+	SourceJobID         string
+	SourcePartID        string
+	DestinationDatabase string
+	DestinationTable    string
+	DestinationSchema   string
+	InsertSelect        string
+	Attempt             int
+}
+
+func workItemSourcePart(item WorkItem) (string, string) {
+	if item.SourceJobID != "" {
+		return item.SourceJobID, item.SourcePartID
+	}
+	return item.JobID, item.PartID
+}
+
+func validateWorkItemSourceOverride(item WorkItem) error {
+	if (item.SourceJobID == "") != (item.SourcePartID == "") {
+		return fmt.Errorf("work item source_job_id and source_part_id must be set together")
+	}
+	if item.SourceJobID != "" {
+		if err := validateSafeSegment(item.SourceJobID); err != nil {
+			return err
+		}
+		if err := validateSafeSegment(item.SourcePartID); err != nil {
+			return err
+		}
+	}
+	if item.SourceJobID != "" || strings.TrimSpace(item.InsertSelect) != "" {
+		if strings.TrimSpace(item.DestinationDatabase) == "" ||
+			strings.TrimSpace(item.DestinationTable) == "" ||
+			strings.TrimSpace(item.DestinationSchema) == "" ||
+			strings.TrimSpace(item.InsertSelect) == "" {
+			return fmt.Errorf("copied source work item %s/%s is missing destination database, table, schema, or insert-select", item.JobID, item.PartID)
+		}
+	}
+	return nil
 }
 
 type ProcessResult struct {
@@ -241,8 +278,8 @@ func nonNegativeDuration(duration time.Duration) time.Duration {
 }
 
 func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result ProcessResult, err error) {
-	if item.Bucket == "" || item.SourceKey == "" || item.JobID == "" || item.PartID == "" {
-		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, job_id, or part_id")
+	if item.Bucket == "" || item.SourceKey == "" || item.FinishedKey == "" || item.JobID == "" || item.PartID == "" {
+		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, finished_key, job_id, or part_id")
 	}
 	if item.Attempt < 1 {
 		return ProcessResult{}, fmt.Errorf("work item attempt must be at least 1, got %d", item.Attempt)
@@ -251,6 +288,9 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		return ProcessResult{}, err
 	}
 	if err := validateSafeSegment(item.PartID); err != nil {
+		return ProcessResult{}, err
+	}
+	if err := validateWorkItemSourceOverride(item); err != nil {
 		return ProcessResult{}, err
 	}
 
@@ -332,11 +372,20 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"part", m.Part.RelativePath,
 		"disk", m.Part.Disk,
 	)
-	if m.JobID != item.JobID || m.PartID != item.PartID {
-		return ProcessResult{}, fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
+	sourceJobID, sourcePartID := workItemSourcePart(item)
+	if m.JobID != sourceJobID || m.PartID != sourcePartID {
+		return ProcessResult{}, fmt.Errorf("work item references source %s/%s but manifest contains %s/%s", sourceJobID, sourcePartID, m.JobID, m.PartID)
 	}
 	if m.S3.Bucket != item.Bucket || m.S3.SourceKey != item.SourceKey {
 		return ProcessResult{}, fmt.Errorf("work item S3 reference does not match manifest")
+	}
+	m.JobID = item.JobID
+	m.PartID = item.PartID
+	m.S3.FinishedKey = item.FinishedKey
+	if item.InsertSelect != "" {
+		m.Dest = manifest.TableRef{Database: item.DestinationDatabase, Table: item.DestinationTable}
+		m.SQL.DestinationSchema = item.DestinationSchema
+		m.SQL.InsertSelect = item.InsertSelect
 	}
 
 	if err := artifact.RemoveManifest(sourceRoot); err != nil {

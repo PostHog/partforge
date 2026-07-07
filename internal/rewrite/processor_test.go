@@ -43,6 +43,33 @@ func TestReduceInsertSelectThreadSettings(t *testing.T) {
 	}
 }
 
+func TestValidateWorkItemSourceOverrideRequiresDestinationSQL(t *testing.T) {
+	err := validateWorkItemSourceOverride(WorkItem{
+		JobID:        "job-copy",
+		PartID:       "part-copy",
+		SourceJobID:  "job-source",
+		SourcePartID: "part-source",
+	})
+	if err == nil {
+		t.Fatal("expected missing copied SQL error")
+	}
+	if !strings.Contains(err.Error(), "missing destination database") {
+		t.Fatalf("error = %v, want missing destination SQL", err)
+	}
+}
+
+func TestWorkItemSourcePartUsesCopiedSourceRef(t *testing.T) {
+	jobID, partID := workItemSourcePart(WorkItem{
+		JobID:        "job-copy",
+		PartID:       "part-copy",
+		SourceJobID:  "job-source",
+		SourcePartID: "part-source",
+	})
+	if jobID != "job-source" || partID != "part-source" {
+		t.Fatalf("source = %s/%s, want job-source/part-source", jobID, partID)
+	}
+}
+
 func TestReduceInsertSelectThreadSettingsStopsAtOne(t *testing.T) {
 	_, reduced, err := reduceInsertSelectThreadSettings(chhttp.QuerySettings{
 		"max_threads":        "1",

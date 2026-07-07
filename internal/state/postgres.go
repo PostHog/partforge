@@ -71,6 +71,8 @@ type Part struct {
 	Bucket         string `json:"bucket"`
 	SourceKey      string `json:"source_key"`
 	FinishedKey    string `json:"finished_key"`
+	SourceJobID    string `json:"source_job_id,omitempty"`
+	SourcePartID   string `json:"source_part_id,omitempty"`
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
 	StartedAt      string `json:"started_at,omitempty"`
@@ -88,6 +90,7 @@ type Part struct {
 	DestinationDatabase  string   `json:"destination_database,omitempty"`
 	DestinationTable     string   `json:"destination_table,omitempty"`
 	DestinationSchema    string   `json:"destination_schema,omitempty"`
+	InsertSelect         string   `json:"insert_select,omitempty"`
 	CompactGeneration    int      `json:"compact_generation,omitempty"`
 	CompactInputPartIDs  []string `json:"compact_input_part_ids,omitempty"`
 	CompactCooldownUntil string   `json:"compact_cooldown_until,omitempty"`
@@ -500,12 +503,32 @@ func (s *Store) CreatePart(ctx context.Context, part Part) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if strings.TrimSpace(part.SourceJobID) != "" {
+		source, err := s.readPartTx(ctx, tx, part.SourceJobID, part.SourcePartID)
+		if err != nil {
+			return fmt.Errorf("validate source part reference for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		if isGeneratedCompactPart(source) {
+			return fmt.Errorf("source part reference for %s/%s points at generated compact part %s/%s", part.JobID, part.PartID, source.JobID, source.PartID)
+		}
+		if source.Bucket != part.Bucket || source.SourceKey != part.SourceKey {
+			return fmt.Errorf("source part reference for %s/%s does not match source artifact %s/%s", part.JobID, part.PartID, source.JobID, source.PartID)
+		}
+	}
+	_, err = tx.Exec(ctx,
 		`INSERT INTO `+s.tableSQL+` (job_id, part_id, status, worker_id, created_at, updated_at, data) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		part.JobID, part.PartID, string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data,
 	)
 	if err != nil {
 		return fmt.Errorf("create state item for %s/%s: %w", part.JobID, part.PartID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1523,6 +1546,10 @@ func (s *Store) ListFinishedParts(ctx context.Context, jobID string) ([]Part, er
 }
 
 func (s *Store) DeleteJobParts(ctx context.Context, parts []Part) error {
+	return s.DeleteJobPartsAfterLock(ctx, parts, nil)
+}
+
+func (s *Store) DeleteJobPartsAfterLock(ctx context.Context, parts []Part, afterLock func() error) error {
 	if len(parts) == 0 {
 		return errors.New("job has no parts to delete")
 	}
@@ -1537,7 +1564,31 @@ func (s *Store) DeleteJobParts(ctx context.Context, parts []Part) error {
 		if part.JobID != jobID {
 			return fmt.Errorf("delete job parts got mixed job ids %q and %q", jobID, part.JobID)
 		}
-		tag, err := s.pool.Exec(ctx, `DELETE FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = $2`, part.JobID, part.PartID)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, part := range parts {
+		if _, err := s.readPartTx(ctx, tx, part.JobID, part.PartID); err != nil {
+			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		ref, ok, err := s.sourceDependentTx(ctx, tx, part.JobID, part.PartID)
+		if err != nil {
+			return fmt.Errorf("check source part dependents for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		if ok {
+			return fmt.Errorf("cannot delete source part %s/%s; it is referenced by %s/%s", part.JobID, part.PartID, ref.JobID, ref.PartID)
+		}
+	}
+	if afterLock != nil {
+		if err := afterLock(); err != nil {
+			return err
+		}
+	}
+	for _, part := range parts {
+		tag, err := tx.Exec(ctx, `DELETE FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = $2`, part.JobID, part.PartID)
 		if err != nil {
 			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, err)
 		}
@@ -1545,7 +1596,23 @@ func (s *Store) DeleteJobParts(ctx context.Context, parts []Part) error {
 			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, &conditionalCheckFailedError{})
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
+}
+
+func (s *Store) sourceDependentTx(ctx context.Context, tx pgx.Tx, jobID, partID string) (Part, bool, error) {
+	var data []byte
+	err := tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE data->>'source_job_id' = $1 AND data->>'source_part_id' = $2 ORDER BY job_id, part_id LIMIT 1`, jobID, partID).Scan(&data)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Part{}, false, nil
+	}
+	if err != nil {
+		return Part{}, false, err
+	}
+	part, err := partFromJSON(data)
+	if err != nil {
+		return Part{}, false, err
+	}
+	return part, true, nil
 }
 
 func (s *Store) MarkImporting(ctx context.Context, part Part, now time.Time) error {
@@ -1752,9 +1819,12 @@ func (s *Store) ResetOriginalPartToReady(ctx context.Context, part Part, now tim
 		current.WorkerID = ""
 		current.CompactCooldownUntil = ""
 		current.SupersededBy = ""
-		current.DestinationDatabase = ""
-		current.DestinationTable = ""
-		current.DestinationSchema = ""
+		if strings.TrimSpace(current.SourceJobID) == "" {
+			current.DestinationDatabase = ""
+			current.DestinationTable = ""
+			current.DestinationSchema = ""
+			current.InsertSelect = ""
+		}
 		current.CompactGeneration = 0
 		current.CompactInputPartIDs = nil
 		clearCompactProgress(current)
@@ -1882,7 +1952,17 @@ func validatePart(part Part) error {
 	if part.Status == "" {
 		return errors.New("part state is missing status")
 	}
+	if (part.SourceJobID == "") != (part.SourcePartID == "") {
+		return errors.New("part state source_job_id and source_part_id must be set together")
+	}
+	if part.SourceJobID == part.JobID && part.SourcePartID == part.PartID {
+		return fmt.Errorf("part %s/%s cannot reference itself as a source part", part.JobID, part.PartID)
+	}
 	return nil
+}
+
+func isGeneratedCompactPart(part Part) bool {
+	return len(part.CompactInputPartIDs) > 0 || part.CompactGeneration > 0
 }
 
 func formatTime(t time.Time) string {

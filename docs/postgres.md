@@ -2,7 +2,7 @@
 
 PartForge tracks every part of every job in Postgres. This is the source of truth for the pipeline: workers claim work with row locks, transition parts through their lifecycle, and record progress and compaction lineage here. Because all state lives in Postgres, jobs are resumable and can be driven by many workers at once.
 
-The table holds no bulk data, only per-part metadata and pointers to S3 artifacts. Part data itself lives in S3. Rows may include `job_name` when `upload-freeze -job-name` is used; `list-jobs` displays it with job status, counts, and timestamps.
+The table holds no bulk data, only per-part metadata and pointers to S3 artifacts. Part data itself lives in S3. Rows may include `job_name` when `upload-freeze -job-name` is used; `list-jobs` displays it with job status, counts, and timestamps. Rows created with `upload-freeze -copy-parts-from-job` store `source_job_id` and `source_part_id` in `data` so the source owner rows cannot be deleted while copied jobs still reference their uploaded source artifacts.
 
 ## Connection
 

@@ -1177,7 +1177,8 @@ func TestCommandHelpIncludesDescriptionAndFlags(t *testing.T) {
 	help := out.String()
 	for _, want := range []string{
 		"Scan a named ClickHouse FREEZE",
-		"Required: -database, -table, -freeze, -bucket",
+		"Required: -bucket",
+		"-copy-parts-from-job",
 		"Flags:",
 		"-database",
 	} {
@@ -1332,6 +1333,26 @@ func TestJobS3PrefixesRejectsWrongJobKey(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected wrong job key error")
+	}
+}
+
+func TestJobS3PrefixesSkipsBorrowedSourceKey(t *testing.T) {
+	prefixes, err := jobS3Prefixes("job-copy", []state.Part{
+		{
+			JobID:        "job-copy",
+			PartID:       "part-1",
+			Bucket:       "bucket",
+			SourceKey:    "partforge/jobs/job-source/source/part-1",
+			FinishedKey:  "partforge/jobs/job-copy/finished/part-1",
+			SourceJobID:  "job-source",
+			SourcePartID: "part-source",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixes) != 1 || prefixes[0].Prefix != "partforge/jobs/job-copy" {
+		t.Fatalf("prefixes = %+v, want only copied job prefix", prefixes)
 	}
 }
 
@@ -1898,6 +1919,47 @@ func TestReadSQLBundleFromSourceManifest(t *testing.T) {
 	}
 	if got.DestinationSchema != want.DestinationSchema || got.InsertSelect != want.InsertSelect {
 		t.Fatalf("sql = %+v, want destination and insert from %+v", got, want)
+	}
+}
+
+func TestReadSQLBundleFromCopiedSourceManifestUsesStateSQL(t *testing.T) {
+	sourceDir := t.TempDir()
+	sourceSQL := manifest.SQLBundle{
+		SourceSchema:      "CREATE TABLE src.events (id UInt64) ENGINE = MergeTree ORDER BY id",
+		DestinationSchema: "CREATE TABLE dst.old_events (id UInt64) ENGINE = MergeTree ORDER BY id",
+		InsertSelect:      "INSERT INTO dst.old_events SELECT id FROM src.events",
+	}
+	if err := artifact.WriteManifest(sourceDir, manifest.Manifest{
+		Version: manifest.Version,
+		JobID:   "job-source",
+		PartID:  "part-source",
+		Freeze:  "freeze-1",
+		Source:  manifest.TableRef{Database: "src", Table: "events"},
+		Dest:    manifest.TableRef{Database: "dst", Table: "old_events"},
+		Part:    manifest.SourcePart{Disk: "default", Name: "all_1_1_0", RelativePath: "store/all_1_1_0"},
+		SQL:     sourceSQL,
+		S3:      manifest.S3Refs{Bucket: "bucket", SourceKey: "source/part-1", FinishedKey: "finished/part-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	wantDestination := "CREATE TABLE dst.new_events (id UInt64) ENGINE = MergeTree ORDER BY id"
+	wantInsert := "INSERT INTO dst.new_events SELECT id FROM src.events"
+	got, err := readSQLBundleFromSourceManifest(context.Background(), s3copy.Copier{Binary: fakeS5cmdCopyFile(t, filepath.Join(sourceDir, artifact.ManifestName))}, state.Part{
+		JobID:             "job-copy",
+		PartID:            "part-copy",
+		Bucket:            "bucket",
+		SourceKey:         "source/part-1",
+		SourceJobID:       "job-source",
+		SourcePartID:      "part-source",
+		DestinationSchema: wantDestination,
+		InsertSelect:      wantInsert,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceSchema != sourceSQL.SourceSchema || got.DestinationSchema != wantDestination || got.InsertSelect != wantInsert {
+		t.Fatalf("sql = %+v, want copied job SQL with original source schema", got)
 	}
 }
 

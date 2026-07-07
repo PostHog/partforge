@@ -144,6 +144,8 @@ It prints a generated `job-id` (or pass `-job-id` to set one). `-job-name` is op
 
 For shard fanout, run the first shard with `-destination-schema-file` and `-insert-select-file`, then run later shards with `-copy-sql-from-job=<first-job-id>` instead of copying those SQL files to every host. `upload-freeze` reads the prior job's source manifest from S3 and reuses only its destination schema and insert-select; it still captures the current shard's source schema with `SHOW CREATE TABLE`.
 
+For schema experiments on the same uploaded source parts, run another `upload-freeze` with `-copy-parts-from-job=<source-job-id>` and the new destination SQL files. This skips local disk scanning and source-part uploads; the new job points at the source job's uploaded `source/` artifacts and writes its own `finished/` artifacts. Jobs that own referenced source parts cannot be deleted, and `delete-job -delete-s3` on copied jobs skips borrowed source prefixes.
+
 ### 4. worker
 
 The worker claims a `READY` part, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact finished artifacts before promoting them to `FINISHED`.
