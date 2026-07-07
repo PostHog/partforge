@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -57,6 +58,118 @@ const inProgressStageUnknown = "unknown"
 const settleWaitStage = "wait_merges"
 
 var version = "dev"
+
+type commandHelp struct {
+	Name    string
+	Usage   string
+	Summary string
+	Details string
+}
+
+var commandHelps = []commandHelp{
+	{
+		Name:    "upload-freeze",
+		Usage:   "[flags]",
+		Summary: "Scan a named ClickHouse FREEZE, upload frozen source parts to S3, and create READY work rows in Postgres.",
+		Details: `Run this on a host that can read the source ClickHouse disk paths from system.disks. The command writes a manifest into every frozen part, uploads each raw source part directory, and records the source schema plus destination SQL for workers.
+
+Required: -database, -table, -freeze, -bucket, and either both -destination-schema-file and -insert-select-file or -copy-sql-from-job.`,
+	},
+	{
+		Name:    "worker",
+		Usage:   "[flags]",
+		Summary: "Claim work from Postgres, rewrite source parts in a local ClickHouse, upload finished artifacts, and optionally compact them.",
+		Details: `A worker starts its own local ClickHouse, downloads one READY source part, runs the captured INSERT SELECT, uploads the produced destination parts, and marks the row COMPACT_READY. When rewrite work is idle, role=all workers also compact COMPACT_READY artifacts before they become FINISHED.
+
+Use -role=inserter or -role=compactor to split rewrite and compaction into separate worker pools. Use -once for a single work item.`,
+	},
+	{
+		Name:    "import-finished",
+		Usage:   "[flags]",
+		Summary: "Attach FINISHED artifacts from S3 into the final destination ClickHouse table.",
+		Details: `Run this near the destination ClickHouse node. It downloads each selected FINISHED artifact, extracts its part tarballs into the destination table's detached directory, and runs ALTER TABLE ... ATTACH PART.
+
+The destination table must be empty by default. Set -require-empty=false only when intentionally continuing a controlled single-part import.`,
+	},
+	{
+		Name:    "list-jobs",
+		Usage:   "[flags]",
+		Summary: "List jobs in the Postgres state table with status, progress, timestamps, and optional names.",
+		Details: "Use -json when another tool needs stable machine-readable output.",
+	},
+	{
+		Name:    "job-status",
+		Usage:   "[flags]",
+		Summary: "Show one job's progress, state counts, compact finalization ETA, and failed part errors.",
+		Details: "Use -parts for per-row state, -details for rewrite stage timings, and -all to include superseded rows in per-part output.",
+	},
+	{
+		Name:    "retry-failed",
+		Usage:   "[flags]",
+		Summary: "Move failed or stale parts back to the state where they can be retried.",
+		Details: `Failed rewrite parts go back to READY. Failed import parts go back to FINISHED so import-finished retries only the attach step.
+
+Select exactly one of -all, -part-id, or -stale. -include-in-progress resets stuck IN_PROGRESS rows; -force retries selected rows regardless of current state.`,
+	},
+	{
+		Name:    "set-part-state",
+		Usage:   "[flags]",
+		Summary: "Force selected part rows into a stable state for manual recovery.",
+		Details: "Select rows by repeated -part-id or by -status. The target -to-status must be READY, COMPACT_READY, or FINISHED. Requires -force.",
+	},
+	{
+		Name:    "finalize-compaction",
+		Usage:   "[flags]",
+		Summary: "Ask compacting workers to stop waiting for more merges and finish with current useful output.",
+		Details: "Select exactly one of -all, repeated -part-id, or -output-part-id. Workers observe the request through compact progress heartbeats. Requires -force.",
+	},
+	{
+		Name:    "finalise-compaction",
+		Usage:   "[flags]",
+		Summary: "British spelling alias for finalize-compaction.",
+		Details: "Runs the same recovery command as finalize-compaction and uses the same flags.",
+	},
+	{
+		Name:    "reset-compact-timer",
+		Usage:   "[flags]",
+		Summary: "Restart a job's compact-window timer by setting compact-ready timestamps to now.",
+		Details: "Use this when a job should get another compaction window before COMPACT_READY artifacts are finalized. Requires -force.",
+	},
+	{
+		Name:    "reset-job",
+		Usage:   "[flags]",
+		Summary: "Delete generated compact rows and move original source rows back to READY for a full re-rewrite.",
+		Details: "The command validates compaction lineage and refuses to run after import has started. -delete-s3 also removes generated and rewritten artifacts, while keeping uploaded source parts. Requires -force.",
+	},
+	{
+		Name:    "reset-compaction",
+		Usage:   "[flags]",
+		Summary: "Delete generated compact rows and move rewritten originals back to COMPACT_READY for re-compaction.",
+		Details: "The command validates compaction lineage and refuses to run after import has started. -delete-s3 removes generated compact artifacts. Requires -force.",
+	},
+	{
+		Name:    "delete-parts",
+		Usage:   "[flags]",
+		Summary: "Force-delete selected Postgres part rows from one job without touching S3 or ClickHouse data.",
+		Details: "Select exactly one of -all, -status, or repeated -part-id. This is state-table surgery and requires -force.",
+	},
+	{
+		Name:    "delete-job",
+		Usage:   "[flags]",
+		Summary: "Delete all Postgres state rows for one job, optionally deleting that job's S3 artifacts too.",
+		Details: "-delete-s3 deletes the recorded job prefix from S3 after deriving the target from state rows.",
+	},
+	{
+		Name:    "version",
+		Summary: "Print the build version and exit.",
+	},
+	{
+		Name:    "help",
+		Usage:   "[command]",
+		Summary: "Print top-level help or a short description for one command.",
+		Details: "Run partforge <command> --help to see that command's full flag list.",
+	},
+}
 
 type workerRunDirs struct {
 	Root       string
@@ -156,7 +269,7 @@ func run() error {
 	case "set-part-state":
 		return runSetPartState(ctx, os.Args[2:])
 	case "finalize-compaction", "finalise-compaction":
-		return runFinalizeCompaction(ctx, os.Args[2:])
+		return runFinalizeCompaction(ctx, os.Args[1], os.Args[2:])
 	case "reset-compact-timer":
 		return runResetCompactTimer(ctx, os.Args[2:])
 	case "reset-job":
@@ -168,9 +281,10 @@ func run() error {
 	case "delete-job":
 		return runDeleteJob(ctx, os.Args[2:])
 	case "version":
-		fmt.Println(version)
-		return nil
-	case "help", "-h", "--help":
+		return runVersion(os.Args[2:])
+	case "help":
+		return runHelp(os.Args[2:])
+	case "-h", "--help":
 		usage()
 		return nil
 	default:
@@ -180,64 +294,127 @@ func run() error {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage:
-  partforge upload-freeze   [flags]
-  partforge worker          [flags]
-  partforge import-finished [flags]
-  partforge list-jobs       [flags]
-  partforge job-status      [flags]
-  partforge retry-failed    [flags]
-  partforge set-part-state  [flags]
-  partforge finalize-compaction [flags]
-  partforge reset-compact-timer [flags]
-  partforge reset-job       [flags]
-  partforge reset-compaction [flags]
-  partforge delete-parts    [flags]
-  partforge delete-job      [flags]
+	printRootHelp(os.Stderr)
+}
 
-Commands:
-  upload-freeze     Upload frozen source part directories to S3 and register Postgres work.
-  worker            Claim Postgres work, rewrite source parts with local ClickHouse, and upload finished artifacts.
-  import-finished   Attach finished artifacts into the final ClickHouse table with safe part renames.
-  list-jobs         List job IDs found in the Postgres state table.
-  job-status        Show part state counts, progress, and failed part errors for one job.
-  retry-failed      Move failed parts back to their retryable state.
-  set-part-state    Force selected part rows into a stable state for admin recovery.
-  finalize-compaction Request compacting workers to save and finish current useful output.
-  reset-compact-timer Restart selected compact rows' compact-window timer.
-  reset-job         Delete generated compact rows and move original job parts back to READY.
-  reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
-  delete-parts      Force delete selected Postgres part rows from one job.
-  delete-job        Delete one job's Postgres state rows, optionally including S3 artifacts.
-  version           Print the build version.
-`)
+func printRootHelp(out io.Writer) {
+	fmt.Fprintln(out, `PartForge rewrites large ClickHouse tables by freezing source parts, rewriting them on workers, and importing finished parts into a destination table.
+
+Usage:
+  partforge <command> [flags]
+  partforge <command> --help
+
+Commands:`)
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	for _, help := range commandHelps {
+		fmt.Fprintf(tw, "  %s\t%s\n", help.Name, help.Summary)
+	}
+	_ = tw.Flush()
+	fmt.Fprintln(out, "\nConfig:\n  Every command reads defaults from /etc/partforge/config.json unless -config points elsewhere. CLI flags override config values.")
+}
+
+func newCommandFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.Usage = func() {
+		printCommandHelp(fs.Output(), name, fs)
+	}
+	return fs
+}
+
+func printCommandHelp(out io.Writer, name string, fs *flag.FlagSet) {
+	help, ok := commandHelpFor(name)
+	if !ok {
+		fmt.Fprintf(out, "Usage of %s:\n", name)
+		if fs != nil {
+			fs.PrintDefaults()
+		}
+		return
+	}
+	fmt.Fprintf(out, "%s\n\nUsage:\n  partforge %s", help.Summary, name)
+	if help.Usage != "" {
+		fmt.Fprintf(out, " %s", help.Usage)
+	}
+	fmt.Fprintln(out)
+	if help.Details != "" {
+		fmt.Fprintf(out, "\n%s\n", help.Details)
+	}
+	if fs != nil {
+		hasFlags := false
+		fs.VisitAll(func(*flag.Flag) {
+			hasFlags = true
+		})
+		if hasFlags {
+			fmt.Fprintln(out, "\nFlags:")
+			previousOutput := fs.Output()
+			fs.SetOutput(out)
+			fs.PrintDefaults()
+			fs.SetOutput(previousOutput)
+		}
+	}
+}
+
+func commandHelpFor(name string) (commandHelp, bool) {
+	for _, help := range commandHelps {
+		if help.Name == name {
+			return help, true
+		}
+	}
+	return commandHelp{}, false
+}
+
+func runVersion(args []string) error {
+	fs := newCommandFlagSet("version")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	fmt.Println(version)
+	return nil
+}
+
+func runHelp(args []string) error {
+	fs := newCommandFlagSet("help")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	switch fs.NArg() {
+	case 0:
+		printRootHelp(os.Stderr)
+	case 1:
+		if _, ok := commandHelpFor(fs.Arg(0)); !ok {
+			return fmt.Errorf("unknown command %q", fs.Arg(0))
+		}
+		printCommandHelp(os.Stderr, fs.Arg(0), nil)
+	default:
+		return errors.New("help accepts at most one command")
+	}
+	return nil
 }
 
 func runUploadFreeze(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("upload-freeze", flag.ExitOnError)
+	fs := newCommandFlagSet("upload-freeze")
 	var (
-		configPath            = fs.String("config", defaultConfigPath, "JSON config file path")
-		database              = fs.String("database", "", "source database")
-		table                 = fs.String("table", "", "source table")
-		freezeName            = fs.String("freeze", "", "ALTER TABLE ... FREEZE WITH NAME value")
-		destinationSchemaFile = fs.String("destination-schema-file", "", "file containing full CREATE TABLE for destination")
-		insertSelectFile      = fs.String("insert-select-file", "", "file containing INSERT INTO destination SELECT ... FROM source")
-		copySQLFromJob        = fs.String("copy-sql-from-job", "", "copy destination schema and insert-select from an existing job id")
-		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL for SHOW CREATE TABLE")
-		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
+		configPath            = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		database              = fs.String("database", "", "source ClickHouse database containing the frozen table")
+		table                 = fs.String("table", "", "source ClickHouse table that was frozen")
+		freezeName            = fs.String("freeze", "", "FREEZE name passed to ALTER TABLE ... FREEZE WITH NAME")
+		destinationSchemaFile = fs.String("destination-schema-file", "", "path to SQL file containing the full destination CREATE TABLE")
+		insertSelectFile      = fs.String("insert-select-file", "", "path to SQL file containing INSERT INTO destination SELECT ... FROM source")
+		copySQLFromJob        = fs.String("copy-sql-from-job", "", "existing job id to copy destination schema and insert-select SQL from")
+		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL used for SHOW CREATE TABLE and disk discovery")
+		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP username")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		jobID                 = fs.String("job-id", "", "optional job id override")
-		jobName               = fs.String("job-name", "", "optional readable job name")
-		bucket                = fs.String("bucket", "", "S3 bucket")
-		prefix                = fs.String("prefix", "partforge", "S3 key prefix")
-		stateTable            = fs.String("state-table", defaultStateTable, "Postgres state table")
+		jobID                 = fs.String("job-id", "", "job id to store in manifests and Postgres; empty generates one")
+		jobName               = fs.String("job-name", "", "readable job name shown by list-jobs")
+		bucket                = fs.String("bucket", "", "S3 bucket for source and finished part artifacts")
+		prefix                = fs.String("prefix", "partforge", "S3 key prefix under the bucket")
+		stateTable            = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region                = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint            = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers per upload process; <=0 auto-scales from upload-concurrency")
-		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source parts to upload concurrently; <=0 uses detected CPU count")
-		postgresURL           = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth       = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		s3Endpoint            = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers value per upload process; <=0 auto-scales from upload-concurrency")
+		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of frozen source parts to upload concurrently; <=0 uses detected CPU count")
+		postgresURL           = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth       = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -810,38 +987,38 @@ func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
 }
 
 func runWorker(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("worker", flag.ExitOnError)
+	fs := newCommandFlagSet("worker")
 	var (
-		configPath                = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath                = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		region                    = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint                = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary               = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		stateTable                = fs.String("state-table", defaultStateTable, "Postgres state table")
-		postgresURL               = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth           = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		clickHouseURL             = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
-		clickHouseUser            = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
-		clickHousePassword        = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		clickHouseBinary          = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
-		clickHouseConfigFile      = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
-		once                      = fs.Bool("once", false, "process one part and exit")
-		pollInterval              = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
-		workerID                  = fs.String("worker-id", "", "worker identity recorded on claimed parts")
-		workDir                   = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
+		s3Endpoint                = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary               = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		stateTable                = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+		postgresURL               = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth           = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		clickHouseURL             = fs.String("clickhouse-url", defaultClickHouseURL, "local worker ClickHouse HTTP URL")
+		clickHouseUser            = fs.String("clickhouse-user", "", "local worker ClickHouse HTTP username")
+		clickHousePassword        = fs.String("clickhouse-password", "", "local worker ClickHouse HTTP password")
+		clickHouseBinary          = fs.String("clickhouse-binary", "clickhouse", "path to the clickhouse binary used to start the local server")
+		clickHouseConfigFile      = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "base clickhouse-server config file for the local worker server")
+		once                      = fs.Bool("once", false, "process one rewrite or compaction work item, then exit")
+		pollInterval              = fs.Duration("poll-interval", 10*time.Second, "how long an idle worker sleeps before checking for work again")
+		workerID                  = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
+		workDir                   = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
 		defaultCompressionCodec   = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
 		mergeIdleTimeout          = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
 		mergeMaxRuntime           = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
-		role                      = fs.String("role", string(workerRoleAll), "worker role: all, inserter, or compactor")
-		compact                   = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
+		role                      = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
+		compact                   = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
 		compactWindow             = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactOptimizeFinalAfter = fs.Duration("compact-optimize-final-after", rewrite.DefaultCompactOptimizeFinalAfter, "how long compaction waits with mergeable idle parts before running OPTIMIZE FINAL; 0 uses the default")
 		compactMaxArtifacts       = fs.Int("compact-max-artifacts", defaultCompactMaxArtifacts, "maximum input artifacts for one compaction batch")
 		compactMaxBytes           = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
-		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
-		metricsPath               = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
-		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "local ClickHouse native Prometheus metrics port")
-		clickHousePrometheusPath  = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "local ClickHouse native Prometheus metrics HTTP path")
-		clickHouseScrapeTimeout   = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local ClickHouse native Prometheus metrics")
+		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
+		metricsPath               = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
+		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")
+		clickHousePrometheusPath  = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "HTTP path where the local worker ClickHouse exposes native Prometheus metrics")
+		clickHouseScrapeTimeout   = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local worker ClickHouse Prometheus metrics")
 		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to Postgres; <=0 disables progress writes")
 	)
 	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
@@ -2053,24 +2230,24 @@ func compactReadySince(part state.Part) (time.Time, error) {
 }
 
 func runImportFinished(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("import-finished", flag.ExitOnError)
+	fs := newCommandFlagSet("import-finished")
 	var (
-		configPath         = fs.String("config", defaultConfigPath, "JSON config file path")
-		database           = fs.String("database", "", "final destination database")
-		table              = fs.String("table", "", "final destination table")
-		jobID              = fs.String("job-id", "", "job id to import")
-		partID             = fs.String("part-id", "", "optional finished part id to import")
-		stateTable         = fs.String("state-table", defaultStateTable, "Postgres state table")
+		configPath         = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		database           = fs.String("database", "", "destination ClickHouse database to attach parts into")
+		table              = fs.String("table", "", "destination ClickHouse table to attach parts into")
+		jobID              = fs.String("job-id", "", "job id whose FINISHED parts should be imported")
+		partID             = fs.String("part-id", "", "single finished part id to import; empty imports all finished parts")
+		stateTable         = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region             = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint         = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary        = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		postgresURL        = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth    = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		s3Endpoint         = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary        = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		postgresURL        = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth    = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
 		clickHouseURL      = fs.String("clickhouse-url", defaultClickHouseURL, "destination ClickHouse HTTP URL")
-		clickHouseUser     = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
-		clickHousePassword = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		workDir            = fs.String("work-dir", "", "import scratch directory; empty uses the destination ClickHouse disk")
-		requireEmpty       = fs.Bool("require-empty", true, "fail if the destination table already has active parts")
+		clickHouseUser     = fs.String("clickhouse-user", "", "destination ClickHouse HTTP username")
+		clickHousePassword = fs.String("clickhouse-password", "", "destination ClickHouse HTTP password")
+		workDir            = fs.String("work-dir", "", "import scratch directory; empty uses a directory on the destination ClickHouse disk")
+		requireEmpty       = fs.Bool("require-empty", true, "fail if the destination table already has active parts, preventing accidental duplicate attaches")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2163,14 +2340,14 @@ func runImportFinished(ctx context.Context, args []string) error {
 }
 
 func runListJobs(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("list-jobs", flag.ExitOnError)
+	fs := newCommandFlagSet("list-jobs")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of a table")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2240,17 +2417,24 @@ func printJobs(out *os.File, jobs []state.Job) {
 }
 
 func buildListJobDetail(job state.Job) listJobDetail {
-	rewriteCompleted := job.Counts[state.StatusCompactReady] + job.Counts[state.StatusCompacting] + job.Counts[state.StatusSuperseded] + job.Counts[state.StatusFinished] + job.Counts[state.StatusImporting] + job.Counts[state.StatusImported]
-	importCompleted := job.Counts[state.StatusImported]
+	currentTotal := job.Total - job.Counts[state.StatusSuperseded]
+	currentCounts := make(map[state.Status]int, len(job.Counts))
+	for status, count := range job.Counts {
+		if status != state.StatusSuperseded {
+			currentCounts[status] = count
+		}
+	}
+	rewriteCompleted := currentCounts[state.StatusCompactReady] + currentCounts[state.StatusCompacting] + currentCounts[state.StatusFinished] + currentCounts[state.StatusImporting] + currentCounts[state.StatusImported]
+	importCompleted := currentCounts[state.StatusImported]
 	return listJobDetail{
 		JobID:            job.JobID,
 		Name:             job.Name,
-		Status:           overallStatus(job.Total, job.Counts),
-		PartsTotal:       job.Total,
+		Status:           overallStatus(currentTotal, currentCounts),
+		PartsTotal:       currentTotal,
 		RewriteCompleted: rewriteCompleted,
-		RewritePercent:   percent(rewriteCompleted, job.Total),
+		RewritePercent:   percent(rewriteCompleted, currentTotal),
 		ImportCompleted:  importCompleted,
-		ImportPercent:    percent(importCompleted, job.Total),
+		ImportPercent:    percent(importCompleted, currentTotal),
 		SubmittedAt:      job.SubmittedAt,
 		UpdatedAt:        job.UpdatedAt,
 		StatusCounts:     listJobStatusCounts(job.Counts),
@@ -2273,16 +2457,16 @@ func formatListJobProgress(done, total int) string {
 }
 
 func runJobStatus(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("job-status", flag.ExitOnError)
+	fs := newCommandFlagSet("job-status")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id to inspect")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
 		compactWindow   = fs.Duration("compact-window", defaultCompactWindow, "worker compact window used to report compact finalization ETA")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 		showParts       = fs.Bool("parts", false, "include per-part state rows")
 		showDetails     = fs.Bool("details", false, "include per-part rewrite stage timing details")
 		showAllParts    = fs.Bool("all", false, "include superseded parts in per-part output")
@@ -2363,21 +2547,21 @@ func selectImportFinishedParts(finishedParts []state.Part, partID string) ([]sta
 }
 
 func runRetryFailed(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("retry-failed", flag.ExitOnError)
+	fs := newCommandFlagSet("retry-failed")
 	var (
-		configPath        = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath        = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID             = fs.String("job-id", "", "job id containing failed parts")
-		partID            = fs.String("part-id", "", "specific part id to retry")
+		partID            = fs.String("part-id", "", "single part id to retry")
 		all               = fs.Bool("all", false, "retry all failed parts in the job")
 		stale             = fs.Bool("stale", false, "retry IN_PROGRESS parts with stale persisted progress")
 		staleAfter        = fs.Duration("stale-after", defaultRetryStaleAfter, "minimum age of progress_updated_at for -stale")
-		includeInProgress = fs.Bool("include-in-progress", false, "also retry IN_PROGRESS parts by returning them to READY")
+		includeInProgress = fs.Bool("include-in-progress", false, "with -all or -part-id, also return selected IN_PROGRESS parts to READY")
 		force             = fs.Bool("force", false, "retry selected parts regardless of current state")
-		stateTable        = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable        = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region            = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL       = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth   = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput        = fs.Bool("json", false, "print JSON output")
+		postgresURL       = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth   = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput        = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2479,19 +2663,19 @@ func runResetJob(ctx context.Context, args []string) error {
 }
 
 func runSetPartState(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("set-part-state", flag.ExitOnError)
+	fs := newCommandFlagSet("set-part-state")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id containing parts to update")
 		partIDs         partIDListFlag
 		status          = fs.String("status", "", "update parts currently in this exact state, e.g. COMPACTING")
 		toStatus        = fs.String("to-status", "", "target stable state: READY, COMPACT_READY, or FINISHED")
 		force           = fs.Bool("force", false, "required to update selected part rows")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	fs.Var(&partIDs, "part-id", "specific part id to update; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2574,20 +2758,20 @@ func runSetPartState(ctx context.Context, args []string) error {
 	return nil
 }
 
-func runFinalizeCompaction(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("finalize-compaction", flag.ExitOnError)
+func runFinalizeCompaction(ctx context.Context, command string, args []string) error {
+	fs := newCommandFlagSet(command)
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id containing compacting parts")
 		partIDs         partIDListFlag
 		outputPartID    = fs.String("output-part-id", "", "compact output part id from worker logs or compact progress")
 		all             = fs.Bool("all", false, "request finalization for all COMPACTING rows in the job")
 		force           = fs.Bool("force", false, "required to request compaction finalization")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	fs.Var(&partIDs, "part-id", "specific COMPACTING state part id to finalize; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2669,16 +2853,16 @@ func runFinalizeCompaction(ctx context.Context, args []string) error {
 }
 
 func runResetCompactTimer(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("reset-compact-timer", flag.ExitOnError)
+	fs := newCommandFlagSet("reset-compact-timer")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id whose compact timer should be reset")
 		force           = fs.Bool("force", false, "required to reset compact timer")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2734,19 +2918,19 @@ func runResetCompaction(ctx context.Context, args []string) error {
 }
 
 func runResetState(ctx context.Context, args []string, mode resetMode) error {
-	fs := flag.NewFlagSet(string(mode), flag.ExitOnError)
+	fs := newCommandFlagSet(string(mode))
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id to reset")
 		force           = fs.Bool("force", false, "required to reset selected job state")
 		deleteS3        = fs.Bool("delete-s3", false, "also delete reset artifact S3 prefixes")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint      = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		s3Endpoint      = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2830,19 +3014,19 @@ func runResetState(ctx context.Context, args []string, mode resetMode) error {
 }
 
 func runDeleteParts(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("delete-parts", flag.ExitOnError)
+	fs := newCommandFlagSet("delete-parts")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id containing parts to delete")
 		partIDs         partIDListFlag
 		status          = fs.String("status", "", "delete parts in this exact state, e.g. IMPORTED")
 		all             = fs.Bool("all", false, "delete every part row in the job")
 		force           = fs.Bool("force", false, "required to delete selected part rows")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	fs.Var(&partIDs, "part-id", "specific part id to delete; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
@@ -2919,18 +3103,18 @@ func runDeleteParts(ctx context.Context, args []string) error {
 }
 
 func runDeleteJob(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("delete-job", flag.ExitOnError)
+	fs := newCommandFlagSet("delete-job")
 	var (
-		configPath      = fs.String("config", defaultConfigPath, "JSON config file path")
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		jobID           = fs.String("job-id", "", "job id to delete")
 		deleteS3        = fs.Bool("delete-s3", false, "also delete this job's S3 artifacts")
-		stateTable      = fs.String("state-table", defaultStateTable, "Postgres state table")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint      = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		postgresURL     = fs.String("postgres-url", "", "Postgres state store URL")
-		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM auth for Postgres state store")
-		jsonOutput      = fs.Bool("json", false, "print JSON output")
+		s3Endpoint      = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary     = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -3022,45 +3206,7 @@ func destinationTableRefFromSchema(schema string) (manifest.TableRef, error) {
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) error {
-	return fs.Parse(filterUnknownFlags(fs, args))
-}
-
-func filterUnknownFlags(fs *flag.FlagSet, args []string) []string {
-	known := map[string]struct{}{}
-	fs.VisitAll(func(f *flag.Flag) {
-		known[f.Name] = struct{}{}
-	})
-
-	filtered := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			filtered = append(filtered, args[i:]...)
-			break
-		}
-		if !strings.HasPrefix(arg, "-") || arg == "-" {
-			filtered = append(filtered, arg)
-			continue
-		}
-
-		name, hasInlineValue := flagNameAndValue(arg)
-		if _, ok := known[name]; ok {
-			filtered = append(filtered, arg)
-			continue
-		}
-
-		fmt.Fprintf(os.Stderr, "warning: flag is not recognised; continuing anyway: %s\n", arg)
-		if !hasInlineValue && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-			i++
-		}
-	}
-	return filtered
-}
-
-func flagNameAndValue(arg string) (string, bool) {
-	trimmed := strings.TrimLeft(arg, "-")
-	name, _, hasValue := strings.Cut(trimmed, "=")
-	return name, hasValue
+	return fs.Parse(args)
 }
 
 func applyConfigDefaults(fs *flag.FlagSet, path, command string) error {

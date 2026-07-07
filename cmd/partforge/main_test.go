@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1128,20 +1130,60 @@ func TestWorkerSettingsForRole(t *testing.T) {
 	}
 }
 
-func TestParseFlagsIgnoresUnknownFlags(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	known := fs.String("known", "", "")
-	enabled := fs.Bool("enabled", false, "")
+func TestParseFlagsPreservesHelpFlags(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
 
-	err := parseFlags(fs, []string{"-unknown", "discarded", "-known", "value", "--old-bool", "-enabled", "--inline=ignored"})
-	if err != nil {
-		t.Fatal(err)
+		err := parseFlags(fs, []string{arg})
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("parseFlags(%q) error = %v, want flag.ErrHelp", arg, err)
+		}
 	}
-	if *known != "value" {
-		t.Fatalf("known = %q, want value", *known)
+}
+
+func TestUnknownFlagPrintsCommandHelp(t *testing.T) {
+	fs := flag.NewFlagSet("upload-freeze", flag.ContinueOnError)
+	fs.String("database", "", "source ClickHouse database containing the frozen table")
+	var out bytes.Buffer
+	fs.SetOutput(&out)
+	fs.Usage = func() {
+		printCommandHelp(fs.Output(), "upload-freeze", fs)
 	}
-	if !*enabled {
-		t.Fatal("expected enabled flag to be parsed")
+
+	err := parseFlags(fs, []string{"--not-a-real-flag"})
+	if err == nil {
+		t.Fatal("expected unknown flag to fail")
+	}
+	help := out.String()
+	for _, want := range []string{
+		"flag provided but not defined: -not-a-real-flag",
+		"Scan a named ClickHouse FREEZE",
+		"Flags:",
+		"-database",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("unknown flag output missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestCommandHelpIncludesDescriptionAndFlags(t *testing.T) {
+	fs := flag.NewFlagSet("upload-freeze", flag.ContinueOnError)
+	fs.String("database", "", "source ClickHouse database containing the frozen table")
+
+	var out bytes.Buffer
+	printCommandHelp(&out, "upload-freeze", fs)
+	help := out.String()
+	for _, want := range []string{
+		"Scan a named ClickHouse FREEZE",
+		"Required: -database, -table, -freeze, -bucket",
+		"Flags:",
+		"-database",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("help output missing %q:\n%s", want, help)
+		}
 	}
 }
 
@@ -1508,6 +1550,32 @@ func TestBuildListJobsOutputPreservesJobIDList(t *testing.T) {
 	}
 	if got.Details[1].Status != "READY" || got.Details[1].PartsTotal != 1 {
 		t.Fatalf("job-b detail = %+v", got.Details[1])
+	}
+}
+
+func TestBuildListJobDetailIgnoresSupersededRowsForProgress(t *testing.T) {
+	imported := buildListJobDetail(state.Job{
+		JobID: "job-imported",
+		Total: 3096,
+		Counts: map[state.Status]int{
+			state.StatusSuperseded: 3091,
+			state.StatusImported:   5,
+		},
+	})
+	if imported.Status != "IMPORTED" || imported.PartsTotal != 5 || imported.RewriteCompleted != 5 || imported.ImportCompleted != 5 || imported.ImportPercent != 100 {
+		t.Fatalf("imported detail = %+v", imported)
+	}
+
+	readyForImport := buildListJobDetail(state.Job{
+		JobID: "job-ready-for-import",
+		Total: 3078,
+		Counts: map[state.Status]int{
+			state.StatusSuperseded: 3073,
+			state.StatusFinished:   5,
+		},
+	})
+	if readyForImport.Status != "READY_FOR_IMPORT" || readyForImport.PartsTotal != 5 || readyForImport.RewriteCompleted != 5 || readyForImport.ImportCompleted != 0 || readyForImport.ImportPercent != 0 {
+		t.Fatalf("ready-for-import detail = %+v", readyForImport)
 	}
 }
 
