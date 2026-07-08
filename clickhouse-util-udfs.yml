@@ -1,0 +1,7 @@
+repository: PostHog/clickhouse-util-udfs
+release: latest
+loader_config_name: udf_config.xml
+udfs:
+  - binary_name: json_clean_posthog_event_properties_udf
+    config_name: JSONCleanPostHogEventProperties_function.xml
+    config_dest_name: json_clean_posthog_event_properties_function.xml

@@ -33,9 +33,23 @@ RUN apt-get update \
         clickhouse-client=${CLICKHOUSE_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
+FROM clickhouse-runtime AS clickhouse-util-udfs
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-yaml \
+    && rm -rf /var/lib/apt/lists/*
+COPY clickhouse-util-udfs.yml /etc/partforge/clickhouse-util-udfs.yml
+COPY clickhouse/install_clickhouse_util_udfs.py /usr/local/bin/install-clickhouse-util-udfs
+RUN chmod 0755 /usr/local/bin/install-clickhouse-util-udfs \
+    && CLICKHOUSE_CONFIG_DIR=/out/etc/clickhouse-server CLICKHOUSE_DATA_PATH=/out/var/lib/clickhouse \
+        install-clickhouse-util-udfs /etc/partforge/clickhouse-util-udfs.yml "$TARGETARCH"
+
 FROM clickhouse-runtime AS worker
 COPY --from=build /out/partforge /usr/local/bin/partforge
 COPY --from=s5cmd /s5cmd /usr/local/bin/s5cmd
+COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/etc/clickhouse-server/config.d/clickhouse-util-udfs.xml /etc/clickhouse-server/config.d/clickhouse-util-udfs.xml
+COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/etc/clickhouse-server/user_defined/ /etc/clickhouse-server/user_defined/
+COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/var/lib/clickhouse/user_scripts/ /var/lib/clickhouse/user_scripts/
 RUN chmod 0755 /usr/local/bin/partforge /usr/local/bin/s5cmd
 USER root
 ENTRYPOINT ["/usr/local/bin/partforge"]
