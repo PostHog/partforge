@@ -5,3 +5,6 @@ udfs:
   - binary_name: json_clean_posthog_event_properties_udf
     config_name: JSONCleanPostHogEventProperties_function.xml
     config_dest_name: json_clean_posthog_event_properties_function.xml
+  - binary_name: json_drop_keys_udf
+    config_name: JSONDropKeys_function.xml
+    config_dest_name: json_drop_keys_function.xml
