@@ -47,6 +47,7 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 		"--filesystem_caches_path=" + withTrailingSeparator(filepath.Join(root, "filesystem_caches")),
 		"--custom_local_disks_base_directory=" + withTrailingSeparator(filepath.Join(root, "disks")),
 		"--user_directories.local_directory.path=" + withTrailingSeparator(filepath.Join(root, "access")),
+		"--user_scripts_path=" + withTrailingSeparator(clickHouseUserScriptsPath),
 		"--background_pool_size=12",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -162,6 +163,7 @@ func TestArgsGenerateMergePoolFreeEntriesConfig(t *testing.T) {
 		"--filesystem_caches_path=" + withTrailingSeparator(filepath.Join(root, "filesystem_caches")),
 		"--custom_local_disks_base_directory=" + withTrailingSeparator(filepath.Join(root, "disks")),
 		"--user_directories.local_directory.path=" + withTrailingSeparator(filepath.Join(root, "access")),
+		"--user_scripts_path=" + withTrailingSeparator(clickHouseUserScriptsPath),
 		"--background_pool_size=13",
 		"--background_merges_mutations_concurrency_ratio=0.3076923076923077",
 	}

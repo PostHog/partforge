@@ -52,6 +52,7 @@ type Server struct {
 }
 
 const clickHouseStopTimeout = 30 * time.Second
+const clickHouseUserScriptsPath = "/var/lib/clickhouse/user_scripts"
 
 func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Binary == "" {
@@ -400,6 +401,7 @@ func storageConfigArgs(dataDir string) ([]string, []string, error) {
 	for _, p := range paths {
 		configOverrides = append(configOverrides, p.arg+withTrailingSeparator(p.path))
 	}
+	configOverrides = append(configOverrides, "--user_scripts_path="+withTrailingSeparator(clickHouseUserScriptsPath))
 	return serverArgs, configOverrides, nil
 }
 
