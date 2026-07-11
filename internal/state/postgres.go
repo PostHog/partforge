@@ -127,12 +127,14 @@ type Part struct {
 }
 
 type Job struct {
-	JobID       string         `json:"job_id"`
-	Name        string         `json:"name,omitempty"`
-	Total       int            `json:"total"`
-	Counts      map[Status]int `json:"counts,omitempty"`
-	SubmittedAt string         `json:"submitted_at,omitempty"`
-	UpdatedAt   string         `json:"updated_at,omitempty"`
+	JobID                      string         `json:"job_id"`
+	Name                       string         `json:"name,omitempty"`
+	Total                      int            `json:"total"`
+	Counts                     map[Status]int `json:"counts,omitempty"`
+	DestinationActivePartCount uint64         `json:"destination_active_part_count,omitempty"`
+	DestinationPartitionCount  int            `json:"destination_partition_count,omitempty"`
+	SubmittedAt                string         `json:"submitted_at,omitempty"`
+	UpdatedAt                  string         `json:"updated_at,omitempty"`
 }
 
 type QueryProgress struct {
@@ -1452,6 +1454,7 @@ func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]s
 
 func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job, error) {
 	jobsByID := map[string]Job{}
+	jobPartitionsByID := map[string]map[string]struct{}{}
 	queried := map[Status]struct{}{}
 	for _, status := range statuses {
 		if strings.TrimSpace(string(status)) == "" {
@@ -1481,6 +1484,18 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 			}
 			existing.Total++
 			existing.Counts[status]++
+			if status != StatusSuperseded {
+				existing.DestinationActivePartCount += part.DestinationActivePartCount
+				if jobPartitionsByID[part.JobID] == nil {
+					jobPartitionsByID[part.JobID] = map[string]struct{}{}
+				}
+				for partitionID, count := range part.DestinationActivePartitionCounts {
+					if strings.TrimSpace(partitionID) != "" && count > 0 {
+						jobPartitionsByID[part.JobID][partitionID] = struct{}{}
+					}
+				}
+				existing.DestinationPartitionCount = len(jobPartitionsByID[part.JobID])
+			}
 			if part.CreatedAt != "" && (existing.SubmittedAt == "" || part.CreatedAt < existing.SubmittedAt) {
 				existing.SubmittedAt = part.CreatedAt
 			}

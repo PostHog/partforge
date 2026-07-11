@@ -1513,12 +1513,14 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 	got := captureFileOutput(t, func(out *os.File) {
 		printJobs(out, []state.Job{
 			{
-				JobID:       "job-a",
-				Name:        "Backfill A",
-				Total:       3,
-				Counts:      map[state.Status]int{state.StatusReady: 2, state.StatusFinished: 1},
-				SubmittedAt: "2026-06-24T00:00:00.000000000Z",
-				UpdatedAt:   "2026-06-24T01:00:00.000000000Z",
+				JobID:                      "job-a",
+				Name:                       "Backfill A",
+				Total:                      3,
+				Counts:                     map[state.Status]int{state.StatusReady: 2, state.StatusFinished: 1},
+				DestinationActivePartCount: 17,
+				DestinationPartitionCount:  4,
+				SubmittedAt:                "2026-06-24T00:00:00.000000000Z",
+				UpdatedAt:                  "2026-06-24T01:00:00.000000000Z",
 			},
 			{JobID: "job-b", Total: 1, Counts: map[state.Status]int{state.StatusFailed: 1}},
 		})
@@ -1527,7 +1529,10 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 	for _, want := range []string{
 		"JOB_ID",
 		"STATUS",
-		"PARTS",
+		"ARTIFACTS",
+		"CH_PARTS",
+		"PARTITIONS",
+		"job-a   READY   3          17        4",
 		"SUBMITTED_AT",
 		"UPDATED_AT",
 		"COUNTS",

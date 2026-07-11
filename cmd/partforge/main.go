@@ -2520,15 +2520,17 @@ func buildListJobsOutput(jobs []state.Job) listJobsOutput {
 
 func printJobs(out *os.File, jobs []state.Job) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tPARTS\tREWRITE\tIMPORT\tSUBMITTED_AT\tUPDATED_AT\tNAME\tCOUNTS")
+	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tARTIFACTS\tCH_PARTS\tPARTITIONS\tREWRITE\tIMPORT\tSUBMITTED_AT\tUPDATED_AT\tNAME\tCOUNTS")
 	for _, job := range jobs {
 		detail := buildListJobDetail(job)
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			detail.JobID,
 			detail.Status,
 			detail.PartsTotal,
+			detail.ClickHouseParts,
+			detail.Partitions,
 			formatListJobProgress(detail.RewriteCompleted, detail.PartsTotal),
 			formatListJobProgress(detail.ImportCompleted, detail.PartsTotal),
 			detail.SubmittedAt,
@@ -2555,6 +2557,8 @@ func buildListJobDetail(job state.Job) listJobDetail {
 		Name:             job.Name,
 		Status:           overallStatus(currentTotal, currentCounts),
 		PartsTotal:       currentTotal,
+		ClickHouseParts:  job.DestinationActivePartCount,
+		Partitions:       job.DestinationPartitionCount,
 		RewriteCompleted: rewriteCompleted,
 		RewritePercent:   percent(rewriteCompleted, currentTotal),
 		ImportCompleted:  importCompleted,
@@ -3796,6 +3800,8 @@ type listJobDetail struct {
 	Name             string        `json:"name,omitempty"`
 	Status           string        `json:"status"`
 	PartsTotal       int           `json:"parts_total"`
+	ClickHouseParts  uint64        `json:"clickhouse_parts"`
+	Partitions       int           `json:"partitions"`
 	RewriteCompleted int           `json:"rewrite_completed"`
 	RewritePercent   float64       `json:"rewrite_percent"`
 	ImportCompleted  int           `json:"import_completed"`
