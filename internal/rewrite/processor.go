@@ -545,7 +545,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		Database: m.Dest.Database,
 		Table:    m.Dest.Table,
 	}
-	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart"); err != nil {
+	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart", false); err != nil {
 		return rewriteResult{}, err
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
@@ -812,12 +812,12 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 	return value
 }
 
-func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Manifest, stageTracker *rewriteStageTracker, target mergeWaitTarget, waitContext string) (bool, error) {
+func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Manifest, stageTracker *rewriteStageTracker, target mergeWaitTarget, waitContext string, waitForSelection bool) (bool, error) {
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
 		return false, err
 	}
 	slog.Info("waiting for destination merges", "stage", stageWaitMerges, "job_id", m.JobID, "part_id", m.PartID, "destination_table", target.tableSQL(), "wait_context", waitContext)
-	mergeWait, err := p.waitForMerges(ctx, target)
+	mergeWait, err := p.waitForMerges(ctx, target, waitForSelection)
 	if err != nil && ctx.Err() != nil {
 		return false, err
 	}
@@ -1450,7 +1450,7 @@ type mergeWaitLogState struct {
 	lastReason string
 }
 
-func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (mergeWaitResult, error) {
+func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, waitForSelection bool) (mergeWaitResult, error) {
 	timeout := p.MergeTimeout
 	if timeout == 0 {
 		timeout = DefaultMergeTimeout
@@ -1534,6 +1534,17 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 				optimizeFinalSnapshot = mergePartSnapshot{}
 				continue
 			}
+		}
+		if count == 0 && !waitForSelection {
+			return mergeWaitResult{
+				Settled:          true,
+				Reason:           "no_active_destination_merges",
+				ActiveParts:      snapshot.ActiveParts,
+				TotalBytes:       snapshot.TotalBytes,
+				LargestPartBytes: snapshot.LargestPartBytes,
+				Timeout:          timeout,
+				MaxTimeout:       maxTimeout,
+			}, nil
 		}
 
 		zeroMergesIdle := time.Duration(0)

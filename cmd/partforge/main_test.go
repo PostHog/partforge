@@ -1006,32 +1006,17 @@ func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
 	}
 }
 
-func TestDerivedMergeSettleMinWait(t *testing.T) {
-	if got := derivedMergeSettleMinWait(5*time.Minute, time.Minute); got != time.Minute {
-		t.Fatalf("derivedMergeSettleMinWait(5m, 1m) = %s, want 1m", got)
-	}
-	if got := derivedMergeSettleMinWait(15*time.Second, 2*time.Minute); got != 3750*time.Millisecond {
-		t.Fatalf("derivedMergeSettleMinWait(15s, 2m) = %s, want 3.75s", got)
-	}
-	if got := derivedMergeSettleMinWait(0, time.Minute); got != 0 {
-		t.Fatalf("derivedMergeSettleMinWait(0, 1m) = %s, want 0", got)
-	}
-}
-
-func TestSourceMergeWaitTimeoutsCapWhenCompactEnabled(t *testing.T) {
-	idleTimeout, maxRuntime := sourceMergeWaitTimeouts(time.Hour, 2*time.Hour, true)
-	if idleTimeout != compactSourceMergeWaitCap || maxRuntime != compactSourceMergeWaitCap {
-		t.Fatalf("source merge timeouts = %s/%s, want %s/%s", idleTimeout, maxRuntime, compactSourceMergeWaitCap, compactSourceMergeWaitCap)
+func TestSourceMergeWaitMaxRuntimeCapsWhenCompactEnabled(t *testing.T) {
+	if maxRuntime := sourceMergeWaitMaxRuntime(2*time.Hour, true); maxRuntime != compactSourceMergeWaitCap {
+		t.Fatalf("source merge max runtime = %s, want %s", maxRuntime, compactSourceMergeWaitCap)
 	}
 
-	idleTimeout, maxRuntime = sourceMergeWaitTimeouts(time.Hour, 2*time.Hour, false)
-	if idleTimeout != time.Hour || maxRuntime != 2*time.Hour {
-		t.Fatalf("source merge timeouts without compact = %s/%s, want 1h/2h", idleTimeout, maxRuntime)
+	if maxRuntime := sourceMergeWaitMaxRuntime(2*time.Hour, false); maxRuntime != 2*time.Hour {
+		t.Fatalf("source merge max runtime without compact = %s, want 2h", maxRuntime)
 	}
 
-	idleTimeout, maxRuntime = sourceMergeWaitTimeouts(time.Minute, 30*time.Second, true)
-	if idleTimeout != time.Minute || maxRuntime != time.Minute {
-		t.Fatalf("source merge timeouts with short max = %s/%s, want 1m/1m", idleTimeout, maxRuntime)
+	if maxRuntime := sourceMergeWaitMaxRuntime(30*time.Second, true); maxRuntime != 30*time.Second {
+		t.Fatalf("short source merge max runtime = %s, want 30s", maxRuntime)
 	}
 }
 

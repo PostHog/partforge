@@ -199,7 +199,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}
 		err := func() error {
 			defer cancelWait()
-			_, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact")
+			_, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact", true)
 			return err
 		}()
 		if err != nil {

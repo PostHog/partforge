@@ -1123,7 +1123,6 @@ func runWorker(ctx context.Context, args []string) error {
 		workerID                  = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
 		workDir                   = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
 		defaultCompressionCodec   = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
-		mergeIdleTimeout          = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
 		mergeMaxRuntime           = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
 		role                      = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
 		compact                   = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
@@ -1160,9 +1159,6 @@ func runWorker(ctx context.Context, args []string) error {
 	roleSettings, err := workerSettingsForRole(selectedRole, *compact)
 	if err != nil {
 		return err
-	}
-	if *mergeIdleTimeout < 0 {
-		return fmt.Errorf("merge-idle-timeout must be non-negative, got %s", *mergeIdleTimeout)
 	}
 	if *mergeMaxRuntime < 0 {
 		return fmt.Errorf("merge-max-runtime must be non-negative, got %s", *mergeMaxRuntime)
@@ -1249,8 +1245,7 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge concurrency ratio: %w", err)
 	}
-	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
-	sourceMergeSettleMinWait := derivedMergeSettleMinWait(sourceMergeIdleTimeout, rewrite.DefaultMergeSettleMinWait)
+	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
 	slog.Info(
@@ -1274,9 +1269,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"merge_pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy,
-		"merge_idle_timeout", sourceMergeIdleTimeout,
 		"merge_max_runtime", sourceMergeMaxRuntime,
-		"merge_settle_min_wait", sourceMergeSettleMinWait,
 		"source_merge_compact_cap_enabled", roleSettings.SourceMergeCompactCap,
 		"source_merge_compact_cap", compactSourceMergeWaitCap,
 		"compact_window", *compactWindow,
@@ -1472,16 +1465,14 @@ func runWorker(ctx context.Context, args []string) error {
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:          ch,
-				WorkDir:             runDirs.Scratch,
-				MergeTimeout:        sourceMergeIdleTimeout,
-				MergeMaxTimeout:     sourceMergeMaxRuntime,
-				MergeSettleMinWait:  sourceMergeSettleMinWait,
-				MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
-				Metrics:             recorder,
-				InsertSettings:      insertSettings,
-				ProgressInterval:    *stateProgressInterval,
+				S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:       ch,
+				WorkDir:          runDirs.Scratch,
+				MergeTimeout:     sourceMergeMaxRuntime,
+				MergeMaxTimeout:  sourceMergeMaxRuntime,
+				Metrics:          recorder,
+				InsertSettings:   insertSettings,
+				ProgressInterval: *stateProgressInterval,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:        mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
@@ -2106,39 +2097,16 @@ func cloneUint64Map(values map[string]uint64) map[string]uint64 {
 	return out
 }
 
-func derivedMergeSettleMinWait(idleTimeout, maxWait time.Duration) time.Duration {
-	if idleTimeout <= 0 {
-		return 0
-	}
-	wait := idleTimeout / 4
-	if wait < time.Second {
-		wait = time.Second
-	}
-	if maxWait > 0 && wait > maxWait {
-		wait = maxWait
-	}
-	return wait
-}
-
-func sourceMergeWaitTimeouts(idleTimeout, maxRuntime time.Duration, compactEnabled bool) (time.Duration, time.Duration) {
-	if idleTimeout == 0 {
-		idleTimeout = rewrite.DefaultMergeTimeout
-	}
+func sourceMergeWaitMaxRuntime(maxRuntime time.Duration, compactEnabled bool) time.Duration {
 	if maxRuntime == 0 {
 		maxRuntime = rewrite.DefaultMergeMaxTimeout
 	}
 	if compactEnabled {
-		if idleTimeout > compactSourceMergeWaitCap {
-			idleTimeout = compactSourceMergeWaitCap
-		}
 		if maxRuntime > compactSourceMergeWaitCap {
 			maxRuntime = compactSourceMergeWaitCap
 		}
 	}
-	if maxRuntime < idleTimeout {
-		maxRuntime = idleTimeout
-	}
-	return idleTimeout, maxRuntime
+	return maxRuntime
 }
 
 func compactLeaseStaleAfter(compactWindow time.Duration) time.Duration {

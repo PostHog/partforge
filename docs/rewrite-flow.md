@@ -82,19 +82,19 @@ graph TD
     D -- No --> E{Hard merge timeout reached?}
     E -- No --> A
     E -- Yes --> F[Stop waiting and continue with current parts]
-    D -- Yes --> G{Active parts <= settle min?}
-    G -- Yes --> H[Settled]
-    G -- No --> I{Same part snapshot idle for settle min wait?}
-    I -- No --> J{Compactor optimize-final idle threshold reached?}
-    J -- Yes --> K[Run OPTIMIZE FINAL locally]
-    K --> A
-    J -- No --> E
-    I -- Yes --> H
+    D -- Yes --> G{Source rewrite?}
+    G -- Yes --> H[Immediately freeze current parts]
+    G -- No --> I{Compaction output settled?}
+    I -- Yes --> J[Measure compact output]
+    I -- No --> K{Optimize-final idle threshold reached?}
+    K -- Yes --> L[Run OPTIMIZE FINAL locally]
+    L --> A
+    K -- No --> E
 ```
 
-`-merge-idle-timeout` is an inactivity window used to check whether the destination has reached the merge target. It is extended when ClickHouse has active destination merges or when the destination part snapshot changes. `-merge-max-runtime` is the hard cap for the whole source rewrite wait. When worker compaction is enabled, the initial source rewrite merge wait is capped at 5 minutes because later compaction work is responsible for deeper consolidation. The compaction path uses a 15 minute merge inactivity timeout and the remaining `-compact-window` as its hard merge-wait cap; the deprecated `-compact-merge-idle-timeout` and `-compact-merge-max-runtime` flags are ignored.
+Source rewrites stop waiting as soon as `system.merges` reports no active destination merge, then freeze and upload the current destination parts for later compaction. They do not wait for ClickHouse to select another merge. `-merge-max-runtime` remains the hard cap while merges are active; when worker compaction is enabled, that cap is limited to 5 minutes because later compaction work is responsible for deeper consolidation.
 
-If the hard merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist. Any destination with more than one active output part must keep the same part snapshot idle for the derived settle wait and have no partition with a pair of active parts that can merge under the 150 GiB target before the worker treats merges as settled.
+Compaction remains more patient: it uses a 15 minute merge inactivity timeout and the remaining `-compact-window` as its hard merge-wait cap. A compact destination with more than one active output part must keep the same part snapshot idle for the settle wait and have no partition with a pair of active parts that can merge under the 150 GiB target before it is treated as settled. If the hard merge wait times out or merge-wait inspection fails, that is not a rewrite failure; the worker logs the reason and continues with the current parts.
 
 ## Worker Compaction
 

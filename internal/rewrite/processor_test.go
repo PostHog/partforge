@@ -406,7 +406,7 @@ func TestWaitForDestinationMergesReportsSettled(t *testing.T) {
 	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
 	settled, err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test")
+	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestWaitForDestinationMergesReturnsFalseAfterTimeout(t *testing.T) {
 		MergeTimeout:      time.Nanosecond,
 		MergeMaxTimeout:   time.Nanosecond,
 		MergePollInterval: time.Nanosecond,
-	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test")
+	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 		ClickHouse:      chhttp.Client{URL: server.URL},
 		MergeTimeout:    timeout,
 		MergeMaxTimeout: timeout,
-	}).waitForMerges(context.Background(), testMergeWaitTarget())
+	}).waitForMerges(context.Background(), testMergeWaitTarget(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,9 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 	}
 }
 
-func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
+func TestWaitForMergesReturnsImmediatelyWithoutActiveMerges(t *testing.T) {
+	var mergeRequests int
+	var partRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -508,9 +510,11 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 		query := string(body)
 		switch {
 		case strings.Contains(query, "system.merges"):
+			mergeRequests++
 			_, _ = w.Write([]byte("0\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte("0\t0\t0\n"))
+			partRequests++
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -520,18 +524,66 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 
 	result, err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-	}).waitForMerges(context.Background(), testMergeWaitTarget())
+	}).waitForMerges(context.Background(), testMergeWaitTarget(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !result.Settled {
 		t.Fatal("expected settled merge result")
 	}
+	if result.Reason != "no_active_destination_merges" {
+		t.Fatalf("reason = %q, want no_active_destination_merges", result.Reason)
+	}
+	if mergeRequests != 1 || partRequests != 1 {
+		t.Fatalf("requests = %d merge/%d parts, want one of each", mergeRequests, partRequests)
+	}
 	if result.Timeout != DefaultMergeTimeout {
 		t.Fatalf("timeout = %s, want %s", result.Timeout, DefaultMergeTimeout)
 	}
 	if result.MaxTimeout != DefaultMergeMaxTimeout {
 		t.Fatalf("max timeout = %s, want %s", result.MaxTimeout, DefaultMergeMaxTimeout)
+	}
+}
+
+func TestWaitForMergesStopsWhenActiveMergesFinish(t *testing.T) {
+	mergeRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			mergeRequests++
+			if mergeRequests == 1 {
+				_, _ = w.Write([]byte("1\n"))
+			} else {
+				_, _ = w.Write([]byte("0\n"))
+			}
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	result, err := (Processor{
+		ClickHouse:        chhttp.Client{URL: server.URL},
+		MergePollInterval: time.Nanosecond,
+	}).waitForMerges(context.Background(), testMergeWaitTarget(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Settled || result.Reason != "no_active_destination_merges" {
+		t.Fatalf("result = %+v, want no active destination merges", result)
+	}
+	if mergeRequests != 2 {
+		t.Fatalf("merge requests = %d, want 2", mergeRequests)
 	}
 }
 
@@ -564,7 +616,7 @@ func TestWaitForMergesSettlesWhenMergeTargetReachedAfterIdleWindow(t *testing.T)
 		MergeSettleMinWait:  minWait,
 		MergePollInterval:   time.Millisecond,
 		MergeSettleMinParts: 1,
-	}).waitForMerges(context.Background(), testMergeWaitTarget())
+	}).waitForMerges(context.Background(), testMergeWaitTarget(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,7 +664,7 @@ func TestWaitForMergesStopsAtMergeMaxTimeoutForActiveMerges(t *testing.T) {
 		MergeTimeout:      baseTimeout,
 		MergeMaxTimeout:   maxTimeout,
 		MergePollInterval: time.Millisecond,
-	}).waitForMerges(context.Background(), testMergeWaitTarget())
+	}).waitForMerges(context.Background(), testMergeWaitTarget(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +713,7 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 		ClickHouse:          chhttp.Client{URL: server.URL},
 		MergeSettleMinWait:  time.Hour,
 		MergeSettleMinParts: 3,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -709,7 +761,7 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) 
 		MergeSettleMinWait:  time.Millisecond,
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -762,7 +814,7 @@ func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 		MergeSettleMinWait:  10 * time.Millisecond,
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -816,7 +868,7 @@ func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
 		OptimizeFinalAfter:  2 * time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +922,7 @@ func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
 		OptimizeFinalAfter:  time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -917,7 +969,7 @@ func TestWaitForMergesSkipsOptimizeFinalWhenPartsAreInDifferentPartitions(t *tes
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
 		OptimizeFinalAfter:  time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -967,7 +1019,7 @@ func TestWaitForMergesSkipsOptimizeFinalWhenPartitionExceedsTargetPartBytes(t *t
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
 		OptimizeFinalAfter:  time.Millisecond,
-	}).waitForMerges(ctx, testMergeWaitTarget())
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
