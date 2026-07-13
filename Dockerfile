@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
-ARG CLICKHOUSE_VERSION=26.3.10.60
+ARG CLICKHOUSE_VERSION=26.6.1.1193
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg tzdata \
