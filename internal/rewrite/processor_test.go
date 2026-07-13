@@ -83,7 +83,7 @@ func TestReduceInsertSelectThreadSettingsStopsAtOne(t *testing.T) {
 	}
 }
 
-func TestRunInsertSelectSendsInsertBlockSettings(t *testing.T) {
+func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 	var insertSettings url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -106,11 +106,9 @@ func TestRunInsertSelectSendsInsertBlockSettings(t *testing.T) {
 	defer server.Close()
 
 	settings := chhttp.QuerySettings{
-		"max_threads":                 "4",
-		"max_insert_threads":          "4",
-		"max_memory_usage":            "34359738368",
-		"min_insert_block_size_rows":  "0",
-		"min_insert_block_size_bytes": "2863311530",
+		"max_threads":        "4",
+		"max_insert_threads": "4",
+		"max_memory_usage":   "34359738368",
 	}
 	err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},

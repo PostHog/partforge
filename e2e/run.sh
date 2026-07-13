@@ -40,48 +40,28 @@ assert_worker_insert_memory_settings() {
     exit 1
   fi
 
-  local cpus memory_bytes max_threads max_insert_threads max_memory_usage min_rows min_bytes
+  local cpus memory_bytes max_threads max_insert_threads max_memory_usage
   cpus="$(log_value "$line" "cpus")"
   memory_bytes="$(log_value "$line" "memory_bytes_raw")"
   max_threads="$(log_value "$line" "max_threads")"
   max_insert_threads="$(log_value "$line" "max_insert_threads")"
   max_memory_usage="$(log_value "$line" "max_memory_usage_raw")"
-  min_rows="$(log_value "$line" "min_insert_block_size_rows")"
-  min_bytes="$(log_value "$line" "min_insert_block_size_bytes_raw")"
 
   require_uint "cpus" "$cpus"
   require_uint "memory_bytes" "$memory_bytes"
   require_uint "max_threads" "$max_threads"
   require_uint "max_insert_threads" "$max_insert_threads"
   require_uint "max_memory_usage" "$max_memory_usage"
-  require_uint "min_insert_block_size_rows" "$min_rows"
-  require_uint "min_insert_block_size_bytes" "$min_bytes"
 
-  local cpu_threads memory_threads expected_threads
-  if (( cpus < 4 )); then
+  local cpu_threads expected_threads
+  if (( cpus < 2 )); then
     cpu_threads=1
   else
-    cpu_threads=$((cpus / 4))
+    cpu_threads=$((cpus / 2))
   fi
-  local expected_max_memory expected_min_bytes expected_min_rows reserved_insert_block_memory
+  expected_threads=$cpu_threads
+  local expected_max_memory
   expected_max_memory=$((memory_bytes * 70 / 100))
-  memory_threads=$((expected_max_memory / (6 * 2 * 1024 * 1024 * 1024)))
-  if (( memory_threads < 1 )); then
-    memory_threads=1
-  fi
-  if (( memory_threads < cpu_threads )); then
-    expected_threads=$memory_threads
-  else
-    expected_threads=$cpu_threads
-  fi
-  expected_min_bytes=$((expected_max_memory / (6 * expected_threads)))
-  expected_min_rows=$((expected_min_bytes / 1024))
-  if (( expected_min_rows < 8192 )); then
-    expected_min_rows=8192
-  elif (( expected_min_rows > 8388608 )); then
-    expected_min_rows=8388608
-  fi
-  reserved_insert_block_memory=$((min_bytes * max_insert_threads * 3))
 
   if (( max_threads != expected_threads )); then
     echo "max_threads=$max_threads, expected $expected_threads from cpus=$cpus" >&2
@@ -93,18 +73,6 @@ assert_worker_insert_memory_settings() {
   fi
   if (( max_memory_usage != expected_max_memory )); then
     echo "max_memory_usage=$max_memory_usage, expected $expected_max_memory from memory_bytes=$memory_bytes" >&2
-    exit 1
-  fi
-  if (( min_rows != expected_min_rows )); then
-    echo "min_insert_block_size_rows=$min_rows, expected $expected_min_rows" >&2
-    exit 1
-  fi
-  if (( min_bytes != expected_min_bytes )); then
-    echo "min_insert_block_size_bytes=$min_bytes, expected $expected_min_bytes" >&2
-    exit 1
-  fi
-  if (( reserved_insert_block_memory > max_memory_usage / 2 )); then
-    echo "modeled insert block memory budget $reserved_insert_block_memory exceeds half max_memory_usage $((max_memory_usage / 2))" >&2
     exit 1
   fi
 }

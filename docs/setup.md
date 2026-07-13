@@ -121,7 +121,7 @@ FROM src_db.events
 
 #### Settings
 
-You don't need to hand-tune performance. The worker derives insert settings (memory cap, `max_threads` / `max_insert_threads`, insert block sizes) and merge settings from the container's detected CPU and memory, and applies the destination `default_compression_codec` (default `ZSTD(5)`, `-default-compression-codec`) before the insert. A query-level `SETTINGS` clause in your `INSERT ... SELECT` is passed through to ClickHouse if you have a specific need, but avoid overriding the memory/thread settings the worker manages. See [operations.md](operations.md) and [rewrite-flow.md](rewrite-flow.md).
+You don't need to hand-tune performance. The worker derives the insert memory cap and `max_threads` / `max_insert_threads` from the container's detected CPU and memory, leaves insert block sizing to ClickHouse, derives merge settings, and applies the destination `default_compression_codec` (default `ZSTD(5)`, `-default-compression-codec`) before the insert. A query-level `SETTINGS` clause in your `INSERT ... SELECT` is passed through to ClickHouse if you have a specific need, but avoid overriding the memory/thread settings the worker manages. See [operations.md](operations.md) and [rewrite-flow.md](rewrite-flow.md).
 
 ### 3. upload-freeze
 
