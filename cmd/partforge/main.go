@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -54,6 +55,8 @@ const compactSourceMergeWaitCap = 5 * time.Minute
 const compactMinInputParts uint64 = 2
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
+const ecsTaskProtectionTimeout = 5 * time.Second
+const ecsTaskProtectionExpirationMinutes = 2880
 const inProgressStageUnknown = "unknown"
 const settleWaitStage = "wait_merges"
 
@@ -1299,6 +1302,10 @@ func runWorker(ctx context.Context, args []string) error {
 		recorder = prom
 		prometheusMetrics = prom
 	}
+	ecsProtection, err := detectECSTaskProtection(ctx)
+	if err != nil {
+		return err
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -1349,8 +1356,12 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactMaxBytes:               *compactMaxBytes,
 					Metrics:                       recorder,
 					PrometheusMetrics:             prometheusMetrics,
+					ECSProtection:                 &ecsProtection,
 				})
 				if err != nil {
+					return err
+				}
+				if err := ecsProtection.Set(ctx, false); err != nil {
 					return err
 				}
 				if didCompactWork {
@@ -1382,6 +1393,15 @@ func runWorker(ctx context.Context, args []string) error {
 			"attempt", part.Attempts,
 			"source_key", part.SourceKey,
 		)
+		if err := ecsProtection.Set(ctx, true); err != nil {
+			stateCtx, cancel := workerStateUpdateContext()
+			releaseErr := stateStore.ReleaseInProgress(stateCtx, *part, resolvedWorkerID, time.Now().UTC())
+			cancel()
+			if releaseErr != nil {
+				return fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release part %s/%s: %v", err, part.JobID, part.PartID, releaseErr)
+			}
+			return err
+		}
 
 		workItem := rewrite.WorkItem{
 			Bucket:              part.Bucket,
@@ -1571,6 +1591,9 @@ func runWorker(ctx context.Context, args []string) error {
 		}
 		slog.Info("part marked compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
 		cleanupPartNow()
+		if err := ecsProtection.Set(ctx, false); err != nil {
+			return err
+		}
 		if *once {
 			return nil
 		}
@@ -1636,6 +1659,7 @@ type workerCompactionConfig struct {
 	CompactMaxBytes               uint64
 	Metrics                       metrics.Recorder
 	PrometheusMetrics             *metrics.Prometheus
+	ECSProtection                 *ecsTaskProtection
 }
 
 func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
@@ -1705,6 +1729,15 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			return true, nil
 		}
 		return false, nil
+	}
+	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
+		stateCtx, cancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, *batch, cfg.WorkerID, time.Now().UTC())
+		cancel()
+		if releaseErr != nil {
+			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch %s: %v", err, batch.JobID, releaseErr)
+		}
+		return true, err
 	}
 
 	inputIDs := compactBatchPartIDs(batch.Parts)
@@ -3515,6 +3548,73 @@ func resolveWorkerID(configured string) (string, error) {
 		return "", errors.New("resolved empty worker hostname")
 	}
 	return fmt.Sprintf("%s-%d", hostname, os.Getpid()), nil
+}
+
+type ecsTaskProtection struct {
+	endpoint  string
+	client    *http.Client
+	protected bool
+}
+
+func detectECSTaskProtection(ctx context.Context) (ecsTaskProtection, error) {
+	agentURI := strings.TrimSpace(os.Getenv("ECS_AGENT_URI"))
+	if agentURI == "" {
+		return ecsTaskProtection{}, nil
+	}
+
+	protection := ecsTaskProtection{
+		endpoint: strings.TrimRight(agentURI, "/") + "/task-protection/v1/state",
+		client:   &http.Client{Timeout: ecsTaskProtectionTimeout},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, protection.endpoint, nil)
+	if err != nil {
+		return ecsTaskProtection{}, fmt.Errorf("build ECS task scale-in protection probe: %w", err)
+	}
+	resp, err := protection.client.Do(req)
+	if err != nil {
+		slog.Info("ECS task scale-in protection endpoint unavailable; continuing without protection", "stage", "detect_ecs_task_protection", "error", err)
+		return ecsTaskProtection{}, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		slog.Info("ECS task scale-in protection endpoint not supported; continuing without protection", "stage", "detect_ecs_task_protection")
+		return ecsTaskProtection{}, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return ecsTaskProtection{}, fmt.Errorf("probe ECS task scale-in protection: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	slog.Info("detected ECS task scale-in protection", "stage", "detect_ecs_task_protection")
+	return protection, nil
+}
+
+func (p *ecsTaskProtection) Set(ctx context.Context, enabled bool) error {
+	if p == nil || p.endpoint == "" || p.protected == enabled {
+		return nil
+	}
+	body := `{"ProtectionEnabled":false}`
+	if enabled {
+		// ponytail: 48h is ECS's maximum; add renewal if a single work item can exceed it.
+		body = fmt.Sprintf(`{"ProtectionEnabled":true,"ExpiresInMinutes":%d}`, ecsTaskProtectionExpirationMinutes)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, p.endpoint, strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build ECS task scale-in protection request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("set ECS task scale-in protection to %t: %w", enabled, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("set ECS task scale-in protection to %t: %s: %s", enabled, resp.Status, strings.TrimSpace(string(responseBody)))
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	p.protected = enabled
+	return nil
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) error {

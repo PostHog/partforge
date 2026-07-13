@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +31,83 @@ import (
 func TestDefaultCompactWindow(t *testing.T) {
 	if defaultCompactWindow != 24*time.Hour {
 		t.Fatalf("defaultCompactWindow = %s, want 24h", defaultCompactWindow)
+	}
+}
+
+func TestDetectECSTaskProtectionWithoutECS(t *testing.T) {
+	t.Setenv("ECS_AGENT_URI", "")
+	protection, err := detectECSTaskProtection(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protection.endpoint != "" {
+		t.Fatalf("endpoint = %q, want disabled protection", protection.endpoint)
+	}
+}
+
+func TestDetectECSTaskProtectionIgnoresMissingEndpoint(t *testing.T) {
+	unavailable := httptest.NewServer(http.NotFoundHandler())
+	unavailableURL := unavailable.URL
+	unavailable.Close()
+	t.Setenv("ECS_AGENT_URI", unavailableURL)
+	protection, err := detectECSTaskProtection(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protection.endpoint != "" {
+		t.Fatalf("endpoint = %q, want disabled protection", protection.endpoint)
+	}
+
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	t.Setenv("ECS_AGENT_URI", server.URL)
+
+	protection, err = detectECSTaskProtection(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protection.endpoint != "" {
+		t.Fatalf("endpoint = %q, want disabled protection", protection.endpoint)
+	}
+}
+
+func TestECSTaskProtectionLifecycle(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/task-protection/v1/state" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, `{"protection":{"ProtectionEnabled":false}}`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, string(body))
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+	t.Setenv("ECS_AGENT_URI", server.URL)
+
+	protection, err := detectECSTaskProtection(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protection.Set(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := protection.Set(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := protection.Set(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		`{"ProtectionEnabled":true,"ExpiresInMinutes":2880}`,
+		`{"ProtectionEnabled":false}`,
+	}
+	if fmt.Sprint(requests) != fmt.Sprint(want) {
+		t.Fatalf("requests = %v, want %v", requests, want)
 	}
 }
 

@@ -12,6 +12,12 @@ Run the workers as an ECS service and give the task an **IAM role** scoped to th
 - **Region resolves from the environment.** Set `AWS_REGION` or pass `-aws-region` when `-postgres-iam-auth` is enabled.
 - **Scale by replicas.** More worker tasks = more parts in flight. There is no coordinator to scale; workers claim independently from Postgres.
 
+### ECS task scale-in protection
+
+Workers automatically use the ECS agent's task scale-in protection endpoint when `ECS_AGENT_URI` is available. A worker protects its task after claiming rewrite or compaction work and removes protection after committing the result. Outside ECS, or when the agent does not expose the endpoint, worker behavior is unchanged.
+
+The task role needs `ecs:GetTaskProtection` and `ecs:UpdateTaskProtection`. If the endpoint is detected but protection cannot be changed, the worker releases newly claimed work and exits instead of processing it unprotected.
+
 ### Task IAM policy
 
 Combine the S3 permissions with `rds-db:connect` for the Postgres database user. Database setup details are in [postgres.md](postgres.md).
