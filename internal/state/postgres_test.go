@@ -247,7 +247,7 @@ func TestUpdateCompactProgressRejectsMixedJobBatch(t *testing.T) {
 			compactBatchTestPart("job-a", "part-a", StatusCompacting),
 			compactBatchTestPart("job-b", "part-b", StatusCompacting),
 		},
-	}, "compact-out", "worker", PartStats{}, PartStats{}, time.Now().UTC())
+	}, "compact-out", "worker", PartStats{}, PartStats{}, CompactProgress{}, time.Now().UTC())
 	if err == nil {
 		t.Fatal("expected mixed job compact batch error")
 	}

@@ -96,15 +96,18 @@ type Part struct {
 	CompactCooldownUntil string   `json:"compact_cooldown_until,omitempty"`
 	SupersededBy         string   `json:"superseded_by,omitempty"`
 
-	CompactOutputPartID        string `json:"compact_output_part_id,omitempty"`
-	CompactProgressAt          string `json:"compact_progress_at,omitempty"`
-	CompactFinalizeRequestedAt string `json:"compact_finalize_requested_at,omitempty"`
-	CompactInputPartCount      uint64 `json:"compact_input_part_count,omitempty"`
-	CompactInputRows           uint64 `json:"compact_input_rows,omitempty"`
-	CompactInputBytes          uint64 `json:"compact_input_bytes,omitempty"`
-	CompactOutputPartCount     uint64 `json:"compact_output_part_count,omitempty"`
-	CompactOutputRows          uint64 `json:"compact_output_rows,omitempty"`
-	CompactOutputBytes         uint64 `json:"compact_output_bytes,omitempty"`
+	CompactOutputPartID        string  `json:"compact_output_part_id,omitempty"`
+	CompactProgressAt          string  `json:"compact_progress_at,omitempty"`
+	CompactFinalizeRequestedAt string  `json:"compact_finalize_requested_at,omitempty"`
+	CompactInputPartCount      uint64  `json:"compact_input_part_count,omitempty"`
+	CompactInputRows           uint64  `json:"compact_input_rows,omitempty"`
+	CompactInputBytes          uint64  `json:"compact_input_bytes,omitempty"`
+	CompactOutputPartCount     uint64  `json:"compact_output_part_count,omitempty"`
+	CompactOutputRows          uint64  `json:"compact_output_rows,omitempty"`
+	CompactOutputBytes         uint64  `json:"compact_output_bytes,omitempty"`
+	CompactStage               string  `json:"compact_stage,omitempty"`
+	CompactActiveMerges        uint64  `json:"compact_active_merges,omitempty"`
+	CompactMergeProgress       float64 `json:"compact_merge_progress,omitempty"`
 
 	ProgressUpdatedAt                string            `json:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `json:"read_rows,omitempty"`
@@ -490,6 +493,9 @@ func clearCompactProgress(part *Part) {
 	part.CompactOutputPartCount = 0
 	part.CompactOutputRows = 0
 	part.CompactOutputBytes = 0
+	part.CompactStage = ""
+	part.CompactActiveMerges = 0
+	part.CompactMergeProgress = 0
 }
 
 func compactOwnedOrUnownedReady(part Part, workerID string) bool {
@@ -740,7 +746,13 @@ func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now t
 	return nil
 }
 
-func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, outputPartID, workerID string, inputStats, outputStats PartStats, now time.Time) error {
+type CompactProgress struct {
+	Stage         string
+	ActiveMerges  uint64
+	MergeProgress float64
+}
+
+func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, outputPartID, workerID string, inputStats, outputStats PartStats, progress CompactProgress, now time.Time) error {
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("worker id is required")
 	}
@@ -749,6 +761,9 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	}
 	if err := validateCompactBatch(batch); err != nil {
 		return err
+	}
+	if progress.MergeProgress < 0 || progress.MergeProgress > 1 {
+		return fmt.Errorf("compact merge progress must be between 0 and 1, got %f", progress.MergeProgress)
 	}
 	for _, part := range batch.Parts {
 		_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
@@ -767,6 +782,9 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 			current.CompactOutputPartCount = outputStats.Count
 			current.CompactOutputRows = outputStats.Rows
 			current.CompactOutputBytes = outputStats.Bytes
+			current.CompactStage = strings.TrimSpace(progress.Stage)
+			current.CompactActiveMerges = progress.ActiveMerges
+			current.CompactMergeProgress = progress.MergeProgress
 			current.Error = ""
 			current.CompactCooldownUntil = ""
 			return nil

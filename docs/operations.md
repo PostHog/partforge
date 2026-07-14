@@ -26,8 +26,13 @@ Core metrics:
 - `partforge_current_read_rows`, `partforge_current_read_bytes`, `partforge_current_written_rows`, `partforge_current_written_bytes`
 - `partforge_active_part_count`, `partforge_active_part_rows`, `partforge_active_part_bytes`
 - `partforge_forges_started_total`, `partforge_forges_completed_total`, `partforge_forges_failed_total`
+- `partforge_compact_batch_active`, `partforge_compact_stage`, `partforge_compact_active_merges`
+- `partforge_compact_part_count`, `partforge_compact_part_rows`, `partforge_compact_part_bytes`
+- `partforge_compact_partition_parts`, `partforge_compact_partition_rows`, `partforge_compact_partition_bytes`
+- `partforge_compact_merge_progress_ratio`, `partforge_compact_merge_elapsed_seconds`, `partforge_compact_merge_source_parts`
+- `partforge_compact_merge_rows_read`, `partforge_compact_merge_rows_total`, `partforge_compact_merge_bytes_read`, `partforge_compact_merge_bytes_total`
 
-Read/write counters update live while the `INSERT SELECT` runs, polled from the local ClickHouse `system.processes` for the rewrite query id. Active-part gauges come from `system.parts` while those parts are attached.
+Read/write counters update live while the `INSERT SELECT` runs, polled from the local ClickHouse `system.processes` for the rewrite query id. Active-part gauges come from `system.parts` while those parts are attached. During compaction, the worker independently polls `system.parts` and `system.merges`, including while `OPTIMIZE FINAL` is blocking. A native merge is identified by `job_id`, the stable compact `output_part_id`, `partition_id`, and ClickHouse `result_part_name`. Compact gauges are removed when the batch ends so finished batches do not remain in live Grafana totals.
 
 Workers also write a per-part progress heartbeat to Postgres every `15s` (`-state-progress-interval`, `0` disables) so `job-status` reflects progress even during S3 transfer stages.
 
@@ -38,7 +43,7 @@ partforge list-jobs                 # jobs with status, part counts, submitted/u
 partforge job-status -job-id=job-123
 ```
 
-Both accept `-json`; `list-jobs -json` keeps `jobs` as job IDs, adds `job_names` when names are set, and includes `job_details` for status/progress/timestamps. `job-status -parts` adds per-row detail (persisted rewrite counters, compact-ready age, destination partitions, active part stats, `FAILED_MERGES`); `job-status -details` adds each part's current stage and per-stage timings. The physical part counters (`input_clickhouse_parts`, `current_output_clickhouse_parts`) refer to ClickHouse parts, not state rows.
+Both accept `-json`; `list-jobs -json` keeps `jobs` as job IDs, adds `job_names` when names are set, and includes `job_details` for status/progress/timestamps. `job-status` lists active compacting batches with their stage, input/current ClickHouse part counts, active native merge count, and current merge-wave percentage. `job-status -parts` adds per-row detail (persisted rewrite and compaction counters, compact-ready age, destination partitions, active part stats, `FAILED_MERGES`); `job-status -details` adds each part's current rewrite stage and per-stage timings. The physical part counters (`input_clickhouse_parts`, `current_output_clickhouse_parts`) refer to ClickHouse parts, not state rows.
 
 ## Admin and recovery commands
 

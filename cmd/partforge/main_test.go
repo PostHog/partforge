@@ -201,6 +201,14 @@ func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
 			CompactOutputPartID:    "compact-1",
 			CompactInputPartCount:  9,
 			CompactOutputPartCount: 4,
+			CompactInputRows:       1000,
+			CompactInputBytes:      10_000,
+			CompactOutputRows:      1000,
+			CompactOutputBytes:     8_000,
+			CompactStage:           "merging",
+			CompactActiveMerges:    2,
+			CompactMergeProgress:   0.375,
+			CompactProgressAt:      "2026-07-14T12:00:00Z",
 		},
 		{
 			JobID:                  "job-1",
@@ -219,6 +227,13 @@ func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
 	compacting := findStatusPartStats(summary.StatePartStats, state.StatusCompacting)
 	if compacting.Count != 2 || compacting.InputClickHouseParts != 9 || compacting.OutputClickHouseParts != 4 {
 		t.Fatalf("compacting part stats = %+v, want count=2 input=9 output=4", compacting)
+	}
+	if len(summary.CompactingBatches) != 1 {
+		t.Fatalf("compacting batches = %+v, want one", summary.CompactingBatches)
+	}
+	batch := summary.CompactingBatches[0]
+	if batch.OutputPartID != "compact-1" || batch.Stage != "merging" || batch.InputClickHouseParts != 9 || batch.CurrentClickHouseParts != 4 || batch.InputRows != 1000 || batch.InputBytes != 10_000 || batch.CurrentRows != 1000 || batch.CurrentBytes != 8_000 || batch.ActiveMerges != 2 || batch.MergeProgressPercent != 37.5 {
+		t.Fatalf("compacting batch = %+v", batch)
 	}
 }
 
@@ -1729,6 +1744,38 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 		"compact: ready=1 compacting=1 window=2h0m0s",
 		"compact_finalize: blocked by COMPACTING=1; eligible after 2026-06-24T13:30:00Z (in 30m0s)",
 	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPrintJobSummaryIncludesCompactingBatchProgress(t *testing.T) {
+	summary := jobSummary{
+		JobID:  "job-1",
+		Status: "COMPACTING",
+		Total:  2,
+		Counts: map[state.Status]int{state.StatusCompacting: 2},
+		CompactingBatches: []compactingBatchSummary{
+			{
+				OutputPartID:           "compact-1",
+				WorkerID:               "worker-1",
+				Stage:                  "merging",
+				InputClickHouseParts:   9,
+				CurrentClickHouseParts: 4,
+				CurrentRows:            1000,
+				CurrentBytes:           8 * 1024 * 1024,
+				ActiveMerges:           2,
+				MergeProgressPercent:   37.5,
+				ProgressAt:             "2026-07-14T12:00:00Z",
+			},
+		},
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobSummary(out, summary)
+	})
+	for _, want := range []string{"COMPACTING BATCHES", "compact-1", "merging", "37.5%", "CURRENT_CH_PARTS", "CURRENT_ROWS", "8 MB"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
 		}

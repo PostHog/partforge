@@ -1352,6 +1352,7 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactOptimizeFinalAfter:     effectiveCompactOptimizeFinalAfter,
 					CompactLeaseStaleAfter:        compactStaleAfter,
 					CompactHeartbeatInterval:      compactHeartbeatInterval,
+					CompactProgressInterval:       *stateProgressInterval,
 					CompactMaxArtifacts:           *compactMaxArtifacts,
 					CompactMaxBytes:               *compactMaxBytes,
 					Metrics:                       recorder,
@@ -1655,6 +1656,7 @@ type workerCompactionConfig struct {
 	CompactOptimizeFinalAfter     time.Duration
 	CompactLeaseStaleAfter        time.Duration
 	CompactHeartbeatInterval      time.Duration
+	CompactProgressInterval       time.Duration
 	CompactMaxArtifacts           int
 	CompactMaxBytes               uint64
 	Metrics                       metrics.Recorder
@@ -1807,6 +1809,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		Rows:  batch.InputRows,
 		Bytes: batch.InputBytes,
 	})
+	defer cfg.Metrics.ClearCompaction(batch.JobID, outputPartID)
 	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, manualFinalizeCtx, cfg, workItem, currentBatch, compactDeadline)
 	cleanupCompactNow := func() {
 		if cleanupCompact != nil {
@@ -1990,10 +1993,10 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 		},
 		ShutdownContext:  shutdownCtx,
 		MergeStopContext: manualFinalizeCtx,
+		ProgressInterval: cfg.CompactProgressInterval,
+		Metrics:          cfg.Metrics,
 	}
 	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
-		cfg.Metrics.SetCompactPartStats("input", item.JobID, item.OutputPartID, snapshot.InputStats)
-		cfg.Metrics.SetCompactPartStats("output", item.JobID, item.OutputPartID, snapshot.DestinationStats)
 		stateCtx, cancel := workerStateUpdateContext()
 		defer cancel()
 		return cfg.StateStore.UpdateCompactProgress(stateCtx, compactBatch(), item.OutputPartID, cfg.WorkerID, state.PartStats{
@@ -2004,6 +2007,10 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 			Count: snapshot.DestinationStats.Count,
 			Rows:  snapshot.DestinationStats.Rows,
 			Bytes: snapshot.DestinationStats.Bytes,
+		}, state.CompactProgress{
+			Stage:         snapshot.Stage,
+			ActiveMerges:  snapshot.ActiveMerges,
+			MergeProgress: snapshot.MergeProgress,
 		}, time.Now().UTC())
 	}
 	compactor.RestartClickHouse = func(ctx context.Context) error {
@@ -3785,25 +3792,26 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 }
 
 type jobSummary struct {
-	JobID                        string                 `json:"job_id"`
-	Status                       string                 `json:"status"`
-	Total                        int                    `json:"total"`
-	Counts                       map[state.Status]int   `json:"counts"`
-	StatePartStats               []statusPartStats      `json:"-"`
-	InProgressStages             []inProgressStageCount `json:"in_progress_stages,omitempty"`
-	Compact                      *compactJobSummary     `json:"compact,omitempty"`
-	RewriteCompleted             int                    `json:"rewrite_completed"`
-	RewritePercent               float64                `json:"rewrite_percent"`
-	ImportCompleted              int                    `json:"import_completed"`
-	ImportPercent                float64                `json:"import_percent"`
-	InputClickHouseParts         uint64                 `json:"input_clickhouse_parts"`
-	CurrentOutputClickHouseParts uint64                 `json:"current_output_clickhouse_parts"`
-	ReadRows                     uint64                 `json:"read_rows"`
-	ReadBytes                    uint64                 `json:"read_bytes"`
-	WrittenRows                  uint64                 `json:"written_rows"`
-	WrittenBytes                 uint64                 `json:"written_bytes"`
-	FailedMerges                 uint64                 `json:"failed_merges"`
-	FailedParts                  []failedPart           `json:"failed_parts,omitempty"`
+	JobID                        string                   `json:"job_id"`
+	Status                       string                   `json:"status"`
+	Total                        int                      `json:"total"`
+	Counts                       map[state.Status]int     `json:"counts"`
+	StatePartStats               []statusPartStats        `json:"-"`
+	InProgressStages             []inProgressStageCount   `json:"in_progress_stages,omitempty"`
+	Compact                      *compactJobSummary       `json:"compact,omitempty"`
+	CompactingBatches            []compactingBatchSummary `json:"compacting_batches,omitempty"`
+	RewriteCompleted             int                      `json:"rewrite_completed"`
+	RewritePercent               float64                  `json:"rewrite_percent"`
+	ImportCompleted              int                      `json:"import_completed"`
+	ImportPercent                float64                  `json:"import_percent"`
+	InputClickHouseParts         uint64                   `json:"input_clickhouse_parts"`
+	CurrentOutputClickHouseParts uint64                   `json:"current_output_clickhouse_parts"`
+	ReadRows                     uint64                   `json:"read_rows"`
+	ReadBytes                    uint64                   `json:"read_bytes"`
+	WrittenRows                  uint64                   `json:"written_rows"`
+	WrittenBytes                 uint64                   `json:"written_bytes"`
+	FailedMerges                 uint64                   `json:"failed_merges"`
+	FailedParts                  []failedPart             `json:"failed_parts,omitempty"`
 }
 
 type jobSummaryOptions struct {
@@ -3821,6 +3829,21 @@ type compactJobSummary struct {
 	BlockedBy        []statusCount `json:"blocked_by,omitempty"`
 	BlockedByMessage string        `json:"blocked_by_message,omitempty"`
 	Reason           string        `json:"reason,omitempty"`
+}
+
+type compactingBatchSummary struct {
+	OutputPartID           string  `json:"output_part_id"`
+	WorkerID               string  `json:"worker_id,omitempty"`
+	Stage                  string  `json:"stage"`
+	InputClickHouseParts   uint64  `json:"input_clickhouse_parts"`
+	CurrentClickHouseParts uint64  `json:"current_clickhouse_parts"`
+	InputRows              uint64  `json:"input_rows"`
+	InputBytes             uint64  `json:"input_bytes"`
+	CurrentRows            uint64  `json:"current_rows"`
+	CurrentBytes           uint64  `json:"current_bytes"`
+	ActiveMerges           uint64  `json:"active_merges"`
+	MergeProgressPercent   float64 `json:"merge_progress_percent"`
+	ProgressAt             string  `json:"progress_at,omitempty"`
 }
 
 type statusCount struct {
@@ -4006,6 +4029,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 	stateInputParts := map[state.Status]uint64{}
 	stateOutputParts := map[state.Status]uint64{}
 	seenCompactProgress := map[string]struct{}{}
+	var compactingBatches []compactingBatchSummary
 	for _, part := range parts {
 		counts[part.Status]++
 		if !isGeneratedCompactPart(part) {
@@ -4018,6 +4042,20 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 				partOutputParts = 0
 			} else {
 				seenCompactProgress[key] = struct{}{}
+				compactingBatches = append(compactingBatches, compactingBatchSummary{
+					OutputPartID:           part.CompactOutputPartID,
+					WorkerID:               part.WorkerID,
+					Stage:                  compactStage(part),
+					InputClickHouseParts:   part.CompactInputPartCount,
+					CurrentClickHouseParts: part.CompactOutputPartCount,
+					InputRows:              part.CompactInputRows,
+					InputBytes:             part.CompactInputBytes,
+					CurrentRows:            part.CompactOutputRows,
+					CurrentBytes:           part.CompactOutputBytes,
+					ActiveMerges:           part.CompactActiveMerges,
+					MergeProgressPercent:   part.CompactMergeProgress * 100,
+					ProgressAt:             part.CompactProgressAt,
+				})
 			}
 		}
 		stateInputParts[part.Status] += partInputParts
@@ -4051,6 +4089,12 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 	sort.Slice(failed, func(i, j int) bool {
 		return failed[i].PartID < failed[j].PartID
 	})
+	sort.Slice(compactingBatches, func(i, j int) bool {
+		if compactingBatches[i].OutputPartID != compactingBatches[j].OutputPartID {
+			return compactingBatches[i].OutputPartID < compactingBatches[j].OutputPartID
+		}
+		return compactingBatches[i].WorkerID < compactingBatches[j].WorkerID
+	})
 
 	total := len(parts)
 	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusSuperseded] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
@@ -4063,6 +4107,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		StatePartStats:               statePartStats(counts, stateInputParts, stateOutputParts),
 		InProgressStages:             inProgressStageCounts(stageCounts, stageInputParts, stageOutputParts),
 		Compact:                      compactSummary(parts, counts, opts),
+		CompactingBatches:            compactingBatches,
 		RewriteCompleted:             rewriteCompleted,
 		RewritePercent:               percent(rewriteCompleted, total),
 		ImportCompleted:              importCompleted,
@@ -4327,6 +4372,13 @@ func compactProgressRollupKey(part state.Part) (string, bool) {
 	return strings.Join([]string{part.JobID, part.WorkerID, part.CompactOutputPartID}, "\x00"), true
 }
 
+func compactStage(part state.Part) string {
+	if stage := strings.TrimSpace(part.CompactStage); stage != "" {
+		return stage
+	}
+	return "unknown"
+}
+
 func isCurrentOutputPartStatus(status state.Status) bool {
 	switch status {
 	case state.StatusInProgress, state.StatusCompactReady, state.StatusCompacting, state.StatusFinished, state.StatusImporting, state.StatusImported, state.StatusFailed:
@@ -4364,6 +4416,16 @@ func printJobSummary(out *os.File, summary jobSummary) {
 		fmt.Fprintln(tw, "STAGE\tCOUNT")
 		for _, stage := range summary.InProgressStages {
 			fmt.Fprintf(tw, "%s\t%d\n", stage.Stage, stage.Count)
+		}
+		_ = tw.Flush()
+	}
+
+	if len(summary.CompactingBatches) > 0 {
+		fmt.Fprintln(out, "\nCOMPACTING BATCHES")
+		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "OUTPUT_PART_ID\tWORKER\tSTAGE\tINPUT_CH_PARTS\tCURRENT_CH_PARTS\tCURRENT_ROWS\tCURRENT_SIZE\tACTIVE_MERGES\tMERGE_PROGRESS\tPROGRESS_AT")
+		for _, batch := range summary.CompactingBatches {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%.1f%%\t%s\n", batch.OutputPartID, batch.WorkerID, batch.Stage, batch.InputClickHouseParts, batch.CurrentClickHouseParts, batch.CurrentRows, formatBytes(batch.CurrentBytes), batch.ActiveMerges, batch.MergeProgressPercent, batch.ProgressAt)
 		}
 		_ = tw.Flush()
 	}

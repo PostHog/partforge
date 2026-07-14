@@ -27,6 +27,23 @@ type PartStats struct {
 	Bytes uint64
 }
 
+type CompactPartitionStats struct {
+	PartitionID string
+	Stats       PartStats
+}
+
+type CompactMerge struct {
+	PartitionID    string
+	ResultPartName string
+	Elapsed        time.Duration
+	Progress       float64
+	SourceParts    uint64
+	RowsRead       uint64
+	RowsTotal      uint64
+	BytesRead      uint64
+	BytesTotal     uint64
+}
+
 type QueryProgress struct {
 	ReadRows     uint64
 	ReadBytes    uint64
@@ -55,6 +72,9 @@ type Recorder interface {
 	CompactionFailed(jobID, outputPartID string)
 	CompactionNoReduction(jobID, outputPartID string, inputStats, outputStats PartStats)
 	SetCompactPartStats(role, jobID, outputPartID string, stats PartStats)
+	SetCompactPartitionStats(role, jobID, outputPartID string, partitions []CompactPartitionStats)
+	ObserveCompactProgress(jobID, outputPartID, stage string, stats PartStats, partitions []CompactPartitionStats, merges []CompactMerge)
+	ClearCompaction(jobID, outputPartID string)
 }
 
 type Noop struct{}
@@ -72,6 +92,11 @@ func (Noop) CompactionCompleted(string, string, PartStats, PartStats)        {}
 func (Noop) CompactionFailed(string, string)                                 {}
 func (Noop) CompactionNoReduction(string, string, PartStats, PartStats)      {}
 func (Noop) SetCompactPartStats(string, string, string, PartStats)           {}
+func (Noop) SetCompactPartitionStats(string, string, string, []CompactPartitionStats) {
+}
+func (Noop) ObserveCompactProgress(string, string, string, PartStats, []CompactPartitionStats, []CompactMerge) {
+}
+func (Noop) ClearCompaction(string, string) {}
 
 type Prometheus struct {
 	registry                *prometheus.Registry
@@ -108,15 +133,28 @@ type Prometheus struct {
 	rewriteTotalElapsed   *prometheus.GaugeVec
 	completedStageSeconds *prometheus.GaugeVec
 
-	compactionsStarted     *prometheus.CounterVec
-	compactionsCompleted   *prometheus.CounterVec
-	compactionsFailed      *prometheus.CounterVec
-	compactionsNoReduction *prometheus.CounterVec
-	compactionDuration     *prometheus.HistogramVec
-	compactInputArtifacts  *prometheus.GaugeVec
-	compactPartCount       *prometheus.GaugeVec
-	compactPartRows        *prometheus.GaugeVec
-	compactPartBytes       *prometheus.GaugeVec
+	compactionsStarted      *prometheus.CounterVec
+	compactionsCompleted    *prometheus.CounterVec
+	compactionsFailed       *prometheus.CounterVec
+	compactionsNoReduction  *prometheus.CounterVec
+	compactionDuration      *prometheus.HistogramVec
+	compactInputArtifacts   *prometheus.GaugeVec
+	compactPartCount        *prometheus.GaugeVec
+	compactPartRows         *prometheus.GaugeVec
+	compactPartBytes        *prometheus.GaugeVec
+	compactActive           *prometheus.GaugeVec
+	compactStage            *prometheus.GaugeVec
+	compactActiveMerges     *prometheus.GaugeVec
+	compactPartitionParts   *prometheus.GaugeVec
+	compactPartitionRows    *prometheus.GaugeVec
+	compactPartitionBytes   *prometheus.GaugeVec
+	compactMergeProgress    *prometheus.GaugeVec
+	compactMergeElapsed     *prometheus.GaugeVec
+	compactMergeSourceParts *prometheus.GaugeVec
+	compactMergeRowsRead    *prometheus.GaugeVec
+	compactMergeRowsTotal   *prometheus.GaugeVec
+	compactMergeBytesRead   *prometheus.GaugeVec
+	compactMergeBytesTotal  *prometheus.GaugeVec
 
 	clickHouseMetricsUp             prometheus.Gauge
 	clickHouseMetricsScrapes        prometheus.Counter
@@ -248,6 +286,58 @@ func NewPrometheus() *Prometheus {
 			Name: "partforge_compact_part_bytes",
 			Help: "Compact batch active ClickHouse bytes_on_disk measured while compaction is running.",
 		}, []string{"role", "job_id", "output_part_id"}),
+		compactActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_batch_active",
+			Help: "Whether a compact batch is currently active.",
+		}, []string{"job_id", "output_part_id"}),
+		compactStage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_stage",
+			Help: "Current compact batch stage. The current stage label is set to 1.",
+		}, []string{"job_id", "output_part_id", "stage"}),
+		compactActiveMerges: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_active_merges",
+			Help: "Current number of ClickHouse merges for the compact batch destination table.",
+		}, []string{"job_id", "output_part_id"}),
+		compactPartitionParts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_partition_parts",
+			Help: "ClickHouse part count per compact batch partition for the input or current snapshot.",
+		}, []string{"role", "job_id", "output_part_id", "partition_id"}),
+		compactPartitionRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_partition_rows",
+			Help: "ClickHouse row count per compact batch partition for the input or current snapshot.",
+		}, []string{"role", "job_id", "output_part_id", "partition_id"}),
+		compactPartitionBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_partition_bytes",
+			Help: "ClickHouse bytes_on_disk per compact batch partition for the input or current snapshot.",
+		}, []string{"role", "job_id", "output_part_id", "partition_id"}),
+		compactMergeProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_progress_ratio",
+			Help: "ClickHouse-reported progress from 0 to 1 for an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeElapsed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_elapsed_seconds",
+			Help: "Elapsed time for an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeSourceParts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_source_parts",
+			Help: "Number of source parts in an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeRowsRead: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_rows_read",
+			Help: "Rows read so far by an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeRowsTotal: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_rows_total",
+			Help: "Total rows in the source parts of an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeBytesRead: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_bytes_read",
+			Help: "Uncompressed bytes read so far by an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
+		compactMergeBytesTotal: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_compact_merge_bytes_total",
+			Help: "Estimated total uncompressed source bytes for an individual compact batch merge.",
+		}, []string{"job_id", "output_part_id", "partition_id", "result_part_name"}),
 		clickHouseMetricsUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "partforge_clickhouse_metrics_up",
 			Help: "Whether the active local ClickHouse Prometheus endpoint was scraped successfully by this metrics endpoint.",
@@ -297,6 +387,19 @@ func NewPrometheus() *Prometheus {
 		p.compactPartCount,
 		p.compactPartRows,
 		p.compactPartBytes,
+		p.compactActive,
+		p.compactStage,
+		p.compactActiveMerges,
+		p.compactPartitionParts,
+		p.compactPartitionRows,
+		p.compactPartitionBytes,
+		p.compactMergeProgress,
+		p.compactMergeElapsed,
+		p.compactMergeSourceParts,
+		p.compactMergeRowsRead,
+		p.compactMergeRowsTotal,
+		p.compactMergeBytesRead,
+		p.compactMergeBytesTotal,
 		p.clickHouseMetricsUp,
 		p.clickHouseMetricsScrapes,
 		p.clickHouseMetricsScrapeFailures,
@@ -539,6 +642,7 @@ func (p *Prometheus) ClearStageProgress(m manifest.Manifest) {
 
 func (p *Prometheus) CompactionStarted(jobID, outputPartID string, inputArtifacts uint64, inputStats PartStats) {
 	p.compactionsStarted.WithLabelValues(jobID).Inc()
+	p.compactActive.WithLabelValues(jobID, outputPartID).Set(1)
 	p.compactInputArtifacts.WithLabelValues(jobID, outputPartID).Set(float64(inputArtifacts))
 	p.SetCompactPartStats("input", jobID, outputPartID, inputStats)
 
@@ -570,6 +674,84 @@ func (p *Prometheus) SetCompactPartStats(role, jobID, outputPartID string, stats
 	p.compactPartCount.WithLabelValues(role, jobID, outputPartID).Set(float64(stats.Count))
 	p.compactPartRows.WithLabelValues(role, jobID, outputPartID).Set(float64(stats.Rows))
 	p.compactPartBytes.WithLabelValues(role, jobID, outputPartID).Set(float64(stats.Bytes))
+}
+
+func (p *Prometheus) SetCompactPartitionStats(role, jobID, outputPartID string, partitions []CompactPartitionStats) {
+	labels := prometheus.Labels{"role": role, "job_id": jobID, "output_part_id": outputPartID}
+	p.compactPartitionParts.DeletePartialMatch(labels)
+	p.compactPartitionRows.DeletePartialMatch(labels)
+	p.compactPartitionBytes.DeletePartialMatch(labels)
+	for _, partition := range partitions {
+		labels := []string{role, jobID, outputPartID, partition.PartitionID}
+		p.compactPartitionParts.WithLabelValues(labels...).Set(float64(partition.Stats.Count))
+		p.compactPartitionRows.WithLabelValues(labels...).Set(float64(partition.Stats.Rows))
+		p.compactPartitionBytes.WithLabelValues(labels...).Set(float64(partition.Stats.Bytes))
+	}
+}
+
+func (p *Prometheus) ObserveCompactProgress(jobID, outputPartID, stage string, stats PartStats, partitions []CompactPartitionStats, merges []CompactMerge) {
+	p.SetCompactPartStats("output", jobID, outputPartID, stats)
+	p.SetCompactPartitionStats("current", jobID, outputPartID, partitions)
+	p.compactActiveMerges.WithLabelValues(jobID, outputPartID).Set(float64(len(merges)))
+
+	batchLabels := prometheus.Labels{"job_id": jobID, "output_part_id": outputPartID}
+	p.compactStage.DeletePartialMatch(batchLabels)
+	if stage != "" {
+		p.compactStage.WithLabelValues(jobID, outputPartID, stage).Set(1)
+	}
+	for _, metric := range []*prometheus.GaugeVec{
+		p.compactMergeProgress,
+		p.compactMergeElapsed,
+		p.compactMergeSourceParts,
+		p.compactMergeRowsRead,
+		p.compactMergeRowsTotal,
+		p.compactMergeBytesRead,
+		p.compactMergeBytesTotal,
+	} {
+		metric.DeletePartialMatch(batchLabels)
+	}
+	for _, merge := range merges {
+		values := []string{jobID, outputPartID, merge.PartitionID, merge.ResultPartName}
+		p.compactMergeProgress.WithLabelValues(values...).Set(merge.Progress)
+		p.compactMergeElapsed.WithLabelValues(values...).Set(merge.Elapsed.Seconds())
+		p.compactMergeSourceParts.WithLabelValues(values...).Set(float64(merge.SourceParts))
+		p.compactMergeRowsRead.WithLabelValues(values...).Set(float64(merge.RowsRead))
+		p.compactMergeRowsTotal.WithLabelValues(values...).Set(float64(merge.RowsTotal))
+		p.compactMergeBytesRead.WithLabelValues(values...).Set(float64(merge.BytesRead))
+		p.compactMergeBytesTotal.WithLabelValues(values...).Set(float64(merge.BytesTotal))
+	}
+}
+
+func (p *Prometheus) ClearCompaction(jobID, outputPartID string) {
+	key := compactKey(jobID, outputPartID)
+	batchLabels := prometheus.Labels{"job_id": jobID, "output_part_id": outputPartID}
+	for _, metric := range []*prometheus.GaugeVec{
+		p.compactStage,
+		p.compactPartitionParts,
+		p.compactPartitionRows,
+		p.compactPartitionBytes,
+		p.compactMergeProgress,
+		p.compactMergeElapsed,
+		p.compactMergeSourceParts,
+		p.compactMergeRowsRead,
+		p.compactMergeRowsTotal,
+		p.compactMergeBytesRead,
+		p.compactMergeBytesTotal,
+	} {
+		metric.DeletePartialMatch(batchLabels)
+	}
+
+	p.compactActive.DeleteLabelValues(jobID, outputPartID)
+	p.compactActiveMerges.DeleteLabelValues(jobID, outputPartID)
+	p.compactInputArtifacts.DeleteLabelValues(jobID, outputPartID)
+	for _, role := range []string{"input", "output"} {
+		p.compactPartCount.DeleteLabelValues(role, jobID, outputPartID)
+		p.compactPartRows.DeleteLabelValues(role, jobID, outputPartID)
+		p.compactPartBytes.DeleteLabelValues(role, jobID, outputPartID)
+	}
+	p.stageMu.Lock()
+	delete(p.compactionStartedAt, key)
+	p.stageMu.Unlock()
 }
 
 func (p *Prometheus) observeForgeDuration(m manifest.Manifest, result string) {

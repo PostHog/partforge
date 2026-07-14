@@ -36,6 +36,8 @@ type Compactor struct {
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
 	ReportProgress      CompactProgressReporter
+	ProgressInterval    time.Duration
+	Metrics             metrics.Recorder
 	ShutdownContext     context.Context
 	MergeStopContext    context.Context
 }
@@ -55,6 +57,9 @@ type CompactProgressReporter func(context.Context, CompactWorkItem, CompactProgr
 type CompactProgressSnapshot struct {
 	InputStats       metrics.PartStats
 	DestinationStats metrics.PartStats
+	Stage            string
+	ActiveMerges     uint64
+	MergeProgress    float64
 }
 
 type CompactWorkItem struct {
@@ -93,6 +98,10 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}
 	}
 	attachedInputs := append([]CompactInput(nil), item.Inputs...)
+	inputStats := compactInputStats(item.Inputs)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, Stage: "attaching_inputs"}); err != nil {
+		return CompactResult{}, err
+	}
 
 	root := filepath.Join(defaultWorkDir(c.WorkDir), item.JobID, item.OutputPartID)
 	if err := os.RemoveAll(root); err != nil {
@@ -144,7 +153,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		return CompactResult{}, err
 	}
 
-	var inputStats metrics.PartStats
+	inputStats = metrics.PartStats{}
 	for idx, input := range item.Inputs {
 		workDir := filepath.Join(root, "inputs", fmt.Sprintf("%06d", idx))
 		stats, err := c.attachFinishedArtifact(phaseCtx, item, input, detached, workDir)
@@ -160,7 +169,10 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	}
 	actualInputStats := summarizePartPartitions(actualInputPartitions)
 	slog.Info("attached compact input artifacts", "stage", "compact_attach_inputs", "job_id", item.JobID, "part_id", item.OutputPartID, "input_artifacts", len(item.Inputs), "active_parts", actualInputStats.Count, "active_rows", actualInputStats.Rows, "active_bytes_on_disk", actualInputStats.Bytes)
-	if err := c.reportProgress(phaseCtx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats}); err != nil {
+	c.metrics().SetCompactPartStats("input", item.JobID, item.OutputPartID, inputStats)
+	c.metrics().SetCompactPartitionStats("input", item.JobID, item.OutputPartID, compactPartitionMetrics(actualInputPartitions))
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "configuring_merges", actualInputStats, compactPartitionMetrics(actualInputPartitions), nil)
+	if err := c.reportProgress(phaseCtx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats, Stage: "configuring_merges"}); err != nil {
 		return CompactResult{}, err
 	}
 	if inputStats.Count < 2 {
@@ -192,6 +204,15 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}
 	}
 	if waitForMerges {
+		observerCtx, cancelObserver := context.WithCancel(phaseCtx)
+		observerErrCh := make(chan error, 1)
+		go func() {
+			err := c.observeCompactProgress(observerCtx, p, item, target, inputStats)
+			if err != nil {
+				cancelPhase()
+			}
+			observerErrCh <- err
+		}()
 		waitCtx := c.mergeWaitContext(phaseCtx)
 		cancelWait := func() {}
 		if deadlineActive {
@@ -202,6 +223,11 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			_, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact", true)
 			return err
 		}()
+		cancelObserver()
+		observerErr := <-observerErrCh
+		if observerErr != nil {
+			return CompactResult{}, observerErr
+		}
 		if err != nil {
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
@@ -221,12 +247,17 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		return CompactResult{}, fmt.Errorf("measure compact output active part partitions: %w", err)
 	}
 	destStats := summarizePartPartitions(destPartitions)
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "measuring_output", destStats, compactPartitionMetrics(destPartitions), nil)
 	slog.Info("measured compact output parts", "stage", "compact_measure_output", "job_id", item.JobID, "part_id", item.OutputPartID, "input_parts", inputStats.Count, "output_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes)
-	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: destStats}); err != nil {
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: destStats, Stage: "measuring_output"}); err != nil {
 		return CompactResult{}, err
 	}
 	if destStats.Count >= inputStats.Count {
 		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: destStats, DestinationPartitions: destPartitions, Inputs: attachedInputs}, nil
+	}
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "uploading_output", destStats, compactPartitionMetrics(destPartitions), nil)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: destStats, Stage: "uploading_output"}); err != nil {
+		return CompactResult{}, err
 	}
 
 	freezeName := workerFreezeName(m, time.Now().UTC())
@@ -302,6 +333,38 @@ func (c Compactor) reportProgress(ctx context.Context, item CompactWorkItem, sna
 		return nil
 	}
 	return c.ReportProgress(ctx, item, snapshot)
+}
+
+func (c Compactor) metrics() metrics.Recorder {
+	if c.Metrics == nil {
+		return metrics.Noop{}
+	}
+	return c.Metrics
+}
+
+func compactInputStats(inputs []CompactInput) metrics.PartStats {
+	var stats metrics.PartStats
+	for _, input := range inputs {
+		stats.Count += input.Parts
+		stats.Rows += input.Rows
+		stats.Bytes += input.Bytes
+	}
+	return stats
+}
+
+func compactPartitionMetrics(partitions []PartPartitionStats) []metrics.CompactPartitionStats {
+	out := make([]metrics.CompactPartitionStats, 0, len(partitions))
+	for _, partition := range partitions {
+		out = append(out, metrics.CompactPartitionStats{
+			PartitionID: partition.PartitionID,
+			Stats: metrics.PartStats{
+				Count: partition.Parts,
+				Rows:  partition.Rows,
+				Bytes: partition.Bytes,
+			},
+		})
+	}
+	return out
 }
 
 func (c Compactor) prepareDestinationTable(ctx context.Context, item CompactWorkItem) error {
