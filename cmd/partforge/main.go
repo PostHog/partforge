@@ -1245,7 +1245,6 @@ func runWorker(ctx context.Context, args []string) error {
 		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
 	}
 	mergeConcurrencyRatio := 1.0
-	maxConcurrentMerges := mergeBackgroundPoolSize
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
@@ -1261,7 +1260,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", mergeBackgroundPoolSize,
 		"merge_concurrency_ratio", mergeConcurrencyRatio,
-		"merge_max_concurrent_merges", maxConcurrentMerges,
+		"compact_merge_max_concurrent_merges", mergeBackgroundPoolSize,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"merge_pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
@@ -1504,13 +1503,8 @@ func runWorker(ctx context.Context, args []string) error {
 					return fmt.Errorf("stop clickhouse before restart: %w", err)
 				}
 				server = nil
-				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", mergeBackgroundPoolSize, "background_merges_mutations_concurrency_ratio", mergeConcurrencyRatio, "background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy, "merge_pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold)
-				restarted, err := startServer(ctx, chproc.Tuning{
-					BackgroundPoolSize:            mergeBackgroundPoolSize,
-					MergeConcurrencyRatio:         mergeConcurrencyRatio,
-					MergeSchedulingPolicy:         mergeTreeSettings.MergeSchedulingPolicy,
-					MergePoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
-				})
+				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
+				restarted, err := startServer(ctx, chproc.Tuning{})
 				if err != nil {
 					return err
 				}
@@ -1656,6 +1650,15 @@ type workerCompactionConfig struct {
 	Metrics                       metrics.Recorder
 	PrometheusMetrics             *metrics.Prometheus
 	ECSProtection                 *ecsTaskProtection
+}
+
+func (cfg workerCompactionConfig) clickHouseTuning() chproc.Tuning {
+	return chproc.Tuning{
+		BackgroundPoolSize:            cfg.MergeBackgroundPoolSize,
+		MergeConcurrencyRatio:         cfg.MergeConcurrencyRatio,
+		MergeSchedulingPolicy:         cfg.MergeSchedulingPolicy,
+		MergePoolFreeEntriesThreshold: cfg.MergePoolFreeEntriesThreshold,
+	}
 }
 
 func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
@@ -1964,7 +1967,7 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 		})
 	}
 	slog.Info("starting local ClickHouse server for compaction", "stage", "compact_start_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID)
-	server, err = startServer(ctx, chproc.Tuning{})
+	server, err = startServer(ctx, cfg.clickHouseTuning())
 	if err != nil {
 		return rewrite.CompactResult{}, cleanup, err
 	}
@@ -2017,12 +2020,7 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 		}
 		server = nil
 		slog.Info("starting local ClickHouse server after compact restart", "stage", "compact_restart_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID, "background_pool_size", cfg.MergeBackgroundPoolSize, "background_merges_mutations_concurrency_ratio", cfg.MergeConcurrencyRatio, "background_merges_mutations_scheduling_policy", cfg.MergeSchedulingPolicy, "merge_pool_free_entries_threshold", cfg.MergePoolFreeEntriesThreshold)
-		restarted, err := startServer(ctx, chproc.Tuning{
-			BackgroundPoolSize:            cfg.MergeBackgroundPoolSize,
-			MergeConcurrencyRatio:         cfg.MergeConcurrencyRatio,
-			MergeSchedulingPolicy:         cfg.MergeSchedulingPolicy,
-			MergePoolFreeEntriesThreshold: cfg.MergePoolFreeEntriesThreshold,
-		})
+		restarted, err := startServer(ctx, cfg.clickHouseTuning())
 		if err != nil {
 			return err
 		}

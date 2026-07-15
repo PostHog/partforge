@@ -13,7 +13,7 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 - **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the worker destination table before the insert-select.
 - **`-clickhouse-binary`**, **`-clickhouse-config-file`**, **`-clickhouse-url`** — locate the local ClickHouse the worker starts.
 
-The worker auto-tunes ClickHouse insert and merge settings from detected CPU/memory (memory-capped inserts, larger insert blocks, merge pool sizing, and a ~150 GiB local merge target). The derivation and the merge-wait state machine are documented in [rewrite-flow.md](rewrite-flow.md).
+The worker auto-tunes ClickHouse insert and merge settings from detected CPU/memory (memory-capped inserts, compactor-only merge pool sizing, and a ~150 GiB local merge target). The derivation and the merge-wait state machine are documented in [rewrite-flow.md](rewrite-flow.md).
 
 ## Metrics
 

@@ -48,7 +48,7 @@ graph TD
     G --> H[ALTER TABLE source ATTACH PART]
     H --> I[Run INSERT INTO destination SELECT ... FROM source]
     I --> J[Apply destination merge settings]
-    J --> K[Restart local ClickHouse with merge tuning]
+    J --> K[Restart local ClickHouse]
     K --> L[Wait for destination merges]
     L --> P[Measure active destination parts]
     P --> Q{Any active destination parts?}
@@ -71,7 +71,9 @@ After a successful insert-select and before the ClickHouse restart, the worker a
 - `max_bytes_to_merge_at_max_space_in_pool`
 - `max_bytes_to_merge_at_min_space_in_pool`
 
-The restarted ClickHouse uses a `round_robin` merge pool sized to half the detected CPUs, with a minimum of two threads and a concurrency ratio of one.
+Server-level merge pool tuning is not applied to rewrite/inserter ClickHouse processes.
+
+Compactor ClickHouse processes start with a `round_robin` merge pool sized to half the detected CPUs, with a minimum of two threads and a concurrency ratio of one. The same tuning is retained when ClickHouse restarts after compact inputs are attached.
 
 ## Merge Wait
 
