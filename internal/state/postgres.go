@@ -1656,6 +1656,21 @@ func (s *Store) MarkImported(ctx context.Context, part Part, now time.Time) erro
 	return s.transition(ctx, part, StatusImporting, StatusImported, "imported_at", "", now)
 }
 
+func (s *Store) ReleaseImport(ctx context.Context, part Part, now time.Time) error {
+	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
+		return current.Status == StatusImporting
+	}, func(current *Part) error {
+		setStatus(current, StatusFinished, now)
+		current.ImportingAt = ""
+		current.Error = ""
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("release import for %s/%s: %w", part.JobID, part.PartID, err)
+	}
+	return nil
+}
+
 func (s *Store) MarkImportFailed(ctx context.Context, part Part, cause error, now time.Time) error {
 	if cause == nil {
 		return errors.New("failure cause is required")

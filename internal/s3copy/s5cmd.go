@@ -1,6 +1,7 @@
 package s3copy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
-	s5cmdRetries = 3
+	s5cmdRetries       = 3
+	s5cmdShutdownGrace = 5 * time.Second
 )
 
 var s5cmdRetryBaseDelay = time.Second
@@ -111,14 +114,39 @@ func (c Copier) runS5cmd(ctx context.Context, fullArgs []string, acceptErr func(
 }
 
 func (c Copier) runArgs(ctx context.Context, fullArgs []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	binary := c.Binary
 	if strings.TrimSpace(binary) == "" {
 		binary = "s5cmd"
 	}
-	cmd := exec.CommandContext(ctx, binary, fullArgs...)
-	out, err := cmd.CombinedOutput()
+	cmd := exec.Command(binary, fullArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		return &CommandError{Binary: binary, Args: fullArgs, Err: err}
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+
+	var err error
+	select {
+	case err = <-wait:
+	case <-ctx.Done():
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-wait:
+		case <-time.After(s5cmdShutdownGrace):
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			<-wait
+		}
+		err = ctx.Err()
+	}
 	if err != nil {
-		return &CommandError{Binary: binary, Args: fullArgs, Err: err, Output: string(out)}
+		return &CommandError{Binary: binary, Args: fullArgs, Err: err, Output: out.String()}
 	}
 	return nil
 }

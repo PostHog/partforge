@@ -2458,6 +2458,13 @@ func runImportFinished(ctx context.Context, args []string) error {
 			}
 			return stateStore.MarkImported(ctx, part, time.Now().UTC())
 		},
+		ReleaseImport: func(ctx context.Context, artifact parts.FinishedArtifact) error {
+			part, ok := partsByID[artifact.PartID]
+			if !ok {
+				return fmt.Errorf("missing state for part %s", artifact.PartID)
+			}
+			return stateStore.ReleaseImport(ctx, part, time.Now().UTC())
+		},
 		MarkImportFailed: func(ctx context.Context, artifact parts.FinishedArtifact, cause error) error {
 			part, ok := partsByID[artifact.PartID]
 			if !ok {

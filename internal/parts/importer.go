@@ -2,6 +2,7 @@ package parts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -37,6 +38,7 @@ type ImportJob struct {
 	RequireEmpty     bool
 	MarkImporting    func(context.Context, FinishedArtifact) error
 	MarkImported     func(context.Context, FinishedArtifact) error
+	ReleaseImport    func(context.Context, FinishedArtifact) error
 	MarkImportFailed func(context.Context, FinishedArtifact, error) error
 }
 
@@ -122,6 +124,16 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 			}
 		}
 		if err := i.importArtifact(ctx, job, artifact, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx)), owner); err != nil {
+			if ctx.Err() != nil && job.ReleaseImport != nil {
+				cleanupErr := os.RemoveAll(root)
+				releaseCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				releaseErr := job.ReleaseImport(releaseCtx, artifact)
+				cancel()
+				if cleanupErr != nil || releaseErr != nil {
+					return fmt.Errorf("cancel import artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, errors.Join(err, cleanupErr, releaseErr))
+				}
+				return err
+			}
 			if job.MarkImportFailed != nil {
 				if markErr := job.MarkImportFailed(ctx, artifact, err); markErr != nil {
 					return fmt.Errorf("import artifact s3://%s/%s: %w; additionally failed to mark import failed: %v", artifact.Bucket, artifact.Key, err, markErr)
