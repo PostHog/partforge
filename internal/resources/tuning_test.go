@@ -47,79 +47,23 @@ func TestInsertThreadCount(t *testing.T) {
 
 func TestMergeBackgroundPoolSize(t *testing.T) {
 	tests := []struct {
-		name   string
-		limits Limits
-		want   int
+		cpus int
+		want int
 	}{
-		{
-			name:   "small cpu count satisfies ClickHouse merge tree defaults",
-			limits: Limits{CPUs: 4},
-			want:   13,
-		},
-		{
-			name:   "larger cpu count uses detected cpu count",
-			limits: Limits{CPUs: 16},
-			want:   16,
-		},
+		{cpus: 1, want: 2},
+		{cpus: 4, want: 2},
+		{cpus: 8, want: 4},
+		{cpus: 16, want: 8},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := MergeBackgroundPoolSize(tt.limits)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tt.want {
-				t.Fatalf("MergeBackgroundPoolSize(%+v) = %d, want %d", tt.limits, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestMergeConcurrencyRatio(t *testing.T) {
-	tests := []struct {
-		name       string
-		limits     Limits
-		poolSize   int
-		wantRatio  float64
-		wantMerges int
-	}{
-		{
-			name:       "small worker keeps clickhouse pool but caps merge slots to cpu count",
-			limits:     Limits{CPUs: 4},
-			poolSize:   13,
-			wantRatio:  4.0 / 13.0,
-			wantMerges: 4,
-		},
-		{
-			name:       "single cpu worker keeps minimum valid merge slots",
-			limits:     Limits{CPUs: 1},
-			poolSize:   13,
-			wantRatio:  2.0 / 13.0,
-			wantMerges: 2,
-		},
-		{
-			name:       "larger worker uses one merge slot per pool thread",
-			limits:     Limits{CPUs: 16},
-			poolSize:   16,
-			wantRatio:  1,
-			wantMerges: 16,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotRatio, gotMerges, err := MergeConcurrencyRatio(tt.limits, tt.poolSize)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if gotRatio != tt.wantRatio {
-				t.Fatalf("ratio = %g, want %g", gotRatio, tt.wantRatio)
-			}
-			if gotMerges != tt.wantMerges {
-				t.Fatalf("merge slots = %d, want %d", gotMerges, tt.wantMerges)
-			}
-		})
+		got, err := MergeBackgroundPoolSize(Limits{CPUs: tt.cpus})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tt.want {
+			t.Fatalf("MergeBackgroundPoolSize(%d CPUs) = %d, want %d", tt.cpus, got, tt.want)
+		}
 	}
 }
 
@@ -129,39 +73,26 @@ func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {
 	}
 }
 
-func TestMergeConcurrencyRatioRejectsInvalidLimits(t *testing.T) {
-	if _, _, err := MergeConcurrencyRatio(Limits{}, 13); err == nil {
-		t.Fatal("expected invalid cpu count error")
-	}
-	if _, _, err := MergeConcurrencyRatio(Limits{CPUs: 4}, 0); err == nil {
-		t.Fatal("expected invalid background pool size error")
-	}
-}
-
 func TestMergeTreeSettingsForLimits(t *testing.T) {
 	tests := []struct {
-		name      string
-		limits    Limits
-		wantRows  uint64
-		wantBytes uint64
+		name     string
+		limits   Limits
+		wantRows uint64
 	}{
 		{
-			name:      "low memory clamps to safe minimum",
-			limits:    Limits{CPUs: 8, MemoryBytes: 1 * 1024 * 1024 * 1024},
-			wantRows:  8192,
-			wantBytes: 9 * 1024 * 1024,
+			name:     "low memory clamps to safe minimum",
+			limits:   Limits{CPUs: 8, MemoryBytes: 1 * 1024 * 1024 * 1024},
+			wantRows: 8192,
 		},
 		{
-			name:      "scales with memory per background worker",
-			limits:    Limits{CPUs: 16, MemoryBytes: 32 * 1024 * 1024 * 1024},
-			wantRows:  155648,
-			wantBytes: 153 * 1024 * 1024,
+			name:     "scales with memory per background worker",
+			limits:   Limits{CPUs: 16, MemoryBytes: 32 * 1024 * 1024 * 1024},
+			wantRows: 155648,
 		},
 		{
-			name:      "high memory clamps to upper bound",
-			limits:    Limits{CPUs: 16, MemoryBytes: 1024 * 1024 * 1024 * 1024},
-			wantRows:  262144,
-			wantBytes: 256 * 1024 * 1024,
+			name:     "high memory clamps to upper bound",
+			limits:   Limits{CPUs: 16, MemoryBytes: 1024 * 1024 * 1024 * 1024},
+			wantRows: 262144,
 		},
 	}
 
@@ -173,9 +104,6 @@ func TestMergeTreeSettingsForLimits(t *testing.T) {
 			}
 			if settings.MergeMaxBlockSize != tt.wantRows {
 				t.Fatalf("merge_max_block_size = %d, want %d", settings.MergeMaxBlockSize, tt.wantRows)
-			}
-			if settings.MergeMaxBlockSizeBytes != tt.wantBytes {
-				t.Fatalf("merge_max_block_size_bytes = %d, want %d", settings.MergeMaxBlockSizeBytes, tt.wantBytes)
 			}
 			if settings.MergeSelectingSleepMS != defaultMergeSelectingSleepMS {
 				t.Fatalf("merge_selecting_sleep_ms = %d, want %d", settings.MergeSelectingSleepMS, defaultMergeSelectingSleepMS)

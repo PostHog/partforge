@@ -1244,10 +1244,8 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
 	}
-	mergeConcurrencyRatio, maxConcurrentMerges, err := resources.MergeConcurrencyRatio(workerLimits, mergeBackgroundPoolSize)
-	if err != nil {
-		return fmt.Errorf("derive clickhouse merge concurrency ratio: %w", err)
-	}
+	mergeConcurrencyRatio := 1.0
+	maxConcurrentMerges := mergeBackgroundPoolSize
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
@@ -1265,7 +1263,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_concurrency_ratio", mergeConcurrencyRatio,
 		"merge_max_concurrent_merges", maxConcurrentMerges,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
-		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"merge_pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy,
@@ -1345,7 +1342,6 @@ func runWorker(ctx context.Context, args []string) error {
 					MergeConcurrencyRatio:         mergeConcurrencyRatio,
 					MergeSchedulingPolicy:         mergeTreeSettings.MergeSchedulingPolicy,
 					MergeMaxBlockSize:             mergeTreeSettings.MergeMaxBlockSize,
-					MergeMaxBlockSizeBytes:        mergeTreeSettings.MergeMaxBlockSizeBytes,
 					MergeSelectingSleepMS:         mergeTreeSettings.MergeSelectingSleepMS,
 					MergePoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 					CompactWindow:                 *compactWindow,
@@ -1493,7 +1489,6 @@ func runWorker(ctx context.Context, args []string) error {
 				ProgressInterval: *stateProgressInterval,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:        mergeTreeSettings.MergeMaxBlockSize,
-					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
 					MergeSelectingSleepMS:    mergeTreeSettings.MergeSelectingSleepMS,
 					DefaultCompressionCodec:  *defaultCompressionCodec,
 					PoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
@@ -1649,7 +1644,6 @@ type workerCompactionConfig struct {
 	MergeConcurrencyRatio         float64
 	MergeSchedulingPolicy         string
 	MergeMaxBlockSize             uint64
-	MergeMaxBlockSizeBytes        uint64
 	MergeSelectingSleepMS         uint64
 	MergePoolFreeEntriesThreshold uint64
 	CompactWindow                 time.Duration
@@ -1986,7 +1980,6 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 		OptimizeFinalAfter:  cfg.CompactOptimizeFinalAfter,
 		MergeTreeSettings: rewrite.MergeTreeSettings{
 			MergeMaxBlockSize:        cfg.MergeMaxBlockSize,
-			MergeMaxBlockSizeBytes:   cfg.MergeMaxBlockSizeBytes,
 			MergeSelectingSleepMS:    cfg.MergeSelectingSleepMS,
 			DefaultCompressionCodec:  cfg.DefaultCompressionCodec,
 			PoolFreeEntriesThreshold: cfg.MergePoolFreeEntriesThreshold,

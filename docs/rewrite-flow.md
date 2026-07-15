@@ -67,10 +67,11 @@ The insert-select step has its own resource retry loop. The worker caps query me
 After a successful insert-select and before the ClickHouse restart, the worker applies these destination table settings:
 
 - `merge_max_block_size`
-- `merge_max_block_size_bytes`
 - `merge_selecting_sleep_ms`
 - `max_bytes_to_merge_at_max_space_in_pool`
 - `max_bytes_to_merge_at_min_space_in_pool`
+
+The restarted ClickHouse uses a `round_robin` merge pool sized to half the detected CPUs, with a minimum of two threads and a concurrency ratio of one.
 
 ## Merge Wait
 

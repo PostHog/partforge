@@ -14,7 +14,7 @@ import (
 	"github.com/PostHog/partforge/internal/metrics"
 )
 
-func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testing.T) {
+func TestConfigureCompactMergeSettingsLeavesDefaultSettingsUntouched(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -31,7 +31,6 @@ func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testin
 		ClickHouse: chhttp.Client{URL: server.URL},
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:        32768,
-			MergeMaxBlockSizeBytes:   67108864,
 			MergeSelectingSleepMS:    1000,
 			PoolFreeEntriesThreshold: 1,
 		},
@@ -47,8 +46,10 @@ func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testin
 	if len(queries) != 1 {
 		t.Fatalf("queries = %#v, want one query", queries)
 	}
-	if strings.Contains(queries[0], "enable_vertical_merge_algorithm") {
-		t.Fatalf("query = %q, want vertical merge algorithm unset", queries[0])
+	for _, setting := range []string{"enable_vertical_merge_algorithm", "merge_max_block_size_bytes"} {
+		if strings.Contains(queries[0], setting) {
+			t.Fatalf("query = %q, want %s unset", queries[0], setting)
+		}
 	}
 }
 
