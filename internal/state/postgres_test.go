@@ -41,6 +41,84 @@ func TestSelectCompactBatchPartsAllowsOversizedSingleMultiPartArtifact(t *testin
 	}
 }
 
+func TestSelectCompactBatchPartsNormalizesFragmentedArtifactAlone(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "fragmented",
+			DestinationActivePartCount: 3,
+			DestinationActivePartBytes: 300,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 3,
+			},
+		},
+		{
+			PartID:                     "normalized",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 8})
+
+	if len(selected) != 1 || selected[0].PartID != "fragmented" {
+		t.Fatalf("selected = %+v, want fragmented artifact alone", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsNormalizesIdlePartitionFirst(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{
+		parts: []Part{
+			{
+				PartID:                     "busy",
+				DestinationActivePartCount: 2,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"busy": 2,
+				},
+			},
+			{
+				PartID:                     "idle",
+				DestinationActivePartCount: 2,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"idle": 2,
+				},
+			},
+		},
+		compactingPartitionIDs: []string{"busy"},
+	}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 8})
+
+	if len(selected) != 1 || selected[0].PartID != "idle" {
+		t.Fatalf("selected = %+v, want idle fragmented artifact alone", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsDoesNotCombineFragmentedBusyPartitionThroughIdleOverlap(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{
+		parts: []Part{
+			{
+				PartID:                     "fragmented",
+				DestinationActivePartCount: 3,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"busy": 2,
+					"idle": 1,
+				},
+			},
+			{
+				PartID:                     "normalized",
+				DestinationActivePartCount: 1,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"idle": 1,
+				},
+			},
+		},
+		compactingPartitionIDs: []string{"busy"},
+	}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 8})
+
+	if len(selected) != 1 || selected[0].PartID != "fragmented" {
+		t.Fatalf("selected = %+v, want fragmented artifact alone", selected)
+	}
+}
+
 func TestSelectCompactBatchPartsIgnoresCooldownField(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected := selectCompactBatchParts(compactGroup{

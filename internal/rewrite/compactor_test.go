@@ -69,6 +69,69 @@ func TestCompactProgressRejectsOutputMoreThanAttachedInput(t *testing.T) {
 	}
 }
 
+func TestCompactInputNeedsNormalization(t *testing.T) {
+	if !compactInputNeedsNormalization([]CompactInput{{
+		Parts:           3,
+		PartitionCounts: map[string]uint64{"202606": 2, "202607": 1},
+	}}) {
+		t.Fatal("expected fragmented single input to need normalization")
+	}
+	if compactInputNeedsNormalization([]CompactInput{{
+		Parts:           2,
+		PartitionCounts: map[string]uint64{"202606": 1, "202607": 1},
+	}}) {
+		t.Fatal("expected one part per partition to be normalized")
+	}
+	if compactInputNeedsNormalization([]CompactInput{{PartitionCounts: map[string]uint64{"202606": 2}}, {PartitionCounts: map[string]uint64{"202606": 1}}}) {
+		t.Fatal("expected multi-input compaction not to use normalization path")
+	}
+}
+
+func TestNormalizeCompactInputVerifiesPartsAfterOptimizeReturns(t *testing.T) {
+	partitionQueries := 0
+	var optimizeQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			optimizeQuery = query
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			_, _ = io.WriteString(w, "0\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			partitionQueries++
+			parts := "2"
+			if partitionQueries > 1 {
+				parts = "1"
+			}
+			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}, MergePollInterval: time.Millisecond}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 2}}, metrics.PartStats{Count: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if optimizeQuery != "OPTIMIZE TABLE `db`.`events` FINAL SETTINGS optimize_skip_merged_partitions = 1" {
+		t.Fatalf("optimize query = %q", optimizeQuery)
+	}
+	if partitionQueries != 2 {
+		t.Fatalf("partition verification queries = %d, want 2", partitionQueries)
+	}
+}
+
 func TestCompactorPhaseContextCancelsOnShutdown(t *testing.T) {
 	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
 	phaseCtx, cancelPhase := (Compactor{ShutdownContext: shutdownCtx}).phaseContext(context.Background())

@@ -1081,13 +1081,40 @@ func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Par
 	}
 	partitions := orderedCandidatePartitions(group.parts, opts.RequiredPartitionIDs)
 	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
+	if part, ok := selectFragmentedCompactPart(group.parts, preferredPartitions); ok {
+		return []Part{part}
+	}
+	fallbackPartitions := partitionsWithout(partitions, preferredPartitions)
+	if part, ok := selectFragmentedCompactPart(group.parts, fallbackPartitions); ok {
+		return []Part{part}
+	}
 	selected, _, _ := selectCompactBatchPartsForPartitions(group.parts, preferredPartitions, minParts, opts, nil, nil, 0)
 	if len(selected) == 0 {
-		fallbackPartitions := partitionsWithout(partitions, preferredPartitions)
 		selected, _, _ = selectCompactBatchPartsForPartitions(group.parts, fallbackPartitions, minParts, opts, nil, nil, 0)
 		return selected
 	}
 	return selected
+}
+
+func selectFragmentedCompactPart(parts []Part, partitions []string) (Part, bool) {
+	for _, part := range parts {
+		eligible := false
+		for _, partitionID := range partitions {
+			if part.DestinationActivePartitionCounts[partitionID] > 0 {
+				eligible = true
+				break
+			}
+		}
+		if !eligible {
+			continue
+		}
+		for _, count := range part.DestinationActivePartitionCounts {
+			if count > 1 {
+				return part, true
+			}
+		}
+	}
+	return Part{}, false
 }
 
 func selectCompactBatchPartsForPartitions(parts []Part, partitions []string, minParts uint64, opts CompactClaimOptions, selected []Part, selectedIDs map[string]struct{}, inputBytes uint64) ([]Part, map[string]struct{}, uint64) {

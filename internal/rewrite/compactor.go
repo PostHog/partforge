@@ -97,6 +97,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			return CompactResult{}, fmt.Errorf("compact input artifact is missing part id, bucket, or finished key")
 		}
 	}
+	normalizing := compactInputNeedsNormalization(item.Inputs)
 	attachedInputs := append([]CompactInput(nil), item.Inputs...)
 	inputStats := compactInputStats(item.Inputs)
 	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, Stage: "attaching_inputs"}); err != nil {
@@ -144,6 +145,11 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	if err := p.configureDestinationCompressionCodec(phaseCtx, m); err != nil {
 		return CompactResult{}, err
 	}
+	if normalizing {
+		if err := c.ClickHouse.Exec(phaseCtx, "SYSTEM STOP MERGES "+chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable)); err != nil {
+			return CompactResult{}, fmt.Errorf("stop compact destination merges: %w", err)
+		}
+	}
 	dataPath, err := p.tableDataPath(phaseCtx, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
 		return CompactResult{}, err
@@ -182,8 +188,14 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	if err := c.configureCompactMergeSettings(phaseCtx, item, actualInputStats.Bytes); err != nil {
 		return CompactResult{}, err
 	}
-	if err := p.restartClickHouse(phaseCtx, m); err != nil {
-		return CompactResult{}, err
+	if normalizing {
+		if err := c.ClickHouse.Exec(phaseCtx, "SYSTEM START MERGES "+chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable)); err != nil {
+			return CompactResult{}, fmt.Errorf("start compact destination merges: %w", err)
+		}
+	} else {
+		if err := p.restartClickHouse(phaseCtx, m); err != nil {
+			return CompactResult{}, err
+		}
 	}
 	target := mergeWaitTarget{
 		JobID:    item.JobID,
@@ -196,6 +208,9 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	if mergeWaitTimeout, ok := compactMergeTimeoutUntil(c.MergeDeadline, time.Now()); ok {
 		deadlineActive = true
 		if mergeWaitTimeout <= 0 {
+			if normalizing {
+				return CompactResult{}, fmt.Errorf("compact merge deadline reached before fragmented input normalization")
+			}
 			waitForMerges = false
 			slog.Info("compact merge deadline reached before destination merge wait; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 		} else {
@@ -217,9 +232,14 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		cancelWait := func() {}
 		if deadlineActive {
 			waitCtx, cancelWait = context.WithDeadline(waitCtx, c.MergeDeadline)
+		} else if normalizing {
+			waitCtx, cancelWait = context.WithTimeout(waitCtx, p.MergeMaxTimeout)
 		}
 		err := func() error {
 			defer cancelWait()
+			if normalizing {
+				return c.normalizeCompactInput(waitCtx, p, item, target, actualInputPartitions, inputStats)
+			}
 			_, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact", true)
 			return err
 		}()
@@ -229,6 +249,9 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			return CompactResult{}, observerErr
 		}
 		if err != nil {
+			if normalizing {
+				return CompactResult{}, err
+			}
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
@@ -285,6 +308,75 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		DestinationPartitions: destPartitions,
 		Inputs:                attachedInputs,
 	}, nil
+}
+
+func compactInputNeedsNormalization(inputs []CompactInput) bool {
+	if len(inputs) != 1 {
+		return false
+	}
+	for _, count := range inputs[0].PartitionCounts {
+		if count > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item CompactWorkItem, target mergeWaitTarget, inputPartitions []PartPartitionStats, inputStats metrics.PartStats) error {
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "optimizing_final", inputStats, compactPartitionMetrics(inputPartitions), nil)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: inputStats, Stage: "optimizing_final"}); err != nil {
+		return err
+	}
+	query := "OPTIMIZE TABLE " + target.tableSQL() + " FINAL SETTINGS optimize_skip_merged_partitions = 1"
+	if err := c.ClickHouse.Exec(ctx, query); err != nil {
+		return fmt.Errorf("optimize fragmented compact input: %w", err)
+	}
+
+	pollInterval := p.MergePollInterval
+	if pollInterval == 0 {
+		pollInterval = defaultMergePollInterval
+	}
+	for {
+		activeMerges, err := p.destinationMergeCount(ctx, target)
+		if err != nil {
+			return fmt.Errorf("verify normalized compact merges: %w", err)
+		}
+		partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
+		if err != nil {
+			return fmt.Errorf("verify normalized compact parts: %w", err)
+		}
+		if activeMerges == 0 && compactPartitionsNormalized(inputPartitions, partitions) {
+			return nil
+		}
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("verify normalized compact output: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func compactPartitionsNormalized(input, output []PartPartitionStats) bool {
+	if len(output) != len(input) {
+		return false
+	}
+	inputIDs := make(map[string]struct{}, len(input))
+	for _, partition := range input {
+		inputIDs[partition.PartitionID] = struct{}{}
+	}
+	for _, partition := range output {
+		if partition.Parts != 1 {
+			return false
+		}
+		if _, ok := inputIDs[partition.PartitionID]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Compactor) phaseContext(ctx context.Context) (context.Context, context.CancelFunc) {
