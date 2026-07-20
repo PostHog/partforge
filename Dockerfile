@@ -17,21 +17,23 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     GOPROXY=off CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=readonly -o /out/partforge ./cmd/partforge
 
+FROM ghcr.io/posthog/clickhouse-posthog:26.6.1.1193-posthog-r0 AS clickhouse
+
 FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
-ARG CLICKHOUSE_VERSION=26.6.1.1193
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg tzdata \
-    && curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg \
-    && arch="$(dpkg --print-architecture)" \
-    && echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=${arch}] https://packages.clickhouse.com/deb stable main" > /etc/apt/sources.list.d/clickhouse.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        clickhouse-common-static=${CLICKHOUSE_VERSION} \
-        clickhouse-server=${CLICKHOUSE_VERSION} \
-        clickhouse-client=${CLICKHOUSE_VERSION} \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && groupadd --system clickhouse \
+    && useradd --system --gid clickhouse --home-dir /nonexistent --shell /bin/false clickhouse \
+    && mkdir -p /etc/clickhouse-client /etc/clickhouse-server/config.d /etc/clickhouse-server/users.d \
+    && chown -R clickhouse:clickhouse /etc/clickhouse-server \
+    && ln -s clickhouse /usr/bin/clickhouse-client \
+    && ln -s clickhouse /usr/bin/clickhouse-server \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=clickhouse /usr/bin/clickhouse /usr/bin/clickhouse
+COPY --from=clickhouse --chown=clickhouse:clickhouse --chmod=0400 /etc/clickhouse-server/config.xml /etc/clickhouse-server/users.xml /etc/clickhouse-server/
+COPY --from=clickhouse --chmod=0644 /etc/clickhouse-client/config.xml /etc/clickhouse-client/config.xml
 
 FROM clickhouse-runtime AS clickhouse-util-udfs
 ARG TARGETARCH
