@@ -17,7 +17,7 @@ const (
 	insertCPUConcurrencyDivisor           = 2
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
-	minMergeBackgroundPoolSize            = 2
+	minMergeBackgroundPoolSize            = 1
 	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
 	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
 	minMergeMaxBlockSizeRows       uint64 = 8192

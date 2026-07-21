@@ -50,7 +50,8 @@ func TestMergeBackgroundPoolSize(t *testing.T) {
 		cpus int
 		want int
 	}{
-		{cpus: 1, want: 2},
+		{cpus: 1, want: 1},
+		{cpus: 2, want: 1},
 		{cpus: 4, want: 2},
 		{cpus: 8, want: 4},
 		{cpus: 16, want: 8},
