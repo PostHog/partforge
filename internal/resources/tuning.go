@@ -15,6 +15,7 @@ const (
 	DefaultCompressionCodec               = "ZSTD(5)"
 	insertMemoryUsagePercent       uint64 = 70
 	insertCPUConcurrencyDivisor           = 2
+	mergeCPUConcurrencyDivisor            = 4
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
 	minMergeBackgroundPoolSize            = 1
@@ -37,7 +38,7 @@ func MergeBackgroundPoolSize(limits Limits) (int, error) {
 	if limits.CPUs < 1 {
 		return 0, fmt.Errorf("cpu limit must be at least 1, got %d", limits.CPUs)
 	}
-	poolSize := limits.CPUs / 2
+	poolSize := limits.CPUs / mergeCPUConcurrencyDivisor
 	if poolSize < minMergeBackgroundPoolSize {
 		return minMergeBackgroundPoolSize, nil
 	}
