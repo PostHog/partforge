@@ -1222,6 +1222,11 @@ func retryableInsertSelectError(err error) bool {
 	return false
 }
 
+func clickHouseMemoryLimitError(err error) bool {
+	var queryErr *chhttp.QueryError
+	return errors.As(err, &queryErr) && strings.Contains(strings.ToLower(queryErr.Body), "code: 241.")
+}
+
 func insertSelectRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 {
 		return time.Second
@@ -1501,11 +1506,23 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, wa
 	for {
 		count, err := p.destinationMergeCount(ctx, target)
 		if err != nil {
+			if clickHouseMemoryLimitError(err) {
+				if err := sleepOrDone(ctx, pollInterval); err != nil {
+					return mergeWaitResult{}, err
+				}
+				continue
+			}
 			return mergeWaitResult{}, err
 		}
 		now := time.Now()
 		snapshot, err := p.mergePartSnapshot(ctx, target)
 		if err != nil {
+			if clickHouseMemoryLimitError(err) {
+				if err := sleepOrDone(ctx, pollInterval); err != nil {
+					return mergeWaitResult{}, err
+				}
+				continue
+			}
 			return mergeWaitResult{}, err
 		}
 		if !havePreviousSnapshot || !sameMergePartSnapshot(snapshot, previousSnapshot) || count > 0 {

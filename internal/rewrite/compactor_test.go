@@ -190,6 +190,46 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 	}
 }
 
+func TestNormalizeCompactInputRetriesMemoryLimitedObservation(t *testing.T) {
+	var mergeQueries atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			if mergeQueries.Add(1) == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, "Code: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED")
+				return
+			}
+			_, _ = io.WriteString(w, "0\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			_, _ = io.WriteString(w, "202606\t1\t100\t1000\n")
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}, MergePollInterval: time.Millisecond}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 2}}, metrics.PartStats{Count: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mergeQueries.Load() != 2 {
+		t.Fatalf("merge observation queries = %d, want 2", mergeQueries.Load())
+	}
+}
+
 func TestNormalizeCompactInputFailsWhenOptimizeMakesNoProgress(t *testing.T) {
 	optimizeStarted := make(chan struct{})
 	optimizeCanceled := make(chan struct{})

@@ -35,12 +35,24 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 			if ctx.Err() != nil {
 				return nil
 			}
+			if clickHouseMemoryLimitError(err) {
+				if sleepOrDone(ctx, compactProgressPollInterval) != nil {
+					return nil
+				}
+				continue
+			}
 			return fmt.Errorf("observe compact partition progress: %w", err)
 		}
 		merges, err := p.compactMerges(ctx, target)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			if clickHouseMemoryLimitError(err) {
+				if sleepOrDone(ctx, compactProgressPollInterval) != nil {
+					return nil
+				}
+				continue
 			}
 			return fmt.Errorf("observe compact merge progress: %w", err)
 		}

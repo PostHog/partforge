@@ -133,12 +133,18 @@ func TestRetryableInsertSelectError(t *testing.T) {
 	if !retryableInsertSelectError(err) {
 		t.Fatal("expected memory limit error to be retryable")
 	}
+	if !clickHouseMemoryLimitError(err) {
+		t.Fatal("expected ClickHouse Code 241 to be a memory limit error")
+	}
 
 	if retryableInsertSelectError(&chhttp.QueryError{StatusCode: 500, Body: "Syntax error"}) {
 		t.Fatal("expected syntax error to be non-retryable")
 	}
 	if retryableInsertSelectError(errors.New("network error")) {
 		t.Fatal("expected unstructured error to be non-retryable")
+	}
+	if clickHouseMemoryLimitError(&chhttp.QueryError{StatusCode: 500, Body: "Syntax error"}) {
+		t.Fatal("expected non-241 error not to be a memory limit error")
 	}
 }
 

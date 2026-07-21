@@ -355,10 +355,22 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
 		if err != nil {
+			if clickHouseMemoryLimitError(err) {
+				if err := sleepOrDone(ctx, pollInterval); err != nil {
+					return fmt.Errorf("verify normalized compact output: %w", err)
+				}
+				continue
+			}
 			return fmt.Errorf("verify normalized compact merges: %w", err)
 		}
 		partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
 		if err != nil {
+			if clickHouseMemoryLimitError(err) {
+				if err := sleepOrDone(ctx, pollInterval); err != nil {
+					return fmt.Errorf("verify normalized compact output: %w", err)
+				}
+				continue
+			}
 			return fmt.Errorf("verify normalized compact parts: %w", err)
 		}
 		activeParts := summarizePartPartitions(partitions).Count
@@ -379,14 +391,8 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
 			return fmt.Errorf("optimize fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
 		}
-		timer := time.NewTimer(pollInterval)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return fmt.Errorf("verify normalized compact output: %w", ctx.Err())
-		case <-timer.C:
+		if err := sleepOrDone(ctx, pollInterval); err != nil {
+			return fmt.Errorf("verify normalized compact output: %w", err)
 		}
 	}
 }
