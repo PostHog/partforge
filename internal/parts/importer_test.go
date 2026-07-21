@@ -96,6 +96,7 @@ func TestImportJobCancellationCleansWorkAndReleasesArtifact(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "s5cmd")
 	readyFile := filepath.Join(dir, "ready")
+	childReadyFile := filepath.Join(dir, "child-ready")
 	parentStoppedFile := filepath.Join(dir, "parent-stopped")
 	childStoppedFile := filepath.Join(dir, "child-stopped")
 	script := fmt.Sprintf(`#!/bin/sh
@@ -107,11 +108,13 @@ mkdir -p "$dest"
 printf partial > "$dest/partial.tar"
 (
 	trap 'printf stopped > %s; exit 0' TERM
+	printf ready > %s
 	sleep 3
 ) &
+while [ ! -f %s ]; do sleep 0.01; done
 printf ready > %s
 wait
-`, shellQuote(parentStoppedFile), shellQuote(childStoppedFile), shellQuote(readyFile))
+`, shellQuote(parentStoppedFile), shellQuote(childStoppedFile), shellQuote(childReadyFile), shellQuote(childReadyFile), shellQuote(readyFile))
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
