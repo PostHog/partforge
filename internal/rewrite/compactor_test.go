@@ -161,6 +161,7 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 			if optimizeAttempts.Add(1) == 1 {
 				close(optimizeStarted)
 			}
+			w.WriteHeader(http.StatusInternalServerError)
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):

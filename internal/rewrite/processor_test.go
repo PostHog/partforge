@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -823,7 +824,7 @@ func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 }
 
 func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
-	var optimizeRequests int
+	var optimizeRequests atomic.Int32
 	var optimizeQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -839,14 +840,15 @@ func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
 		case strings.Contains(query, "GROUP BY partition_id"):
 			_, _ = w.Write([]byte("202401\t2\t0\t1073741824\n"))
 		case strings.Contains(query, "system.parts"):
-			if optimizeRequests == 0 {
+			if optimizeRequests.Load() == 0 {
 				_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 			} else {
 				_, _ = w.Write([]byte("1\t1073741824\t1073741824\n"))
 			}
 		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
-			optimizeRequests++
 			optimizeQuery = query
+			optimizeRequests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -874,8 +876,8 @@ func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
 	if result.ActiveParts != 1 {
 		t.Fatalf("active parts = %d, want 1", result.ActiveParts)
 	}
-	if optimizeRequests != 1 {
-		t.Fatalf("optimize requests = %d, want 1", optimizeRequests)
+	if optimizeRequests.Load() != 1 {
+		t.Fatalf("optimize requests = %d, want 1", optimizeRequests.Load())
 	}
 	if want := "OPTIMIZE TABLE `db`.`query_log_archive_temp` PARTITION ID '202401' FINAL"; optimizeQuery != want {
 		t.Fatalf("optimize query = %q, want %q", optimizeQuery, want)
@@ -883,7 +885,7 @@ func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
 }
 
 func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
-	var optimizeRequests int
+	var optimizeRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -900,7 +902,7 @@ func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
 		case strings.Contains(query, "system.parts"):
 			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
-			optimizeRequests++
+			optimizeRequests.Add(1)
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -922,8 +924,8 @@ func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
-	if optimizeRequests != 1 {
-		t.Fatalf("optimize requests = %d, want 1", optimizeRequests)
+	if optimizeRequests.Load() != 1 {
+		t.Fatalf("optimize requests = %d, want 1", optimizeRequests.Load())
 	}
 }
 

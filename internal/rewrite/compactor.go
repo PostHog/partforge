@@ -338,30 +338,19 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 
 	query := "OPTIMIZE TABLE " + target.tableSQL() + " FINAL SETTINGS optimize_skip_merged_partitions = 1, optimize_throw_if_noop = 1"
 	attempt := 0
-	startOptimize := func() (context.CancelFunc, <-chan error) {
+	optimizeCtx, cancelOptimizes := context.WithCancel(ctx)
+	defer cancelOptimizes()
+	startOptimize := func() {
 		attempt++
-		queryAttempt := attempt
-		optimizeCtx, cancel := context.WithCancel(ctx)
-		result := make(chan error, 1)
-		go func() {
-			result <- c.ClickHouse.ExecWithOptions(optimizeCtx, query, chhttp.QueryOptions{
-				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, queryAttempt),
-			})
-		}()
-		return cancel, result
+		runOptimizeAsync(optimizeCtx, c.ClickHouse, query, chhttp.QueryOptions{
+			QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, attempt),
+		})
 	}
 
 	passStartParts := summarizePartPartitions(inputPartitions).Count
 	lastParts := passStartParts
 	lastProgressAt := time.Now()
-	cancelOptimize, optimizeResult := startOptimize()
-	defer func() {
-		cancelOptimize()
-		if optimizeResult != nil {
-			<-optimizeResult
-		}
-	}()
-	var optimizeErr error
+	startOptimize()
 
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
@@ -381,30 +370,17 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if activeMerges == 0 && compactPartitionsNormalized(inputPartitions, partitions) {
 			return nil
 		}
-		if optimizeResult == nil {
-			if optimizeErr != nil {
-				return fmt.Errorf("optimize fragmented compact input: %w", optimizeErr)
-			}
-			if activeMerges == 0 {
-				if activeParts >= passStartParts {
-					return fmt.Errorf("optimize fragmented compact input returned without reducing active parts: before=%d after=%d", passStartParts, activeParts)
-				}
-				passStartParts = activeParts
-				lastProgressAt = now
-				cancelOptimize, optimizeResult = startOptimize()
-				continue
-			}
+		if activeMerges == 0 && activeParts < passStartParts {
+			passStartParts = activeParts
+			lastProgressAt = now
+			startOptimize()
+			continue
 		}
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
 			return fmt.Errorf("optimize fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
 		}
 		timer := time.NewTimer(pollInterval)
 		select {
-		case optimizeErr = <-optimizeResult:
-			optimizeResult = nil
-			if !timer.Stop() {
-				<-timer.C
-			}
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C

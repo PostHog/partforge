@@ -34,6 +34,7 @@ const DefaultCompactOptimizeFinalAfter = 30 * time.Second
 const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
+const optimizeDispatchTimeout = 2 * time.Second
 
 const (
 	targetMergePartBytes uint64 = 150 * 1024 * 1024 * 1024
@@ -1484,6 +1485,8 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, wa
 	if optimizeFinalAfter < 0 {
 		return mergeWaitResult{}, fmt.Errorf("optimize final idle wait must be non-negative, got %s", optimizeFinalAfter)
 	}
+	optimizeCtx, cancelOptimizes := context.WithCancel(ctx)
+	defer cancelOptimizes()
 	startedAt := time.Now()
 	lastActivityAt := startedAt
 	baseDeadline := lastActivityAt.Add(timeout)
@@ -1594,14 +1597,13 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, wa
 				(!optimizeFinalAttempted || !sameMergePartSnapshot(snapshot, optimizeFinalSnapshot)) {
 				optimizeFinalAttempted = true
 				optimizeFinalSnapshot = snapshot
-				optimizeCtx, cancelOptimize := context.WithDeadline(ctx, maxDeadline)
-				optimizePartitionIDs, err := p.destinationMergeablePartitions(optimizeCtx, target)
+				partitionCtx, cancelPartitionQuery := context.WithDeadline(ctx, maxDeadline)
+				optimizePartitionIDs, err := p.destinationMergeablePartitions(partitionCtx, target)
+				cancelPartitionQuery()
 				if err != nil {
-					cancelOptimize()
 					return mergeWaitResult{}, err
 				}
 				if len(optimizePartitionIDs) == 0 {
-					cancelOptimize()
 					slog.Info(
 						"skipping optimize final after idle destination merges because no partition has multiple active parts",
 						"stage", stageWaitMerges,
@@ -1628,11 +1630,7 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, wa
 						"largest_part_bytes_on_disk", snapshot.LargestPartBytes,
 						"partitions", len(optimizePartitionIDs),
 					)
-					err := p.optimizeFinalPartitions(optimizeCtx, target, optimizePartitionIDs)
-					cancelOptimize()
-					if err != nil {
-						return mergeWaitResult{}, err
-					}
+					p.optimizeFinalPartitions(optimizeCtx, target, optimizePartitionIDs)
 					lastActivityAt = now
 					baseDeadline = lastActivityAt.Add(timeout)
 					zeroMergesStableSnapshotSince = time.Time{}
@@ -1867,14 +1865,19 @@ func sameMergePartSnapshot(a, b mergePartSnapshot) bool {
 		a.LargestPartBytes == b.LargestPartBytes
 }
 
-func (p Processor) optimizeFinalPartitions(ctx context.Context, target mergeWaitTarget, partitionIDs []string) error {
+func (p Processor) optimizeFinalPartitions(ctx context.Context, target mergeWaitTarget, partitionIDs []string) {
 	for _, partitionID := range partitionIDs {
 		query := "OPTIMIZE TABLE " + target.tableSQL() + " PARTITION ID " + chhttp.StringLiteral(partitionID) + " FINAL"
-		if err := p.ClickHouse.Exec(ctx, query); err != nil {
-			return fmt.Errorf("optimize final partition %q for %s: %w", partitionID, target.tableSQL(), err)
-		}
+		runOptimizeAsync(ctx, p.ClickHouse, query, chhttp.QueryOptions{})
 	}
-	return nil
+}
+
+func runOptimizeAsync(ctx context.Context, clickHouse chhttp.Client, query string, options chhttp.QueryOptions) {
+	go func() {
+		dispatchCtx, cancel := context.WithTimeout(ctx, optimizeDispatchTimeout)
+		defer cancel()
+		_ = clickHouse.ExecWithOptions(dispatchCtx, query, options)
+	}()
 }
 
 func mergeWaitSleepDuration(now time.Time, pollInterval time.Duration, deadlines ...time.Time) time.Duration {
