@@ -327,15 +327,42 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: inputStats, Stage: "optimizing_final"}); err != nil {
 		return err
 	}
-	query := "OPTIMIZE TABLE " + target.tableSQL() + " FINAL SETTINGS optimize_skip_merged_partitions = 1"
-	if err := c.ClickHouse.Exec(ctx, query); err != nil {
-		return fmt.Errorf("optimize fragmented compact input: %w", err)
-	}
-
 	pollInterval := p.MergePollInterval
 	if pollInterval == 0 {
 		pollInterval = defaultMergePollInterval
 	}
+	noProgressTimeout := compactMergeSettleMinWait(p.MergeSettleMinWait)
+	if noProgressTimeout < 0 {
+		return fmt.Errorf("normalize compact input merge settle wait must not be negative")
+	}
+
+	query := "OPTIMIZE TABLE " + target.tableSQL() + " FINAL SETTINGS optimize_skip_merged_partitions = 1, optimize_throw_if_noop = 1"
+	attempt := 0
+	startOptimize := func() (context.CancelFunc, <-chan error) {
+		attempt++
+		queryAttempt := attempt
+		optimizeCtx, cancel := context.WithCancel(ctx)
+		result := make(chan error, 1)
+		go func() {
+			result <- c.ClickHouse.ExecWithOptions(optimizeCtx, query, chhttp.QueryOptions{
+				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, queryAttempt),
+			})
+		}()
+		return cancel, result
+	}
+
+	passStartParts := summarizePartPartitions(inputPartitions).Count
+	lastParts := passStartParts
+	lastProgressAt := time.Now()
+	cancelOptimize, optimizeResult := startOptimize()
+	defer func() {
+		cancelOptimize()
+		if optimizeResult != nil {
+			<-optimizeResult
+		}
+	}()
+	var optimizeErr error
+
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
 		if err != nil {
@@ -345,11 +372,39 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if err != nil {
 			return fmt.Errorf("verify normalized compact parts: %w", err)
 		}
+		activeParts := summarizePartPartitions(partitions).Count
+		now := time.Now()
+		if activeParts != lastParts || activeMerges > 0 {
+			lastParts = activeParts
+			lastProgressAt = now
+		}
 		if activeMerges == 0 && compactPartitionsNormalized(inputPartitions, partitions) {
 			return nil
 		}
+		if optimizeResult == nil {
+			if optimizeErr != nil {
+				return fmt.Errorf("optimize fragmented compact input: %w", optimizeErr)
+			}
+			if activeMerges == 0 {
+				if activeParts >= passStartParts {
+					return fmt.Errorf("optimize fragmented compact input returned without reducing active parts: before=%d after=%d", passStartParts, activeParts)
+				}
+				passStartParts = activeParts
+				lastProgressAt = now
+				cancelOptimize, optimizeResult = startOptimize()
+				continue
+			}
+		}
+		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
+			return fmt.Errorf("optimize fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
+		}
 		timer := time.NewTimer(pollInterval)
 		select {
+		case optimizeErr = <-optimizeResult:
+			optimizeResult = nil
+			if !timer.Stop() {
+				<-timer.C
+			}
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C

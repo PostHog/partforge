@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,9 +88,14 @@ func TestCompactInputNeedsNormalization(t *testing.T) {
 	}
 }
 
-func TestNormalizeCompactInputVerifiesPartsAfterOptimizeReturns(t *testing.T) {
-	partitionQueries := 0
-	var optimizeQuery string
+func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
+	type optimizeRequest struct {
+		query   string
+		queryID string
+	}
+	requests := make(chan optimizeRequest, 1)
+	optimizeStarted := make(chan struct{})
+	var partitionQueries atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -100,13 +106,16 @@ func TestNormalizeCompactInputVerifiesPartsAfterOptimizeReturns(t *testing.T) {
 		query := string(body)
 		switch {
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
-			optimizeQuery = query
+			requests <- optimizeRequest{query: query, queryID: r.URL.Query().Get("query_id")}
+			close(optimizeStarted)
+			<-r.Context().Done()
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
-			partitionQueries++
+			<-optimizeStarted
+			queryNumber := partitionQueries.Add(1)
 			parts := "2"
-			if partitionQueries > 1 {
+			if queryNumber > 1 {
 				parts = "1"
 			}
 			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
@@ -124,11 +133,105 @@ func TestNormalizeCompactInputVerifiesPartsAfterOptimizeReturns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if optimizeQuery != "OPTIMIZE TABLE `db`.`events` FINAL SETTINGS optimize_skip_merged_partitions = 1" {
-		t.Fatalf("optimize query = %q", optimizeQuery)
+	request := <-requests
+	if request.query != "OPTIMIZE TABLE `db`.`events` FINAL SETTINGS optimize_skip_merged_partitions = 1, optimize_throw_if_noop = 1" {
+		t.Fatalf("optimize query = %q", request.query)
 	}
-	if partitionQueries != 2 {
-		t.Fatalf("partition verification queries = %d, want 2", partitionQueries)
+	if request.queryID != "partforge-job-1-compact-1-optimize-final-attempt-1" {
+		t.Fatalf("optimize query ID = %q", request.queryID)
+	}
+	if partitionQueries.Load() != 2 {
+		t.Fatalf("partition verification queries = %d, want 2", partitionQueries.Load())
+	}
+}
+
+func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
+	optimizeStarted := make(chan struct{})
+	var optimizeAttempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			if optimizeAttempts.Add(1) == 1 {
+				close(optimizeStarted)
+			}
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			_, _ = io.WriteString(w, "0\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			<-optimizeStarted
+			parts := "2"
+			if optimizeAttempts.Load() > 1 {
+				parts = "1"
+			}
+			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}, MergePollInterval: time.Millisecond}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 3}}, metrics.PartStats{Count: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if optimizeAttempts.Load() != 2 {
+		t.Fatalf("optimize attempts = %d, want 2", optimizeAttempts.Load())
+	}
+}
+
+func TestNormalizeCompactInputFailsWhenOptimizeMakesNoProgress(t *testing.T) {
+	optimizeStarted := make(chan struct{})
+	optimizeCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			close(optimizeStarted)
+			<-r.Context().Done()
+			close(optimizeCanceled)
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			_, _ = io.WriteString(w, "0\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			<-optimizeStarted
+			_, _ = io.WriteString(w, "202606\t2\t100\t1000\n")
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	p := Processor{
+		ClickHouse:         chhttp.Client{URL: server.URL},
+		MergePollInterval:  time.Millisecond,
+		MergeSettleMinWait: 10 * time.Millisecond,
+	}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 2}}, metrics.PartStats{Count: 2})
+	if err == nil || !strings.Contains(err.Error(), "made no progress") {
+		t.Fatalf("error = %v, want no-progress error", err)
+	}
+	select {
+	case <-optimizeCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("OPTIMIZE request was not canceled")
 	}
 }
 
