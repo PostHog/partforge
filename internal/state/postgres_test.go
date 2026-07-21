@@ -33,6 +33,25 @@ func TestMarkCompactPartFailed(t *testing.T) {
 	}
 }
 
+func TestFailedRetryTarget(t *testing.T) {
+	tests := []struct {
+		name string
+		part Part
+		want Status
+	}{
+		{name: "rewrite", part: Part{}, want: StatusReady},
+		{name: "compaction", part: Part{CompactReadyAt: "2026-07-21T14:00:00Z"}, want: StatusCompactReady},
+		{name: "import", part: Part{CompactReadyAt: "2026-07-21T14:00:00Z", ImportingAt: "2026-07-21T15:00:00Z"}, want: StatusFinished},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := failedRetryTarget(test.part); got != test.want {
+				t.Fatalf("failedRetryTarget() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSelectCompactBatchPartsAllowsSingleMultiPartArtifact(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{

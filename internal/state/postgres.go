@@ -1755,10 +1755,7 @@ func (s *Store) RetryFailedPart(ctx context.Context, part Part, now time.Time) (
 	if part.Status != StatusFailed {
 		return "", fmt.Errorf("part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusFailed)
 	}
-	target := StatusReady
-	if part.ImportingAt != "" {
-		target = StatusFinished
-	}
+	target := failedRetryTarget(part)
 	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
 		return current.Status == StatusFailed
 	}, func(current *Part) error {
@@ -1779,6 +1776,16 @@ func (s *Store) RetryFailedPart(ctx context.Context, part Part, now time.Time) (
 		return "", fmt.Errorf("retry failed state item for %s/%s as %s: %w", part.JobID, part.PartID, target, err)
 	}
 	return target, nil
+}
+
+func failedRetryTarget(part Part) Status {
+	if part.ImportingAt != "" {
+		return StatusFinished
+	}
+	if part.CompactReadyAt != "" {
+		return StatusCompactReady
+	}
+	return StatusReady
 }
 
 func (s *Store) RetryInProgressPart(ctx context.Context, part Part, now time.Time) (Status, error) {
