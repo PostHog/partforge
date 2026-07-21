@@ -366,7 +366,7 @@ func TestDestinationFailedMergeCount(t *testing.T) {
 		query := string(body)
 		queries = append(queries, query)
 		if strings.Contains(query, "system.part_log") {
-			_, _ = w.Write([]byte("7\n"))
+			_, _ = w.Write([]byte("7\tCode: 241. MEMORY_LIMIT_EXCEEDED\n"))
 		}
 	}))
 	defer server.Close()
@@ -380,7 +380,7 @@ func TestDestinationFailedMergeCount(t *testing.T) {
 	if count != 7 {
 		t.Fatalf("failed merge count = %d, want 7", count)
 	}
-	if len(queries) != 2 || queries[0] != "SYSTEM FLUSH LOGS" || !strings.Contains(queries[1], "system.part_log") || !strings.Contains(queries[1], "error != 0") {
+	if len(queries) != 2 || queries[0] != "SYSTEM FLUSH LOGS" || !strings.Contains(queries[1], "system.part_log") || !strings.Contains(queries[1], "table_uuid = (SELECT uuid FROM system.tables") || !strings.Contains(queries[1], "error != 0") {
 		t.Fatalf("queries = %#v, want flush logs then failed merge count", queries)
 	}
 }

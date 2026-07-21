@@ -30,6 +30,22 @@ type clickHouseMerge struct {
 func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item CompactWorkItem, target mergeWaitTarget, inputStats metrics.PartStats) error {
 	lastStateReport := time.Time{}
 	for {
+		failedMerges, err := p.destinationFailedMergeSummary(ctx, target)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if clickHouseMemoryLimitError(err) {
+				if sleepOrDone(ctx, compactProgressPollInterval) != nil {
+					return nil
+				}
+				continue
+			}
+			return fmt.Errorf("observe compact merge failures: %w", err)
+		}
+		if failedMerges.Count >= maxCompactMergeFailures {
+			return fmt.Errorf("destination merges failed %d times (limit %d): %s", failedMerges.Count, maxCompactMergeFailures, failedMerges.LatestException)
+		}
 		partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
 		if err != nil {
 			if ctx.Err() != nil {

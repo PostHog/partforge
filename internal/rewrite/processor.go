@@ -35,6 +35,7 @@ const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 const optimizeDispatchTimeout = 2 * time.Second
+const maxCompactMergeFailures uint64 = 3
 
 const (
 	targetMergePartBytes uint64 = 150 * 1024 * 1024 * 1024
@@ -1346,22 +1347,41 @@ func summarizePartPartitions(partitions []PartPartitionStats) metrics.PartStats 
 	return stats
 }
 
-func (p Processor) destinationFailedMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {
+type failedMergeSummary struct {
+	Count           uint64
+	LatestException string
+}
+
+func (p Processor) destinationFailedMergeSummary(ctx context.Context, target mergeWaitTarget) (failedMergeSummary, error) {
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
-		return 0, fmt.Errorf("flush ClickHouse logs before measuring destination failed merges: %w", err)
+		return failedMergeSummary{}, fmt.Errorf("flush ClickHouse logs before measuring destination failed merges: %w", err)
 	}
-	query := "SELECT count() FROM system.part_log WHERE database = " +
+	query := "SELECT count(), if(count() = 0, '<none>', argMax(exception, event_time_microseconds)) FROM system.part_log WHERE database = " +
 		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
+		" AND table_uuid = (SELECT uuid FROM system.tables WHERE database = " + chhttp.StringLiteral(target.Database) +
+		" AND name = " + chhttp.StringLiteral(target.Table) + ")" +
 		" AND event_type = 'MergeParts' AND error != 0 FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("measure destination failed merges from system.part_log: %w", err)
+		return failedMergeSummary{}, fmt.Errorf("measure destination failed merges from system.part_log: %w", err)
 	}
-	count, err := chhttp.ParseUInt(out)
+	rows, err := chhttp.FormatTSVStrings(out, 2)
 	if err != nil {
-		return 0, err
+		return failedMergeSummary{}, err
 	}
-	return count, nil
+	if len(rows) != 1 {
+		return failedMergeSummary{}, fmt.Errorf("expected one failed merge summary row, got %d", len(rows))
+	}
+	count, err := chhttp.ParseUInt(rows[0][0])
+	if err != nil {
+		return failedMergeSummary{}, err
+	}
+	return failedMergeSummary{Count: count, LatestException: rows[0][1]}, nil
+}
+
+func (p Processor) destinationFailedMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {
+	summary, err := p.destinationFailedMergeSummary(ctx, target)
+	return summary.Count, err
 }
 
 func (p Processor) queryProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {

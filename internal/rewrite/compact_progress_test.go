@@ -12,6 +12,33 @@ import (
 	"github.com/PostHog/partforge/internal/metrics"
 )
 
+func TestObserveCompactProgressFailsAfterThreeMergeFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := string(body)
+		switch {
+		case query == "SYSTEM FLUSH LOGS":
+		case strings.Contains(query, "FROM system.part_log"):
+			_, _ = io.WriteString(w, "3\tCode: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED\n")
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+
+	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}}
+	err := (Compactor{}).observeCompactProgress(context.Background(), p, CompactWorkItem{
+		JobID:        "job-1",
+		OutputPartID: "compact-1",
+	}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 10})
+	if err == nil || !strings.Contains(err.Error(), "destination merges failed 3 times") || !strings.Contains(err.Error(), "MEMORY_LIMIT_EXCEEDED") {
+		t.Fatalf("error = %v, want repeated merge failure with ClickHouse exception", err)
+	}
+}
+
 func TestCompactMergesIncludesSourceRowTotals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
