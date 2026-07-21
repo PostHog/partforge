@@ -1729,21 +1729,29 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		}
 		return false, nil
 	}
-	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
+	currentBatch := func() state.CompactBatch {
+		out := *batch
+		out.Parts = append([]state.Part(nil), batch.Parts...)
+		return out
+	}
+	markCompactBatchFailed := func(cause error) error {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, *batch, cfg.WorkerID, time.Now().UTC())
+		markErr := cfg.StateStore.MarkCompactBatchFailed(stateCtx, currentBatch(), cfg.WorkerID, cause, time.Now().UTC())
 		cancel()
-		if releaseErr != nil {
-			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch %s: %v", err, batch.JobID, releaseErr)
+		if markErr != nil {
+			return fmt.Errorf("%w; additionally failed to mark compact batch failed: %v", cause, markErr)
 		}
-		return true, err
+		return cause
+	}
+	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
+		return true, markCompactBatchFailed(fmt.Errorf("enable ECS task scale-in protection: %w", err))
 	}
 
 	inputIDs := compactBatchPartIDs(batch.Parts)
 	outputPartID := manifest.DeriveCompactPartID(inputIDs, batch.Generation)
 	outputFinishedKey, err := rewrite.CompactFinishedKeyFromInput(batch.Parts[0].FinishedKey, outputPartID)
 	if err != nil {
-		return false, err
+		return true, markCompactBatchFailed(err)
 	}
 	slog.Info(
 		"claimed compact-ready batch",
@@ -1757,11 +1765,6 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		"generation", batch.Generation,
 	)
 
-	currentBatch := func() state.CompactBatch {
-		out := *batch
-		out.Parts = append([]state.Part(nil), batch.Parts...)
-		return out
-	}
 	workItem := rewrite.CompactWorkItem{
 		JobID:               batch.JobID,
 		OutputPartID:        outputPartID,
@@ -1773,7 +1776,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	compactDeadline, err := compactBatchDeadline(batch.Parts, cfg.CompactWindow, time.Now().UTC())
 	if err != nil {
-		return true, err
+		return true, markCompactBatchFailed(err)
 	}
 	if !compactDeadline.IsZero() && !time.Now().UTC().Before(compactDeadline) {
 		stateCtx, cancel := workerStateUpdateContext()
@@ -1824,10 +1827,10 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	shutdownRequested := ctx.Err() != nil
 	if err != nil {
-		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
-		cancel()
 		if shutdownRequested {
+			stateCtx, cancel := workerStateUpdateContext()
+			releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+			cancel()
 			if releaseErr != nil {
 				cleanupCompactNow()
 				return true, fmt.Errorf("shutdown release compact batch %s/%s: %w", batch.JobID, outputPartID, releaseErr)
@@ -1836,17 +1839,24 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			cleanupCompactNow()
 			return true, nil
 		}
+		err = fmt.Errorf("compact batch %s/%s failed: %w", batch.JobID, outputPartID, err)
 		cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
-		if releaseErr != nil {
-			cleanupCompactNow()
-			return true, fmt.Errorf("compact batch %s/%s failed: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
-		}
+		failErr := markCompactBatchFailed(err)
 		cleanupCompactNow()
-		return true, err
+		return true, failErr
 	}
 	if !result.Reduced {
+		now := time.Now().UTC()
+		if compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested.Load(), cfg.CompactWindow, compactDeadline, now) {
+			err := fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
+			cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
+			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
+			failErr := markCompactBatchFailed(err)
+			cleanupCompactNow()
+			return true, failErr
+		}
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now)
 		cancel()
 		if releaseErr != nil {
 			cleanupCompactNow()
@@ -1879,7 +1889,9 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	compactReadyAt, err := compactOutputReadyAt(currentBatch().Parts)
 	if err != nil {
-		return true, err
+		failErr := markCompactBatchFailed(err)
+		cleanupCompactNow()
+		return true, failErr
 	}
 	output := state.NewCompactPart(batch.JobID, outputPartID, batch.Parts[0].Bucket, outputFinishedKey, workItem.DestinationDatabase, workItem.DestinationTable, workItem.DestinationSchema, outputInputIDs, batch.Generation, state.PartStats{
 		Count: result.DestinationStats.Count,
@@ -1891,15 +1903,10 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	err = cfg.StateStore.CompleteCompaction(stateCtx, currentBatch(), output, cfg.WorkerID, time.Now().UTC())
 	cancel()
 	if err != nil {
-		releaseCtx, releaseCancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(releaseCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
-		releaseCancel()
-		if releaseErr != nil {
-			cleanupCompactNow()
-			return true, fmt.Errorf("complete compaction %s/%s: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
-		}
+		err = fmt.Errorf("complete compaction %s/%s: %w", batch.JobID, outputPartID, err)
+		failErr := markCompactBatchFailed(err)
 		cleanupCompactNow()
-		return true, err
+		return true, failErr
 	}
 	if manualFinalizeRequested.Load() {
 		output.Status = state.StatusCompactReady
@@ -2050,6 +2057,10 @@ func compactBatchDeadline(parts []state.Part, compactWindow time.Duration, now t
 		return time.Time{}, errors.New(reason)
 	}
 	return deadline, nil
+}
+
+func compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested bool, compactWindow time.Duration, deadline, now time.Time) bool {
+	return !shutdownRequested && !manualFinalizeRequested && compactWindow > 0 && (deadline.IsZero() || now.Before(deadline))
 }
 
 func compactInputs(parts []state.Part) []rewrite.CompactInput {

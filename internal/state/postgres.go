@@ -704,6 +704,52 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 	return nil
 }
 
+func (s *Store) MarkCompactBatchFailed(ctx context.Context, batch CompactBatch, workerID string, cause error, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	if cause == nil {
+		return errors.New("failure cause is required")
+	}
+	if err := validateCompactBatch(batch); err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	for _, part := range batch.Parts {
+		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
+		if err != nil {
+			return fmt.Errorf("mark compact batch %s failed: %w", batch.JobID, err)
+		}
+		if current.Status != StatusCompacting || current.WorkerID != workerID {
+			return fmt.Errorf("mark compact batch %s failed: %w", batch.JobID, &conditionalCheckFailedError{})
+		}
+		markCompactPartFailed(&current, cause, now)
+		if err := s.savePartTx(ctx, tx, current); err != nil {
+			return fmt.Errorf("mark compact batch %s failed: %w", batch.JobID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("mark compact batch %s failed: %w", batch.JobID, err)
+	}
+	return nil
+}
+
+func markCompactPartFailed(part *Part, cause error, now time.Time) {
+	setStatus(part, StatusFailed, now)
+	part.FailedAt = formatTime(now)
+	part.WorkerID = ""
+	part.CompactingAt = ""
+	part.Error = cause.Error()
+	part.CompactCooldownUntil = ""
+	clearCompactProgress(part)
+}
+
 func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) (bool, error) {
 	if strings.TrimSpace(workerID) == "" {
 		return false, errors.New("worker id is required")

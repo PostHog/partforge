@@ -1084,6 +1084,29 @@ func TestCompactBatchDeadlineDisabledForZeroWindow(t *testing.T) {
 	}
 }
 
+func TestCompactNoReductionIsFailure(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	deadline := now.Add(time.Hour)
+	if !compactNoReductionIsFailure(false, false, 24*time.Hour, deadline, now) {
+		t.Fatal("expected in-window no-reduction compaction to fail")
+	}
+	for _, test := range []struct {
+		shutdown bool
+		manual   bool
+		window   time.Duration
+		deadline time.Time
+	}{
+		{shutdown: true, window: 24 * time.Hour, deadline: deadline},
+		{manual: true, window: 24 * time.Hour, deadline: deadline},
+		{window: 0},
+		{window: 24 * time.Hour, deadline: now},
+	} {
+		if compactNoReductionIsFailure(test.shutdown, test.manual, test.window, test.deadline, now) {
+			t.Fatalf("expected terminal no-reduction compaction not to fail: %+v", test)
+		}
+	}
+}
+
 func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
 	staleAfter := compactLeaseStaleAfter(2 * time.Hour)
 	if staleAfter != 2*time.Hour {

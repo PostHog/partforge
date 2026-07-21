@@ -2,10 +2,36 @@ package state
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMarkCompactPartFailed(t *testing.T) {
+	now := time.Date(2026, 7, 21, 14, 30, 0, 0, time.UTC)
+	part := Part{
+		Status:                     StatusCompacting,
+		WorkerID:                   "worker-1",
+		CompactingAt:               formatTime(now.Add(-time.Minute)),
+		CompactOutputPartID:        "compact-1",
+		CompactProgressAt:          formatTime(now.Add(-time.Second)),
+		CompactFinalizeRequestedAt: formatTime(now.Add(-time.Second)),
+		CompactStage:               "merging",
+		CompactActiveMerges:        2,
+		CompactMergeProgress:       0.5,
+	}
+	cause := errors.New("optimize made no progress")
+
+	markCompactPartFailed(&part, cause, now)
+
+	if part.Status != StatusFailed || part.Error != cause.Error() || part.FailedAt != formatTime(now) {
+		t.Fatalf("failed part = %+v", part)
+	}
+	if part.WorkerID != "" || part.CompactingAt != "" || part.CompactOutputPartID != "" || part.CompactStage != "" || part.CompactActiveMerges != 0 || part.CompactMergeProgress != 0 {
+		t.Fatalf("failed part retained compact ownership or progress: %+v", part)
+	}
+}
 
 func TestSelectCompactBatchPartsAllowsSingleMultiPartArtifact(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
