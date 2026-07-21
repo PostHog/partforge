@@ -808,8 +808,8 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	if err := validateCompactBatch(batch); err != nil {
 		return err
 	}
-	if progress.MergeProgress < 0 || progress.MergeProgress > 1 {
-		return fmt.Errorf("compact merge progress must be between 0 and 1, got %f", progress.MergeProgress)
+	if progress.MergeProgress < 0 {
+		return fmt.Errorf("compact merge progress must be non-negative, got %f", progress.MergeProgress)
 	}
 	for _, part := range batch.Parts {
 		_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {

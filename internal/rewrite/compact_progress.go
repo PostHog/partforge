@@ -97,8 +97,8 @@ func (p Processor) compactMerges(ctx context.Context, target mergeWaitTarget) ([
 			}
 			return nil, fmt.Errorf("decode system.merges row: %w", err)
 		}
-		if row.Progress < 0 || row.Progress > 1 {
-			return nil, fmt.Errorf("ClickHouse merge progress must be between 0 and 1, got %f", row.Progress)
+		if row.Progress < 0 {
+			return nil, fmt.Errorf("ClickHouse merge progress must be non-negative, got %f", row.Progress)
 		}
 		rows = append(rows, row)
 	}
