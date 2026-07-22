@@ -21,6 +21,7 @@ const (
 	minMergeBackgroundPoolSize            = 1
 	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
 	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
+	defaultMergeMaxBlockSizeBytes  uint64 = 10 * 1024 * 1024
 	minMergeMaxBlockSizeRows       uint64 = 8192
 	maxMergeMaxBlockSizeRows       uint64 = 262144
 	targetMergeAverageRowSizeBytes uint64 = 1024
@@ -47,6 +48,7 @@ func MergeBackgroundPoolSize(limits Limits) (int, error) {
 
 type MergeTreeSettings struct {
 	MergeMaxBlockSize        uint64
+	MergeMaxBlockSizeBytes   uint64
 	MergeSelectingSleepMS    uint64
 	MergeSchedulingPolicy    string
 	DefaultCompressionCodec  string
@@ -114,6 +116,7 @@ func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
 	mergeMaxBlockSize = roundDownToMultiple(mergeMaxBlockSize, minMergeMaxBlockSizeRows)
 	return MergeTreeSettings{
 		MergeMaxBlockSize:        mergeMaxBlockSize,
+		MergeMaxBlockSizeBytes:   min(mergeMaxBlockSizeBytes, defaultMergeMaxBlockSizeBytes),
 		MergeSelectingSleepMS:    defaultMergeSelectingSleepMS,
 		MergeSchedulingPolicy:    defaultMergeSchedulingPolicy,
 		DefaultCompressionCodec:  DefaultCompressionCodec,

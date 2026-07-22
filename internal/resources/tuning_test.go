@@ -76,24 +76,28 @@ func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {
 
 func TestMergeTreeSettingsForLimits(t *testing.T) {
 	tests := []struct {
-		name     string
-		limits   Limits
-		wantRows uint64
+		name      string
+		limits    Limits
+		wantRows  uint64
+		wantBytes uint64
 	}{
 		{
-			name:     "low memory clamps to safe minimum",
-			limits:   Limits{CPUs: 8, MemoryBytes: 1 * 1024 * 1024 * 1024},
-			wantRows: 8192,
+			name:      "low memory clamps to safe minimum",
+			limits:    Limits{CPUs: 8, MemoryBytes: 1 * 1024 * 1024 * 1024},
+			wantRows:  8192,
+			wantBytes: 9 * 1024 * 1024,
 		},
 		{
-			name:     "scales with memory per background worker",
-			limits:   Limits{CPUs: 16, MemoryBytes: 32 * 1024 * 1024 * 1024},
-			wantRows: 155648,
+			name:      "scales with memory per background worker",
+			limits:    Limits{CPUs: 16, MemoryBytes: 32 * 1024 * 1024 * 1024},
+			wantRows:  155648,
+			wantBytes: 10 * 1024 * 1024,
 		},
 		{
-			name:     "high memory clamps to upper bound",
-			limits:   Limits{CPUs: 16, MemoryBytes: 1024 * 1024 * 1024 * 1024},
-			wantRows: 262144,
+			name:      "high memory clamps to upper bound",
+			limits:    Limits{CPUs: 16, MemoryBytes: 1024 * 1024 * 1024 * 1024},
+			wantRows:  262144,
+			wantBytes: 10 * 1024 * 1024,
 		},
 	}
 
@@ -105,6 +109,9 @@ func TestMergeTreeSettingsForLimits(t *testing.T) {
 			}
 			if settings.MergeMaxBlockSize != tt.wantRows {
 				t.Fatalf("merge_max_block_size = %d, want %d", settings.MergeMaxBlockSize, tt.wantRows)
+			}
+			if settings.MergeMaxBlockSizeBytes != tt.wantBytes {
+				t.Fatalf("merge_max_block_size_bytes = %d, want %d", settings.MergeMaxBlockSizeBytes, tt.wantBytes)
 			}
 			if settings.MergeSelectingSleepMS != defaultMergeSelectingSleepMS {
 				t.Fatalf("merge_selecting_sleep_ms = %d, want %d", settings.MergeSelectingSleepMS, defaultMergeSelectingSleepMS)

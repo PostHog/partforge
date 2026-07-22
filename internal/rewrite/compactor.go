@@ -522,6 +522,9 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	if mergeTreeSettings.MergeMaxBlockSize == 0 {
 		return fmt.Errorf("merge_max_block_size must be greater than zero")
 	}
+	if mergeTreeSettings.MergeMaxBlockSizeBytes == 0 {
+		return fmt.Errorf("merge_max_block_size_bytes must be greater than zero")
+	}
 	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
 		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
 	}
@@ -531,6 +534,7 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	mergeBytes := targetMergePoolByteSettings()
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
+		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
 		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
@@ -547,6 +551,7 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		"part_id", item.OutputPartID,
 		"destination_table", table,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
+		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"destination_active_bytes_on_disk", activeBytes,

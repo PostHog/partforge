@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +31,8 @@ type clickHouseMerge struct {
 
 func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item CompactWorkItem, target mergeWaitTarget, inputStats metrics.PartStats) error {
 	lastStateReport := time.Time{}
+	mergeMaxBlockSizeBytes := p.MergeTreeSettings.MergeMaxBlockSizeBytes
+	var handledMemoryLimitFailures uint64
 	for {
 		failedMerges, err := p.destinationFailedMergeSummary(ctx, target)
 		if err != nil {
@@ -43,8 +47,34 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 			}
 			return fmt.Errorf("observe compact merge failures: %w", err)
 		}
-		if failedMerges.Count >= maxCompactMergeFailures {
-			return fmt.Errorf("destination merges failed %d times (limit %d): %s", failedMerges.Count, maxCompactMergeFailures, failedMerges.LatestException)
+		if failedMerges.MemoryLimitCount > handledMemoryLimitFailures {
+			failures := failedMerges.MemoryLimitCount - handledMemoryLimitFailures
+			next := mergeMaxBlockSizeBytes
+			for range failures {
+				next = max(next/2, minAdaptiveMergeMaxBlockSizeBytes)
+			}
+			if next >= mergeMaxBlockSizeBytes {
+				return fmt.Errorf("destination merge exceeded memory limit with merge_max_block_size_bytes already at minimum %d: %s", mergeMaxBlockSizeBytes, failedMerges.LatestException)
+			}
+			if err := recoverCompactMergeAfterMemoryFailure(ctx, p, target, next); err != nil {
+				return err
+			}
+			slog.Warn(
+				"reduced merge block byte limit after memory-limit merge failure",
+				"stage", "adjusting_merge_memory",
+				"job_id", item.JobID,
+				"part_id", item.OutputPartID,
+				"destination_table", target.tableSQL(),
+				"memory_limit_failures", failedMerges.MemoryLimitCount,
+				"previous_merge_max_block_size_bytes", mergeMaxBlockSizeBytes,
+				"merge_max_block_size_bytes", next,
+			)
+			mergeMaxBlockSizeBytes = next
+			handledMemoryLimitFailures = failedMerges.MemoryLimitCount
+		}
+		nonMemoryFailures := failedMerges.Count - failedMerges.MemoryLimitCount
+		if nonMemoryFailures >= maxCompactMergeFailures {
+			return fmt.Errorf("destination merges failed %d non-memory times (limit %d): %s", nonMemoryFailures, maxCompactMergeFailures, failedMerges.LatestException)
 		}
 		partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
 		if err != nil {
@@ -103,6 +133,35 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 		case <-timer.C:
 		}
 	}
+}
+
+func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, target mergeWaitTarget, mergeMaxBlockSizeBytes uint64) error {
+	table := target.tableSQL()
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+table); err != nil {
+		return fmt.Errorf("stop destination merges after memory-limit failure: %w", err)
+	}
+	query := "ALTER TABLE " + table + " MODIFY SETTING merge_max_block_size_bytes = " + strconv.FormatUint(mergeMaxBlockSizeBytes, 10)
+	if err := p.ClickHouse.Exec(ctx, query); err != nil {
+		startErr := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table)
+		if startErr != nil {
+			return fmt.Errorf("reduce merge_max_block_size_bytes after memory-limit merge failure: %w; additionally failed to restart merges: %v", err, startErr)
+		}
+		return fmt.Errorf("reduce merge_max_block_size_bytes after memory-limit merge failure: %w", err)
+	}
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table); err != nil {
+		return fmt.Errorf("restart destination merges after memory-limit failure: %w", err)
+	}
+	partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
+	if err != nil {
+		return fmt.Errorf("find destination partition to optimize after memory-limit failure: %w", err)
+	}
+	for _, partition := range partitions {
+		if partition.Parts > 1 {
+			p.optimizeFinalPartition(ctx, target, partition.PartitionID)
+			break
+		}
+	}
+	return nil
 }
 
 func (p Processor) compactMerges(ctx context.Context, target mergeWaitTarget) ([]metrics.CompactMerge, error) {

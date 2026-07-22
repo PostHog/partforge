@@ -36,6 +36,7 @@ const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 const optimizeDispatchTimeout = 2 * time.Second
 const maxCompactMergeFailures uint64 = 3
+const minAdaptiveMergeMaxBlockSizeBytes uint64 = 1024 * 1024
 
 const (
 	targetMergePartBytes uint64 = 150 * 1024 * 1024 * 1024
@@ -107,6 +108,7 @@ type Processor struct {
 
 type MergeTreeSettings struct {
 	MergeMaxBlockSize        uint64
+	MergeMaxBlockSizeBytes   uint64
 	MergeSelectingSleepMS    uint64
 	DefaultCompressionCodec  string
 	PoolFreeEntriesThreshold uint64
@@ -705,6 +707,9 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	if mergeTreeSettings.MergeMaxBlockSize == 0 {
 		return fmt.Errorf("merge_max_block_size must be greater than zero")
 	}
+	if mergeTreeSettings.MergeMaxBlockSizeBytes == 0 {
+		return fmt.Errorf("merge_max_block_size_bytes must be greater than zero")
+	}
 	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
 		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
 	}
@@ -718,6 +723,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	mergeBytes := targetMergePoolByteSettings()
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
+		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
 		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
@@ -734,6 +740,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"part_id", m.PartID,
 		"destination_table", table,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
+		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"destination_active_parts", stats.Count,
@@ -1348,15 +1355,16 @@ func summarizePartPartitions(partitions []PartPartitionStats) metrics.PartStats 
 }
 
 type failedMergeSummary struct {
-	Count           uint64
-	LatestException string
+	Count            uint64
+	MemoryLimitCount uint64
+	LatestException  string
 }
 
 func (p Processor) destinationFailedMergeSummary(ctx context.Context, target mergeWaitTarget) (failedMergeSummary, error) {
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
 		return failedMergeSummary{}, fmt.Errorf("flush ClickHouse logs before measuring destination failed merges: %w", err)
 	}
-	query := "SELECT count(), if(count() = 0, '<none>', argMax(exception, event_time_microseconds)) FROM system.part_log WHERE database = " +
+	query := "SELECT count(), countIf(error = 241), if(count() = 0, '<none>', argMax(exception, event_time_microseconds)) FROM system.part_log WHERE database = " +
 		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
 		" AND table_uuid = (SELECT uuid FROM system.tables WHERE database = " + chhttp.StringLiteral(target.Database) +
 		" AND name = " + chhttp.StringLiteral(target.Table) + ")" +
@@ -1365,7 +1373,7 @@ func (p Processor) destinationFailedMergeSummary(ctx context.Context, target mer
 	if err != nil {
 		return failedMergeSummary{}, fmt.Errorf("measure destination failed merges from system.part_log: %w", err)
 	}
-	rows, err := chhttp.FormatTSVStrings(out, 2)
+	rows, err := chhttp.FormatTSVStrings(out, 3)
 	if err != nil {
 		return failedMergeSummary{}, err
 	}
@@ -1376,7 +1384,14 @@ func (p Processor) destinationFailedMergeSummary(ctx context.Context, target mer
 	if err != nil {
 		return failedMergeSummary{}, err
 	}
-	return failedMergeSummary{Count: count, LatestException: rows[0][1]}, nil
+	memoryLimitCount, err := chhttp.ParseUInt(rows[0][1])
+	if err != nil {
+		return failedMergeSummary{}, err
+	}
+	if memoryLimitCount > count {
+		return failedMergeSummary{}, fmt.Errorf("memory-limit merge failures %d exceed total merge failures %d", memoryLimitCount, count)
+	}
+	return failedMergeSummary{Count: count, MemoryLimitCount: memoryLimitCount, LatestException: rows[0][2]}, nil
 }
 
 func (p Processor) destinationFailedMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {

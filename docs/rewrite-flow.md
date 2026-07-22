@@ -67,6 +67,7 @@ The insert-select step has its own resource retry loop. The worker caps query me
 After a successful insert-select and before the ClickHouse restart, the worker applies these destination table settings:
 
 - `merge_max_block_size`
+- `merge_max_block_size_bytes`
 - `merge_selecting_sleep_ms`
 - `max_bytes_to_merge_at_max_space_in_pool`
 - `max_bytes_to_merge_at_min_space_in_pool`
@@ -74,6 +75,8 @@ After a successful insert-select and before the ClickHouse restart, the worker a
 Server-level merge pool tuning is not applied to rewrite/inserter ClickHouse processes.
 
 Compactor ClickHouse processes start with a `round_robin` merge pool sized to half the detected CPUs, with a minimum of two threads and a concurrency ratio of one. The same tuning is retained when ClickHouse restarts after compact inputs are attached.
+
+The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, restarts merges, and dispatches the usual partition-scoped `OPTIMIZE FINAL` again. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
 
 ## Merge Wait
 

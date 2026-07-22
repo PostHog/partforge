@@ -219,6 +219,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 		ClickHouse: chhttp.Client{URL: server.URL},
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
 			MergeSelectingSleepMS:    1000,
 			PoolFreeEntriesThreshold: 1,
 		},
@@ -230,7 +231,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_selecting_sleep_ms = 1000, number_of_free_entries_in_pool_to_lower_max_size_of_merge = 1, number_of_free_entries_in_pool_to_execute_mutation = 1, number_of_free_entries_in_pool_to_execute_optimize_entire_partition = 1, max_bytes_to_merge_at_max_space_in_pool = 161061273600, max_bytes_to_merge_at_min_space_in_pool = 161061273600"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 10485760, merge_selecting_sleep_ms = 1000, number_of_free_entries_in_pool_to_lower_max_size_of_merge = 1, number_of_free_entries_in_pool_to_execute_mutation = 1, number_of_free_entries_in_pool_to_execute_optimize_entire_partition = 1, max_bytes_to_merge_at_max_space_in_pool = 161061273600, max_bytes_to_merge_at_min_space_in_pool = 161061273600"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -366,7 +367,7 @@ func TestDestinationFailedMergeCount(t *testing.T) {
 		query := string(body)
 		queries = append(queries, query)
 		if strings.Contains(query, "system.part_log") {
-			_, _ = w.Write([]byte("7\tCode: 241. MEMORY_LIMIT_EXCEEDED\n"))
+			_, _ = w.Write([]byte("7\t7\tCode: 241. MEMORY_LIMIT_EXCEEDED\n"))
 		}
 	}))
 	defer server.Close()

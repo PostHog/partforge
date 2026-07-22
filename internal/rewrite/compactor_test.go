@@ -15,7 +15,7 @@ import (
 	"github.com/PostHog/partforge/internal/metrics"
 )
 
-func TestConfigureCompactMergeSettingsLeavesDefaultSettingsUntouched(t *testing.T) {
+func TestConfigureCompactMergeSettingsAppliesMergeBlockByteLimit(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -32,6 +32,7 @@ func TestConfigureCompactMergeSettingsLeavesDefaultSettingsUntouched(t *testing.
 		ClickHouse: chhttp.Client{URL: server.URL},
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
 			MergeSelectingSleepMS:    1000,
 			PoolFreeEntriesThreshold: 1,
 		},
@@ -47,10 +48,11 @@ func TestConfigureCompactMergeSettingsLeavesDefaultSettingsUntouched(t *testing.
 	if len(queries) != 1 {
 		t.Fatalf("queries = %#v, want one query", queries)
 	}
-	for _, setting := range []string{"enable_vertical_merge_algorithm", "merge_max_block_size_bytes"} {
-		if strings.Contains(queries[0], setting) {
-			t.Fatalf("query = %q, want %s unset", queries[0], setting)
-		}
+	if !strings.Contains(queries[0], "merge_max_block_size_bytes = 10485760") {
+		t.Fatalf("query = %q, want byte limit", queries[0])
+	}
+	if strings.Contains(queries[0], "enable_vertical_merge_algorithm") {
+		t.Fatalf("query = %q, want vertical merge setting untouched", queries[0])
 	}
 }
 

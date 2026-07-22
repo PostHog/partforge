@@ -5,14 +5,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/metrics"
 )
 
-func TestObserveCompactProgressFailsAfterThreeMergeFailures(t *testing.T) {
+func TestObserveCompactProgressFailsAfterThreeNonMemoryMergeFailures(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -22,7 +24,7 @@ func TestObserveCompactProgressFailsAfterThreeMergeFailures(t *testing.T) {
 		switch {
 		case query == "SYSTEM FLUSH LOGS":
 		case strings.Contains(query, "FROM system.part_log"):
-			_, _ = io.WriteString(w, "3\tCode: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED\n")
+			_, _ = io.WriteString(w, "3\t0\tCode: 999. DB::Exception: merge failed\n")
 		default:
 			t.Fatalf("unexpected query: %s", query)
 		}
@@ -34,8 +36,72 @@ func TestObserveCompactProgressFailsAfterThreeMergeFailures(t *testing.T) {
 		JobID:        "job-1",
 		OutputPartID: "compact-1",
 	}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 10})
-	if err == nil || !strings.Contains(err.Error(), "destination merges failed 3 times") || !strings.Contains(err.Error(), "MEMORY_LIMIT_EXCEEDED") {
+	if err == nil || !strings.Contains(err.Error(), "destination merges failed 3 non-memory times") || !strings.Contains(err.Error(), "merge failed") {
 		t.Fatalf("error = %v, want repeated merge failure with ClickHouse exception", err)
+	}
+}
+
+func TestObserveCompactProgressHalvesMergeBlockBytesAfterMemoryFailure(t *testing.T) {
+	var recoveryQueries []string
+	optimized := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := string(body)
+		switch {
+		case query == "SYSTEM FLUSH LOGS":
+		case strings.Contains(query, "FROM system.part_log"):
+			_, _ = io.WriteString(w, "1\t1\tCode: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED\n")
+		case query == "SYSTEM STOP MERGES `db`.`events`":
+			recoveryQueries = append(recoveryQueries, query)
+		case strings.HasPrefix(query, "ALTER TABLE"):
+			recoveryQueries = append(recoveryQueries, query)
+		case query == "SYSTEM START MERGES `db`.`events`":
+			recoveryQueries = append(recoveryQueries, query)
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			optimized <- query
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			_, _ = io.WriteString(w, "202607\t2\t100\t1000\n")
+		case strings.Contains(query, "FROM system.merges"):
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := (Compactor{
+		ProgressInterval: time.Nanosecond,
+		ReportProgress: func(context.Context, CompactWorkItem, CompactProgressSnapshot) error {
+			select {
+			case query := <-optimized:
+				if query != "OPTIMIZE TABLE `db`.`events` PARTITION ID '202607' FINAL" {
+					t.Fatalf("optimize query = %q", query)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for optimize retry")
+			}
+			cancel()
+			return nil
+		},
+	}).observeCompactProgress(ctx, Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSizeBytes: 8 * 1024 * 1024,
+		},
+	}, CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRecovery := []string{
+		"SYSTEM STOP MERGES `db`.`events`",
+		"ALTER TABLE `db`.`events` MODIFY SETTING merge_max_block_size_bytes = 4194304",
+		"SYSTEM START MERGES `db`.`events`",
+	}
+	if !slices.Equal(recoveryQueries, wantRecovery) {
+		t.Fatalf("queries = %#v, want recovery sequence %#v", recoveryQueries, wantRecovery)
 	}
 }
 
