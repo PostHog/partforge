@@ -134,7 +134,7 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := <-requests
-	if request.query != "OPTIMIZE TABLE `db`.`events` FINAL SETTINGS optimize_skip_merged_partitions = 1, optimize_throw_if_noop = 1" {
+	if request.query != "OPTIMIZE TABLE `db`.`events` PARTITION ID '202606' FINAL SETTINGS optimize_throw_if_noop = 1" {
 		t.Fatalf("optimize query = %q", request.query)
 	}
 	if request.queryID != "partforge-job-1-compact-1-optimize-final-attempt-1" {
@@ -148,6 +148,7 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 	optimizeStarted := make(chan struct{})
 	var optimizeAttempts atomic.Int32
+	requests := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -158,6 +159,7 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 		query := string(body)
 		switch {
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			requests <- query
 			if optimizeAttempts.Add(1) == 1 {
 				close(optimizeStarted)
 			}
@@ -166,11 +168,11 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
 			<-optimizeStarted
-			parts := "2"
+			parts := "202606\t1\t50\t500\n202607\t2\t50\t500\n"
 			if optimizeAttempts.Load() > 1 {
-				parts = "1"
+				parts = "202606\t1\t50\t500\n202607\t1\t50\t500\n"
 			}
-			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
+			_, _ = io.WriteString(w, parts)
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -181,12 +183,20 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
 	target := mergeWaitTarget{Database: "db", Table: "events"}
 	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}, MergePollInterval: time.Millisecond}
-	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 3}}, metrics.PartStats{Count: 3})
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 2}, {PartitionID: "202607", Parts: 2}}, metrics.PartStats{Count: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if optimizeAttempts.Load() != 2 {
 		t.Fatalf("optimize attempts = %d, want 2", optimizeAttempts.Load())
+	}
+	for i, want := range []string{
+		"OPTIMIZE TABLE `db`.`events` PARTITION ID '202606' FINAL SETTINGS optimize_throw_if_noop = 1",
+		"OPTIMIZE TABLE `db`.`events` PARTITION ID '202607' FINAL SETTINGS optimize_throw_if_noop = 1",
+	} {
+		if got := <-requests; got != want {
+			t.Fatalf("optimize request %d = %q, want %q", i+1, got, want)
+		}
 	}
 }
 

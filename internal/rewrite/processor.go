@@ -1665,9 +1665,10 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget, wa
 						"active_parts", snapshot.ActiveParts,
 						"total_bytes_on_disk", snapshot.TotalBytes,
 						"largest_part_bytes_on_disk", snapshot.LargestPartBytes,
-						"partitions", len(optimizePartitionIDs),
+						"partition_id", optimizePartitionIDs[0],
+						"eligible_partitions", len(optimizePartitionIDs),
 					)
-					p.optimizeFinalPartitions(optimizeCtx, target, optimizePartitionIDs)
+					p.optimizeFinalPartition(optimizeCtx, target, optimizePartitionIDs[0])
 					lastActivityAt = now
 					baseDeadline = lastActivityAt.Add(timeout)
 					zeroMergesStableSnapshotSince = time.Time{}
@@ -1902,11 +1903,9 @@ func sameMergePartSnapshot(a, b mergePartSnapshot) bool {
 		a.LargestPartBytes == b.LargestPartBytes
 }
 
-func (p Processor) optimizeFinalPartitions(ctx context.Context, target mergeWaitTarget, partitionIDs []string) {
-	for _, partitionID := range partitionIDs {
-		query := "OPTIMIZE TABLE " + target.tableSQL() + " PARTITION ID " + chhttp.StringLiteral(partitionID) + " FINAL"
-		runOptimizeAsync(ctx, p.ClickHouse, query, chhttp.QueryOptions{})
-	}
+func (p Processor) optimizeFinalPartition(ctx context.Context, target mergeWaitTarget, partitionID string) {
+	query := "OPTIMIZE TABLE " + target.tableSQL() + " PARTITION ID " + chhttp.StringLiteral(partitionID) + " FINAL"
+	runOptimizeAsync(ctx, p.ClickHouse, query, chhttp.QueryOptions{})
 }
 
 func runOptimizeAsync(ctx context.Context, clickHouse chhttp.Client, query string, options chhttp.QueryOptions) {

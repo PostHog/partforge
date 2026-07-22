@@ -935,6 +935,54 @@ func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
 	}
 }
 
+func TestWaitForMergesRunsOneOptimizeFinalPartitionAtATime(t *testing.T) {
+	requests := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "GROUP BY partition_id"):
+			_, _ = w.Write([]byte("202401\t2\t0\t100\n202402\t2\t0\t100\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("4\t400\t100\n"))
+		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
+			requests <- query
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeTimeout:        time.Hour,
+		MergeMaxTimeout:     time.Hour,
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+		OptimizeFinalAfter:  time.Millisecond,
+	}).waitForMerges(ctx, testMergeWaitTarget(), true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("optimize requests = %d, want 1", len(requests))
+	}
+	if got, want := <-requests, "OPTIMIZE TABLE `db`.`query_log_archive_temp` PARTITION ID '202401' FINAL"; got != want {
+		t.Fatalf("optimize query = %q, want %q", got, want)
+	}
+}
+
 func TestWaitForMergesSkipsOptimizeFinalWhenPartsAreInDifferentPartitions(t *testing.T) {
 	var partitionRequests int
 	var optimizeRequests int

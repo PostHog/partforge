@@ -336,21 +336,27 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		return fmt.Errorf("normalize compact input merge settle wait must not be negative")
 	}
 
-	query := "OPTIMIZE TABLE " + target.tableSQL() + " FINAL SETTINGS optimize_skip_merged_partitions = 1, optimize_throw_if_noop = 1"
 	attempt := 0
 	optimizeCtx, cancelOptimizes := context.WithCancel(ctx)
 	defer cancelOptimizes()
-	startOptimize := func() {
-		attempt++
-		runOptimizeAsync(optimizeCtx, c.ClickHouse, query, chhttp.QueryOptions{
-			QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, attempt),
-		})
+	startOptimize := func(partitions []PartPartitionStats) {
+		for _, partition := range partitions {
+			if partition.Parts <= 1 {
+				continue
+			}
+			attempt++
+			query := "OPTIMIZE TABLE " + target.tableSQL() + " PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " FINAL SETTINGS optimize_throw_if_noop = 1"
+			runOptimizeAsync(optimizeCtx, c.ClickHouse, query, chhttp.QueryOptions{
+				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, attempt),
+			})
+			return
+		}
 	}
 
 	passStartParts := summarizePartPartitions(inputPartitions).Count
 	lastParts := passStartParts
 	lastProgressAt := time.Now()
-	startOptimize()
+	startOptimize(inputPartitions)
 
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
@@ -385,7 +391,7 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if activeMerges == 0 && activeParts < passStartParts {
 			passStartParts = activeParts
 			lastProgressAt = now
-			startOptimize()
+			startOptimize(partitions)
 			continue
 		}
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
