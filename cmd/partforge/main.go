@@ -2228,20 +2228,18 @@ func finalizeCompactReadyJob(ctx context.Context, store *state.Store, jobID stri
 }
 
 func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duration, now time.Time) ([]state.Part, bool, error) {
-	var compactReady []state.Part
-	for _, part := range parts {
-		switch part.Status {
-		case state.StatusReady, state.StatusInProgress, state.StatusFailed:
-			return nil, false, nil
-		case state.StatusCompactReady:
-			compactReady = append(compactReady, part)
-		}
-	}
+	compactReady := compactReadyParts(parts)
 	if len(compactReady) == 0 {
 		return nil, false, nil
 	}
 	if normalized := normalizedCompactReadyParts(compactReady); len(normalized) > 0 {
 		return normalized, true, nil
+	}
+	for _, part := range parts {
+		switch part.Status {
+		case state.StatusReady, state.StatusInProgress, state.StatusFailed:
+			return nil, false, nil
+		}
 	}
 	if hasCompactingParts(parts) {
 		return nil, false, nil
@@ -4180,7 +4178,7 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 		return summary
 	}
 	compactReady := compactReadyParts(parts)
-	if len(compactFinalizationSourceBlockers(counts)) == 0 && len(normalizedCompactReadyParts(compactReady)) > 0 {
+	if len(normalizedCompactReadyParts(compactReady)) > 0 {
 		summary.FinalizeAfter = now.UTC().Format(time.RFC3339Nano)
 		summary.FinalizeIn = "0s"
 		summary.FinalizeStatus = "ready"
@@ -4224,16 +4222,6 @@ func compactReadyParts(parts []state.Part) []state.Part {
 func compactFinalizationBlockers(counts map[state.Status]int) []statusCount {
 	var blockers []statusCount
 	for _, status := range []state.Status{state.StatusReady, state.StatusInProgress, state.StatusCompacting, state.StatusFailed} {
-		if counts[status] > 0 {
-			blockers = append(blockers, statusCount{Status: status, Count: counts[status]})
-		}
-	}
-	return blockers
-}
-
-func compactFinalizationSourceBlockers(counts map[state.Status]int) []statusCount {
-	var blockers []statusCount
-	for _, status := range []state.Status{state.StatusReady, state.StatusInProgress, state.StatusFailed} {
 		if counts[status] > 0 {
 			blockers = append(blockers, statusCount{Status: status, Count: counts[status]})
 		}

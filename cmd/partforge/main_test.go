@@ -281,6 +281,7 @@ func TestSummarizeJobCompactFinalizationReadyForSingleUnmergeablePart(t *testing
 				"202606": 1,
 			},
 		},
+		{PartID: "part-in-progress", Status: state.StatusInProgress},
 	}, jobSummaryOptions{
 		Now:           now,
 		CompactWindow: 2 * time.Hour,
@@ -808,6 +809,7 @@ func TestFinalizableCompactReadyPartsFinalizesSingleUnmergeablePart(t *testing.T
 				"202606": 1,
 			},
 		},
+		{PartID: "part-in-progress", Status: state.StatusInProgress},
 	}, 2*time.Hour, now)
 	if err != nil {
 		t.Fatal(err)
