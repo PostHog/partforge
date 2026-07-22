@@ -76,7 +76,9 @@ Server-level merge pool tuning is not applied to rewrite/inserter ClickHouse pro
 
 Compactor ClickHouse processes start with a `round_robin` merge pool sized to half the detected CPUs, with a minimum of two threads and a concurrency ratio of one. The same tuning is retained when ClickHouse restarts after compact inputs are attached.
 
-The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, restarts merges, and dispatches the usual partition-scoped `OPTIMIZE FINAL` again. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
+The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, restarts merges, and dispatches the appropriate staged or final optimize again. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
+
+Compaction enables vertical merges with zero activation thresholds and caps ordinary merges at 100 source parts. Because ClickHouse cannot use its vertical algorithm with more than 127 source parts, PartForge uses ordinary merge selection above that limit and only dispatches partition-scoped `OPTIMIZE FINAL` once the partition reaches 127 parts or fewer.
 
 ## Merge Wait
 

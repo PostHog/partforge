@@ -22,6 +22,11 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
+const (
+	compactMaxPartsToMergeAtOnce = 100
+	maxVerticalMergeSourceParts  = 127
+)
+
 type Compactor struct {
 	S3Copy              s3copy.Copier
 	ClickHouse          chhttp.Client
@@ -345,9 +350,9 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 				continue
 			}
 			attempt++
-			query := "OPTIMIZE TABLE " + target.tableSQL() + " PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " FINAL SETTINGS optimize_throw_if_noop = 1"
+			query := compactOptimizeQuery(target, partition)
 			runOptimizeAsync(optimizeCtx, c.ClickHouse, query, chhttp.QueryOptions{
-				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-final-attempt-%d", item.JobID, item.OutputPartID, attempt),
+				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-attempt-%d", item.JobID, item.OutputPartID, attempt),
 			})
 			return
 		}
@@ -401,6 +406,14 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 			return fmt.Errorf("verify normalized compact output: %w", err)
 		}
 	}
+}
+
+func compactOptimizeQuery(target mergeWaitTarget, partition PartPartitionStats) string {
+	query := "OPTIMIZE TABLE " + target.tableSQL()
+	if partition.Parts <= maxVerticalMergeSourceParts {
+		query += " PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " FINAL"
+	}
+	return query + " SETTINGS optimize_throw_if_noop = 1"
 }
 
 func compactPartitionsNormalized(input, output []PartPartitionStats) bool {
@@ -535,6 +548,12 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
+		", max_parts_to_merge_at_once = " + strconv.Itoa(compactMaxPartsToMergeAtOnce) +
+		", enable_vertical_merge_algorithm = 1" +
+		", allow_vertical_merges_from_compact_to_wide_parts = 1" +
+		", vertical_merge_algorithm_min_rows_to_activate = 0" +
+		", vertical_merge_algorithm_min_bytes_to_activate = 0" +
+		", vertical_merge_algorithm_min_columns_to_activate = 0" +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
 		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
@@ -552,6 +571,8 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		"destination_table", table,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
+		"max_parts_to_merge_at_once", compactMaxPartsToMergeAtOnce,
+		"vertical_merges_enabled", true,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"destination_active_bytes_on_disk", activeBytes,

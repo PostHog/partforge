@@ -157,7 +157,7 @@ func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, tar
 	}
 	for _, partition := range partitions {
 		if partition.Parts > 1 {
-			p.optimizeFinalPartition(ctx, target, partition.PartitionID)
+			runOptimizeAsync(ctx, p.ClickHouse, compactOptimizeQuery(target, partition), chhttp.QueryOptions{})
 			break
 		}
 	}

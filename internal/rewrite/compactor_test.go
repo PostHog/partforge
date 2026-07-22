@@ -15,7 +15,7 @@ import (
 	"github.com/PostHog/partforge/internal/metrics"
 )
 
-func TestConfigureCompactMergeSettingsAppliesMergeBlockByteLimit(t *testing.T) {
+func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -48,11 +48,28 @@ func TestConfigureCompactMergeSettingsAppliesMergeBlockByteLimit(t *testing.T) {
 	if len(queries) != 1 {
 		t.Fatalf("queries = %#v, want one query", queries)
 	}
-	if !strings.Contains(queries[0], "merge_max_block_size_bytes = 10485760") {
-		t.Fatalf("query = %q, want byte limit", queries[0])
+	for _, setting := range []string{
+		"merge_max_block_size_bytes = 10485760",
+		"max_parts_to_merge_at_once = 100",
+		"enable_vertical_merge_algorithm = 1",
+		"allow_vertical_merges_from_compact_to_wide_parts = 1",
+		"vertical_merge_algorithm_min_rows_to_activate = 0",
+		"vertical_merge_algorithm_min_bytes_to_activate = 0",
+		"vertical_merge_algorithm_min_columns_to_activate = 0",
+	} {
+		if !strings.Contains(queries[0], setting) {
+			t.Fatalf("query = %q, want %s", queries[0], setting)
+		}
 	}
-	if strings.Contains(queries[0], "enable_vertical_merge_algorithm") {
-		t.Fatalf("query = %q, want vertical merge setting untouched", queries[0])
+}
+
+func TestCompactOptimizeQueryStagesPartitionsTooWideForVerticalMerge(t *testing.T) {
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	if got, want := compactOptimizeQuery(target, PartPartitionStats{PartitionID: "202508", Parts: 128}), "OPTIMIZE TABLE `db`.`events` SETTINGS optimize_throw_if_noop = 1"; got != want {
+		t.Fatalf("staged optimize query = %q, want %q", got, want)
+	}
+	if got, want := compactOptimizeQuery(target, PartPartitionStats{PartitionID: "202508", Parts: 127}), "OPTIMIZE TABLE `db`.`events` PARTITION ID '202508' FINAL SETTINGS optimize_throw_if_noop = 1"; got != want {
+		t.Fatalf("final optimize query = %q, want %q", got, want)
 	}
 }
 
@@ -139,7 +156,7 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 	if request.query != "OPTIMIZE TABLE `db`.`events` PARTITION ID '202606' FINAL SETTINGS optimize_throw_if_noop = 1" {
 		t.Fatalf("optimize query = %q", request.query)
 	}
-	if request.queryID != "partforge-job-1-compact-1-optimize-final-attempt-1" {
+	if request.queryID != "partforge-job-1-compact-1-optimize-attempt-1" {
 		t.Fatalf("optimize query ID = %q", request.queryID)
 	}
 	if partitionQueries.Load() != 2 {

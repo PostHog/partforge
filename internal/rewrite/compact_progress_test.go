@@ -77,7 +77,7 @@ func TestObserveCompactProgressHalvesMergeBlockBytesAfterMemoryFailure(t *testin
 		ReportProgress: func(context.Context, CompactWorkItem, CompactProgressSnapshot) error {
 			select {
 			case query := <-optimized:
-				if query != "OPTIMIZE TABLE `db`.`events` PARTITION ID '202607' FINAL" {
+				if query != "OPTIMIZE TABLE `db`.`events` PARTITION ID '202607' FINAL SETTINGS optimize_throw_if_noop = 1" {
 					t.Fatalf("optimize query = %q", query)
 				}
 			case <-time.After(time.Second):
