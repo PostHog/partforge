@@ -52,7 +52,7 @@ Combine the S3 permissions with `rds-db:connect` for the Postgres database user.
 Worker scratch (`-work-dir`) holds the local ClickHouse data plus downloaded source parts, and compaction transiently holds downloaded tarballs, extracted parts, merge output, and re-uploaded tarballs at once. It must be **fast local disk with enough headroom**:
 
 - **EC2 launch type with instance-store NVMe** is best for large parts — mount the NVMe into the container and set `-work-dir` on it (e.g. `/mnt/nvme/partforge-work`).
-- **Fargate** works for smaller jobs; raise the task's ephemeral storage and keep `-compact-max-bytes` well below it.
+- **Fargate** works for smaller jobs; size task ephemeral storage for the largest rewritten artifact.
 
 Each claimed part gets its own `run-*` directory that is removed when the part finishes.
 

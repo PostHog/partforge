@@ -223,12 +223,12 @@ if [[ "${status:-}" != "READY_FOR_IMPORT" ]]; then
   echo "job did not reach READY_FOR_IMPORT; status=${status:-<empty>}" >&2
   exit 1
 fi
-if ! grep -h "claimed compact-ready batch" "$ROOT"/.e2e/compact-*.log >/dev/null; then
-  echo "expected compact worker to claim a compact-ready batch" >&2
+if grep -h "claimed compact-ready batch" "$ROOT"/.e2e/compact-*.log >/dev/null; then
+  echo "compact worker unexpectedly combined normalized artifacts" >&2
   exit 1
 fi
-if ! grep -Eh "completed compact batch|compact batch did not reduce active part count" "$ROOT"/.e2e/compact-*.log >/dev/null; then
-  echo "expected compact worker to finish a compact attempt" >&2
+if ! grep -h "finalized compact-ready artifacts" "$ROOT"/.e2e/compact-*.log >/dev/null; then
+  echo "expected compact worker to finalize normalized artifacts" >&2
   exit 1
 fi
 
@@ -248,6 +248,13 @@ docker compose exec -T clickhouse clickhouse-client --query \
   > "$ROOT/.e2e/actual.tsv"
 
 diff -u e2e/expected.tsv "$ROOT/.e2e/actual.tsv"
+
+output_part_count="$(docker compose exec -T clickhouse clickhouse-client --query \
+  "SELECT count() FROM system.parts WHERE database = 'dst' AND table = 'events_new' AND active")"
+if [[ "$output_part_count" != "$part_count" ]]; then
+  echo "output ClickHouse parts=$output_part_count, expected uploaded parts=$part_count" >&2
+  exit 1
+fi
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   delete-job \

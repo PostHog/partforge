@@ -9,7 +9,6 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 - **`-once`** — process one unit of work and exit (used by the e2e script and for controlled draining).
 - **`-poll-interval`** (default `10s`) — how long to wait before re-checking for work when idle.
 - **`-compact-window`** (default `24h`) — how long `COMPACT_READY` artifacts stay eligible for compaction before being promoted to `FINISHED`; also the hard cap on a claimed compact merge wait. `0` finalizes as soon as no useful compaction remains.
-- **`-compact-max-artifacts`** (default `8`, up to `99`) and **`-compact-max-bytes`** (default `300 GiB`, `0` disables) — bound one compaction batch. Keep the byte cap well under free disk.
 - **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the worker destination table before the insert-select.
 - **`-clickhouse-binary`**, **`-clickhouse-config-file`**, **`-clickhouse-url`** — locate the local ClickHouse the worker starts.
 

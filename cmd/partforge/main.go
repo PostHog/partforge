@@ -49,10 +49,7 @@ const defaultClickHousePrometheusPort = 9363
 const defaultClickHousePrometheusPath = "/metrics"
 const defaultClickHousePrometheusScrapeTimeout = 5 * time.Second
 const defaultCompactWindow = 24 * time.Hour
-const defaultCompactMaxArtifacts = 8
-const defaultCompactMaxBytes uint64 = 300 * 1024 * 1024 * 1024
 const compactSourceMergeWaitCap = 5 * time.Minute
-const compactMinInputParts uint64 = 2
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 const ecsTaskProtectionTimeout = 5 * time.Second
@@ -1131,8 +1128,6 @@ func runWorker(ctx context.Context, args []string) error {
 		compact                   = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
 		compactWindow             = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactOptimizeFinalAfter = fs.Duration("compact-optimize-final-after", rewrite.DefaultCompactOptimizeFinalAfter, "how long compaction waits with mergeable idle parts before running OPTIMIZE FINAL; 0 uses the default")
-		compactMaxArtifacts       = fs.Int("compact-max-artifacts", defaultCompactMaxArtifacts, "maximum input artifacts for one compaction batch")
-		compactMaxBytes           = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
 		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
 		metricsPath               = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
 		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")
@@ -1171,9 +1166,6 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactOptimizeFinalAfter < 0 {
 		return fmt.Errorf("compact-optimize-final-after must be non-negative, got %s", *compactOptimizeFinalAfter)
-	}
-	if *compactMaxArtifacts < 1 || *compactMaxArtifacts > state.MaxCompactBatchParts {
-		return fmt.Errorf("compact-max-artifacts must be between 1 and %d, got %d", state.MaxCompactBatchParts, *compactMaxArtifacts)
 	}
 	if *clickHouseScrapeTimeout <= 0 {
 		return fmt.Errorf("clickhouse-prometheus-scrape-timeout must be greater than zero, got %s", *clickHouseScrapeTimeout)
@@ -1276,9 +1268,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_optimize_final_after", effectiveCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
-		"compact_max_artifacts", *compactMaxArtifacts,
-		"compact_max_bytes", *compactMaxBytes,
-		"compact_min_input_parts", compactMinInputParts,
 		"clickhouse_prometheus_enabled", clickHousePrometheusConfig.Enabled,
 		"clickhouse_prometheus_target", clickHousePrometheusTarget,
 		"clickhouse_prometheus_scrape_timeout", *clickHouseScrapeTimeout,
@@ -1348,8 +1337,6 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactLeaseStaleAfter:        compactStaleAfter,
 					CompactHeartbeatInterval:      compactHeartbeatInterval,
 					CompactProgressInterval:       *stateProgressInterval,
-					CompactMaxArtifacts:           *compactMaxArtifacts,
-					CompactMaxBytes:               *compactMaxBytes,
 					Metrics:                       recorder,
 					PrometheusMetrics:             prometheusMetrics,
 					ECSProtection:                 &ecsProtection,
@@ -1645,8 +1632,6 @@ type workerCompactionConfig struct {
 	CompactLeaseStaleAfter        time.Duration
 	CompactHeartbeatInterval      time.Duration
 	CompactProgressInterval       time.Duration
-	CompactMaxArtifacts           int
-	CompactMaxBytes               uint64
 	Metrics                       metrics.Recorder
 	PrometheusMetrics             *metrics.Prometheus
 	ECSProtection                 *ecsTaskProtection
@@ -1706,9 +1691,6 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	slog.Info("claiming compact-ready batch", "stage", "claim_compact", "worker_id", cfg.WorkerID)
 	batch, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
-		MaxArtifacts:   cfg.CompactMaxArtifacts,
-		MaxBytes:       cfg.CompactMaxBytes,
-		MinInputParts:  compactMinInputParts,
 		ExcludedJobIDs: finalization.ExpiredJobIDs,
 	})
 	if err != nil {
@@ -2253,8 +2235,8 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	if len(compactReady) == 0 {
 		return nil, false, nil
 	}
-	if isolatedUnmergeableCompactReady := isolatedUnmergeableCompactReadyParts(parts, compactReady); len(isolatedUnmergeableCompactReady) > 0 {
-		return isolatedUnmergeableCompactReady, true, nil
+	if normalized := normalizedCompactReadyParts(compactReady); len(normalized) > 0 {
+		return normalized, true, nil
 	}
 	if hasCompactingParts(parts) {
 		return nil, false, nil
@@ -2272,27 +2254,10 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	return compactReady, true, nil
 }
 
-func isolatedUnmergeableCompactReadyParts(parts, compactReady []state.Part) []state.Part {
-	activeCompactPartitionParts := map[string]uint64{}
-	for _, part := range parts {
-		if part.Status != state.StatusCompactReady && part.Status != state.StatusCompacting {
-			continue
-		}
-		for partitionID, count := range part.DestinationActivePartitionCounts {
-			if strings.TrimSpace(partitionID) == "" || count == 0 {
-				continue
-			}
-			activeCompactPartitionParts[partitionID] += count
-		}
-	}
-
+func normalizedCompactReadyParts(compactReady []state.Part) []state.Part {
 	var out []state.Part
 	for _, part := range compactReady {
-		partitionID, ok := singlePhysicalPartPartition(part)
-		if !ok {
-			continue
-		}
-		if activeCompactPartitionParts[partitionID] == 1 {
+		if _, ok := singlePhysicalPartPartition(part); ok {
 			out = append(out, part)
 		}
 	}
@@ -4210,11 +4175,11 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 		return summary
 	}
 	compactReady := compactReadyParts(parts)
-	if len(compactFinalizationSourceBlockers(counts)) == 0 && len(isolatedUnmergeableCompactReadyParts(parts, compactReady)) > 0 {
+	if len(compactFinalizationSourceBlockers(counts)) == 0 && len(normalizedCompactReadyParts(compactReady)) > 0 {
 		summary.FinalizeAfter = now.UTC().Format(time.RFC3339Nano)
 		summary.FinalizeIn = "0s"
 		summary.FinalizeStatus = "ready"
-		summary.Reason = "one or more compact-ready parts cannot be compacted further"
+		summary.Reason = "one or more compact-ready artifacts already contain one physical part"
 		return summary
 	}
 	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)

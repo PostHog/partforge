@@ -896,7 +896,7 @@ func TestFinalizableCompactReadyPartsFinalizesIsolatedPartitionWithOtherCompacti
 	}
 }
 
-func TestFinalizableCompactReadyPartsWaitsWhenCompactingPartitionOverlaps(t *testing.T) {
+func TestFinalizableCompactReadyPartsFinalizesNormalizedPartWithCompactingPartition(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected, ok, err := finalizableCompactReadyParts([]state.Part{
 		{
@@ -920,12 +920,12 @@ func TestFinalizableCompactReadyPartsWaitsWhenCompactingPartitionOverlaps(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok || len(selected) != 0 {
-		t.Fatalf("selected = %+v, ok=%t; want overlapping compacting partition to block", selected, ok)
+	if !ok || len(selected) != 1 || selected[0].PartID != "part-compact" {
+		t.Fatalf("selected = %+v, ok=%t; want normalized part finalized", selected, ok)
 	}
 }
 
-func TestFinalizableCompactReadyPartsWaitsWhenReadyPartitionOverlaps(t *testing.T) {
+func TestFinalizableCompactReadyPartsFinalizesNormalizedPartsInSamePartition(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	part := func(partID string) state.Part {
 		return state.Part{
@@ -942,8 +942,8 @@ func TestFinalizableCompactReadyPartsWaitsWhenReadyPartitionOverlaps(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok || len(selected) != 0 {
-		t.Fatalf("selected = %+v, ok=%t; want overlapping compact-ready partition to wait", selected, ok)
+	if !ok || len(selected) != 2 {
+		t.Fatalf("selected = %+v, ok=%t; want both normalized parts finalized", selected, ok)
 	}
 }
 
