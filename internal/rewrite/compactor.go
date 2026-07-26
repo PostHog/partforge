@@ -358,10 +358,10 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		}
 	}
 
-	passStartParts := summarizePartPartitions(inputPartitions).Count
-	lastParts := passStartParts
+	lastParts := summarizePartPartitions(inputPartitions).Count
 	lastProgressAt := time.Now()
-	startOptimize(inputPartitions)
+	automaticMergesDisabled := false
+	var optimizeStartParts uint64
 
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
@@ -393,8 +393,16 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if activeMerges == 0 && compactPartitionsNormalized(inputPartitions, partitions) {
 			return nil
 		}
-		if activeMerges == 0 && activeParts < passStartParts {
-			passStartParts = activeParts
+		if !automaticMergesDisabled && activeMerges == 0 && compactPartitionsReadyForFinal(partitions) {
+			if err := disableAutomaticMerges(ctx, c.ClickHouse, target); err != nil {
+				return fmt.Errorf("disable automatic merges before final compact optimization: %w", err)
+			}
+			automaticMergesDisabled = true
+			lastProgressAt = now
+			continue
+		}
+		if automaticMergesDisabled && activeMerges == 0 && (optimizeStartParts == 0 || activeParts < optimizeStartParts) {
+			optimizeStartParts = activeParts
 			lastProgressAt = now
 			startOptimize(partitions)
 			continue
@@ -406,6 +414,20 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 			return fmt.Errorf("verify normalized compact output: %w", err)
 		}
 	}
+}
+
+func compactPartitionsReadyForFinal(partitions []PartPartitionStats) bool {
+	for _, partition := range partitions {
+		if partition.Parts > maxVerticalMergeSourceParts {
+			return false
+		}
+	}
+	return true
+}
+
+func disableAutomaticMerges(ctx context.Context, clickHouse chhttp.Client, target mergeWaitTarget) error {
+	return clickHouse.Exec(ctx, "ALTER TABLE "+target.tableSQL()+
+		" MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 0, max_bytes_to_merge_at_min_space_in_pool = 0")
 }
 
 func compactOptimizeQuery(target mergeWaitTarget, partition PartPartitionStats) string {

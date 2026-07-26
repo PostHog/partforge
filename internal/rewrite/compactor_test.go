@@ -124,6 +124,7 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 		}
 		query := string(body)
 		switch {
+		case strings.HasPrefix(query, "ALTER TABLE"):
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
 			requests <- optimizeRequest{query: query, queryID: r.URL.Query().Get("query_id")}
 			close(optimizeStarted)
@@ -131,11 +132,12 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
-			<-optimizeStarted
-			queryNumber := partitionQueries.Add(1)
+			partitionQueries.Add(1)
 			parts := "2"
-			if queryNumber > 1 {
+			select {
+			case <-optimizeStarted:
 				parts = "1"
+			default:
 			}
 			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
 		default:
@@ -159,8 +161,74 @@ func TestNormalizeCompactInputVerifiesPartsWhileOptimizeRuns(t *testing.T) {
 	if request.queryID != "partforge-job-1-compact-1-optimize-attempt-1" {
 		t.Fatalf("optimize query ID = %q", request.queryID)
 	}
-	if partitionQueries.Load() != 2 {
-		t.Fatalf("partition verification queries = %d, want 2", partitionQueries.Load())
+	if partitionQueries.Load() < 2 {
+		t.Fatalf("partition verification queries = %d, want at least 2", partitionQueries.Load())
+	}
+}
+
+func TestNormalizeCompactInputWaitsForBackgroundMergesBeforeOptimizeFinal(t *testing.T) {
+	var mergeQueries atomic.Int32
+	var partitionQueries atomic.Int32
+	var automaticMergesDisabled atomic.Bool
+	var optimizeStarted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			if mergeQueries.Add(1) == 1 {
+				_, _ = io.WriteString(w, "1\n")
+			} else {
+				_, _ = io.WriteString(w, "0\n")
+			}
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			parts := "127"
+			if partitionQueries.Add(1) == 1 {
+				parts = "128"
+			} else if optimizeStarted.Load() {
+				parts = "1"
+			}
+			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
+		case strings.HasPrefix(query, "ALTER TABLE"):
+			want := "ALTER TABLE `db`.`events` MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 0, max_bytes_to_merge_at_min_space_in_pool = 0"
+			if query != want {
+				t.Errorf("disable automatic merges query = %q, want %q", query, want)
+			}
+			if partitionQueries.Load() < 2 {
+				t.Errorf("disabled automatic merges before background staging reached 127 parts")
+			}
+			automaticMergesDisabled.Store(true)
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			if !automaticMergesDisabled.Load() {
+				t.Errorf("OPTIMIZE started before automatic merges were disabled")
+			}
+			want := "OPTIMIZE TABLE `db`.`events` PARTITION ID '202606' FINAL SETTINGS optimize_throw_if_noop = 1"
+			if query != want {
+				t.Errorf("optimize query = %q, want %q", query, want)
+			}
+			optimizeStarted.Store(true)
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	item := CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}
+	target := mergeWaitTarget{Database: "db", Table: "events"}
+	p := Processor{ClickHouse: chhttp.Client{URL: server.URL}, MergePollInterval: time.Millisecond}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(context.Background(), p, item, target, []PartPartitionStats{{PartitionID: "202606", Parts: 128}}, metrics.PartStats{Count: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !optimizeStarted.Load() {
+		t.Fatal("expected final optimize after background staging")
 	}
 }
 
@@ -177,6 +245,7 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 		}
 		query := string(body)
 		switch {
+		case strings.HasPrefix(query, "ALTER TABLE"):
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
 			requests <- query
 			if optimizeAttempts.Add(1) == 1 {
@@ -186,9 +255,10 @@ func TestNormalizeCompactInputRepeatsOptimizeAfterProgress(t *testing.T) {
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
-			<-optimizeStarted
 			parts := "202606\t1\t50\t500\n202607\t2\t50\t500\n"
-			if optimizeAttempts.Load() > 1 {
+			if optimizeAttempts.Load() == 0 {
+				parts = "202606\t2\t50\t500\n202607\t2\t50\t500\n"
+			} else if optimizeAttempts.Load() > 1 {
 				parts = "202606\t1\t50\t500\n202607\t1\t50\t500\n"
 			}
 			_, _ = io.WriteString(w, parts)
@@ -230,6 +300,7 @@ func TestNormalizeCompactInputRetriesMemoryLimitedObservation(t *testing.T) {
 		}
 		query := string(body)
 		switch {
+		case strings.HasPrefix(query, "ALTER TABLE"):
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			if mergeQueries.Add(1) == 1 {
@@ -271,6 +342,7 @@ func TestNormalizeCompactInputFailsWhenOptimizeMakesNoProgress(t *testing.T) {
 		}
 		query := string(body)
 		switch {
+		case strings.HasPrefix(query, "ALTER TABLE"):
 		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
 			close(optimizeStarted)
 			<-r.Context().Done()
@@ -278,7 +350,6 @@ func TestNormalizeCompactInputFailsWhenOptimizeMakesNoProgress(t *testing.T) {
 		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 			_, _ = io.WriteString(w, "0\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
-			<-optimizeStarted
 			_, _ = io.WriteString(w, "202606\t2\t100\t1000\n")
 		default:
 			t.Errorf("unexpected query: %s", query)

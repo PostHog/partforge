@@ -137,6 +137,11 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 
 func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, target mergeWaitTarget, mergeMaxBlockSizeBytes uint64) error {
 	table := target.tableSQL()
+	partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
+	if err != nil {
+		return fmt.Errorf("find destination partition after memory-limit failure: %w", err)
+	}
+	retryOptimize := compactPartitionsReadyForFinal(partitions)
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+table); err != nil {
 		return fmt.Errorf("stop destination merges after memory-limit failure: %w", err)
 	}
@@ -148,15 +153,23 @@ func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, tar
 		}
 		return fmt.Errorf("reduce merge_max_block_size_bytes after memory-limit merge failure: %w", err)
 	}
+	if retryOptimize {
+		if err := disableAutomaticMerges(ctx, p.ClickHouse, target); err != nil {
+			startErr := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table)
+			if startErr != nil {
+				return fmt.Errorf("disable automatic merges after memory-limit failure: %w; additionally failed to restart merges: %v", err, startErr)
+			}
+			return fmt.Errorf("disable automatic merges after memory-limit failure: %w", err)
+		}
+	}
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table); err != nil {
 		return fmt.Errorf("restart destination merges after memory-limit failure: %w", err)
 	}
-	partitions, err := p.activePartPartitionStats(ctx, target.Database, target.Table)
-	if err != nil {
-		return fmt.Errorf("find destination partition to optimize after memory-limit failure: %w", err)
-	}
-	for _, partition := range partitions {
-		if partition.Parts > 1 {
+	if retryOptimize {
+		for _, partition := range partitions {
+			if partition.Parts <= 1 {
+				continue
+			}
 			runOptimizeAsync(ctx, p.ClickHouse, compactOptimizeQuery(target, partition), chhttp.QueryOptions{})
 			break
 		}

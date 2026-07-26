@@ -98,10 +98,42 @@ func TestObserveCompactProgressHalvesMergeBlockBytesAfterMemoryFailure(t *testin
 	wantRecovery := []string{
 		"SYSTEM STOP MERGES `db`.`events`",
 		"ALTER TABLE `db`.`events` MODIFY SETTING merge_max_block_size_bytes = 4194304",
+		"ALTER TABLE `db`.`events` MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 0, max_bytes_to_merge_at_min_space_in_pool = 0",
 		"SYSTEM START MERGES `db`.`events`",
 	}
 	if !slices.Equal(recoveryQueries, wantRecovery) {
 		t.Fatalf("queries = %#v, want recovery sequence %#v", recoveryQueries, wantRecovery)
+	}
+}
+
+func TestRecoverCompactMergeDoesNotOptimizeAboveVerticalPartLimit(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			_, _ = io.WriteString(w, "202607\t128\t100\t1000\n")
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			t.Errorf("unexpected optimize above vertical merge limit: %s", query)
+		}
+	}))
+	defer server.Close()
+
+	err := recoverCompactMergeAfterMemoryFailure(context.Background(), Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}, mergeWaitTarget{Database: "db", Table: "events"}, 4*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range queries {
+		if strings.Contains(query, "max_bytes_to_merge_at_max_space_in_pool = 0") {
+			t.Fatalf("disabled background staging with 128 parts: %s", query)
+		}
 	}
 }
 
