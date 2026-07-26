@@ -3,6 +3,7 @@ package rewrite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,68 @@ func TestNormalizeCompactInputUsesBackgroundMerges(t *testing.T) {
 	}
 	if partitionQueries != 2 {
 		t.Fatalf("partition queries = %d, want 2", partitionQueries)
+	}
+}
+
+func TestNormalizeCompactInputBoundsForcedOptimizeSourceParts(t *testing.T) {
+	activeParts := 129
+	maxActiveParts := activeParts
+	detaches := 0
+	attaches := 0
+	optimizes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			_, _ = io.WriteString(w, "0\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			_, _ = fmt.Fprintf(w, "202606\t%d\t100\t1000\n", activeParts)
+		case strings.HasPrefix(query, "SELECT partition_id, name FROM system.parts"):
+			for i := range activeParts {
+				_, _ = fmt.Fprintf(w, "202606\tp%03d\n", i)
+			}
+		case strings.HasPrefix(query, "SYSTEM STOP MERGES"), strings.HasPrefix(query, "ALTER TABLE `db`.`events` MODIFY SETTING"), strings.HasPrefix(query, "SYSTEM START MERGES"):
+		case strings.Contains(query, " DETACH PART "):
+			detaches++
+			activeParts--
+		case strings.Contains(query, " ATTACH PART "):
+			attaches++
+			activeParts++
+			maxActiveParts = max(maxActiveParts, activeParts)
+		case strings.HasPrefix(query, "OPTIMIZE TABLE"):
+			optimizes++
+			if activeParts > maxVerticalMergeSourceParts {
+				t.Fatalf("OPTIMIZE saw %d active parts, limit %d", activeParts, maxVerticalMergeSourceParts)
+			}
+			activeParts = 1
+		default:
+			t.Fatalf("unexpected query: %s", query)
+		}
+	}))
+	defer server.Close()
+
+	p := Processor{
+		ClickHouse:         chhttp.Client{URL: server.URL},
+		MergePollInterval:  time.Millisecond,
+		MergeSettleMinWait: time.Millisecond,
+	}
+	err := (Compactor{ClickHouse: p.ClickHouse}).normalizeCompactInput(
+		context.Background(),
+		p,
+		CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"},
+		mergeWaitTarget{Database: "db", Table: "events"},
+		[]PartPartitionStats{{PartitionID: "202606", Parts: 129}},
+		metrics.PartStats{Count: 129},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detaches != 128 || attaches != 128 || optimizes != 2 || activeParts != 1 || maxActiveParts != 129 {
+		t.Fatalf("detaches=%d attaches=%d optimizes=%d active=%d max_active=%d", detaches, attaches, optimizes, activeParts, maxActiveParts)
 	}
 }
 

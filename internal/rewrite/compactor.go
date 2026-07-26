@@ -22,7 +22,10 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
-const compactMaxPartsToMergeAtOnce = 100
+const (
+	compactMaxPartsToMergeAtOnce = 100
+	maxVerticalMergeSourceParts  = 127
+)
 
 type Compactor struct {
 	S3Copy              s3copy.Copier
@@ -370,12 +373,112 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 			return nil
 		}
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
-			return fmt.Errorf("fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
+			if err := c.forceNormalizeCompactInput(ctx, item, target, partitions, inputStats); err != nil {
+				return err
+			}
+			lastParts = activeParts
+			lastProgressAt = time.Now()
+			continue
 		}
 		if err := sleepOrDone(ctx, pollInterval); err != nil {
 			return fmt.Errorf("verify normalized compact output: %w", err)
 		}
 	}
+}
+
+type compactPartitionParts struct {
+	PartitionID string
+	PartNames   []string
+}
+
+func (c Compactor) forceNormalizeCompactInput(ctx context.Context, item CompactWorkItem, target mergeWaitTarget, partitions []PartPartitionStats, inputStats metrics.PartStats) error {
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "optimizing_final", inputStats, compactPartitionMetrics(partitions), nil)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: summarizePartPartitions(partitions), Stage: "optimizing_final"}); err != nil {
+		return err
+	}
+	if err := disableAutomaticCompactMerges(ctx, c.ClickHouse, target); err != nil {
+		return err
+	}
+	partitionParts, err := c.compactActivePartNames(ctx, target)
+	if err != nil {
+		return err
+	}
+
+	table := target.tableSQL()
+	attempt := 0
+	for _, partition := range partitionParts {
+		if len(partition.PartNames) <= 1 {
+			continue
+		}
+		remaining := partition.PartNames
+		if len(remaining) > maxVerticalMergeSourceParts {
+			remaining = remaining[1:]
+			for _, partName := range remaining {
+				if err := c.ClickHouse.Exec(ctx, "ALTER TABLE "+table+" DETACH PART "+chhttp.StringLiteral(partName)); err != nil {
+					return fmt.Errorf("detach compact part %s before bounded optimize: %w", partName, err)
+				}
+			}
+		}
+
+		for len(remaining) > 0 {
+			batchSize := min(len(remaining), maxVerticalMergeSourceParts-1)
+			sourceParts := batchSize + 1
+			if len(partition.PartNames) <= maxVerticalMergeSourceParts {
+				batchSize = len(remaining)
+				sourceParts = batchSize
+			} else {
+				for _, partName := range remaining[:batchSize] {
+					if err := c.ClickHouse.Exec(ctx, "ALTER TABLE "+table+" ATTACH PART "+chhttp.StringLiteral(partName)); err != nil {
+						return fmt.Errorf("reattach compact part %s for bounded optimize: %w", partName, err)
+					}
+				}
+			}
+
+			attempt++
+			slog.Info("forcing bounded compact partition merge", "stage", "optimizing_final", "job_id", item.JobID, "part_id", item.OutputPartID, "partition_id", partition.PartitionID, "source_parts", sourceParts, "attempt", attempt)
+			query := "OPTIMIZE TABLE " + table + " PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " FINAL SETTINGS optimize_throw_if_noop = 1"
+			if err := c.ClickHouse.ExecWithOptions(ctx, query, chhttp.QueryOptions{QueryID: fmt.Sprintf("partforge-%s-%s-bounded-optimize-%d", item.JobID, item.OutputPartID, attempt)}); err != nil {
+				return fmt.Errorf("bounded optimize compact partition %s with %d parts: %w", partition.PartitionID, sourceParts, err)
+			}
+			remaining = remaining[batchSize:]
+		}
+	}
+	return nil
+}
+
+func disableAutomaticCompactMerges(ctx context.Context, clickHouse chhttp.Client, target mergeWaitTarget) error {
+	table := target.tableSQL()
+	if err := clickHouse.Exec(ctx, "SYSTEM STOP MERGES "+table); err != nil {
+		return fmt.Errorf("stop automatic compact merges: %w", err)
+	}
+	if err := clickHouse.Exec(ctx, "ALTER TABLE "+table+" MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 0, max_bytes_to_merge_at_min_space_in_pool = 0"); err != nil {
+		return fmt.Errorf("disable automatic compact merges: %w", err)
+	}
+	if err := clickHouse.Exec(ctx, "SYSTEM START MERGES "+table); err != nil {
+		return fmt.Errorf("restart compact merges for explicit optimize: %w", err)
+	}
+	return nil
+}
+
+func (c Compactor) compactActivePartNames(ctx context.Context, target mergeWaitTarget) ([]compactPartitionParts, error) {
+	query := "SELECT partition_id, name FROM system.parts WHERE database = " + chhttp.StringLiteral(target.Database) +
+		" AND table = " + chhttp.StringLiteral(target.Table) + " AND active ORDER BY partition_id, min_block_number, max_block_number, name FORMAT TSV"
+	out, err := c.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list active compact parts: %w", err)
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 2)
+	if err != nil {
+		return nil, fmt.Errorf("parse active compact parts: %w", err)
+	}
+	var partitions []compactPartitionParts
+	for _, row := range rows {
+		if len(partitions) == 0 || partitions[len(partitions)-1].PartitionID != row[0] {
+			partitions = append(partitions, compactPartitionParts{PartitionID: row[0]})
+		}
+		partitions[len(partitions)-1].PartNames = append(partitions[len(partitions)-1].PartNames, row[1])
+	}
+	return partitions, nil
 }
 
 func compactPartitionsNormalized(input, output []PartPartitionStats) bool {
