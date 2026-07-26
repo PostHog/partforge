@@ -78,7 +78,7 @@ Compactor ClickHouse processes start with a single-threaded `round_robin` merge 
 
 The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, and restarts merges. Above 127 parts, the single background slot retries staging; at or below 127 parts, PartForge disables automatic selection before retrying `OPTIMIZE FINAL`. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
 
-Compaction enables vertical merges with zero activation thresholds and caps ordinary merges at 100 source parts. Because ClickHouse cannot use its vertical algorithm with more than 127 source parts, PartForge waits for ClickHouse's single background merge slot to bring every partition to that limit. It then disables automatic merge selection, waits for the active background merge to drain, and dispatches partition-scoped `OPTIMIZE FINAL` one at a time.
+Compaction enables vertical merges with zero activation thresholds, caps ordinary merges at 100 source parts, and forces parts older than one second through ordinary selection so ClickHouse does not stop at a locally optimal part layout. Because ClickHouse cannot use its vertical algorithm with more than 127 source parts, PartForge waits for ClickHouse's single background merge slot to bring every partition to that limit. It then disables automatic merge selection, waits for the active background merge to drain, and dispatches partition-scoped `OPTIMIZE FINAL` one at a time.
 
 ## Merge Wait
 

@@ -51,6 +51,8 @@ func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.
 	for _, setting := range []string{
 		"merge_max_block_size_bytes = 10485760",
 		"max_parts_to_merge_at_once = 100",
+		"min_age_to_force_merge_seconds = 1",
+		"min_age_to_force_merge_on_partition_only = 0",
 		"enable_vertical_merge_algorithm = 1",
 		"allow_vertical_merges_from_compact_to_wide_parts = 1",
 		"vertical_merge_algorithm_min_rows_to_activate = 0",
