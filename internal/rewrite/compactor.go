@@ -22,10 +22,7 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
-const (
-	compactMaxPartsToMergeAtOnce = 100
-	maxVerticalMergeSourceParts  = 127
-)
+const compactMaxPartsToMergeAtOnce = 100
 
 type Compactor struct {
 	S3Copy              s3copy.Copier
@@ -37,7 +34,6 @@ type Compactor struct {
 	MergeSettleMinParts uint64
 	MergePollInterval   time.Duration
 	MergeDeadline       time.Time
-	OptimizeFinalAfter  time.Duration
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
 	ReportProgress      CompactProgressReporter
@@ -127,7 +123,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		MergeSettleMinWait:  compactMergeSettleMinWait(c.MergeSettleMinWait),
 		MergeSettleMinParts: c.MergeSettleMinParts,
 		MergePollInterval:   c.MergePollInterval,
-		OptimizeFinalAfter:  compactOptimizeFinalAfter(c.OptimizeFinalAfter),
 		MergeTreeSettings:   c.MergeTreeSettings,
 		RestartClickHouse:   c.RestartClickHouse,
 	}
@@ -328,8 +323,8 @@ func compactInputNeedsNormalization(inputs []CompactInput) bool {
 }
 
 func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item CompactWorkItem, target mergeWaitTarget, inputPartitions []PartPartitionStats, inputStats metrics.PartStats) error {
-	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "optimizing_final", inputStats, compactPartitionMetrics(inputPartitions), nil)
-	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: inputStats, Stage: "optimizing_final"}); err != nil {
+	c.metrics().ObserveCompactProgress(item.JobID, item.OutputPartID, "waiting_for_merge_selection", inputStats, compactPartitionMetrics(inputPartitions), nil)
+	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: inputStats, Stage: "waiting_for_merge_selection"}); err != nil {
 		return err
 	}
 	pollInterval := p.MergePollInterval
@@ -341,27 +336,8 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		return fmt.Errorf("normalize compact input merge settle wait must not be negative")
 	}
 
-	attempt := 0
-	optimizeCtx, cancelOptimizes := context.WithCancel(ctx)
-	defer cancelOptimizes()
-	startOptimize := func(partitions []PartPartitionStats) {
-		for _, partition := range partitions {
-			if partition.Parts <= 1 {
-				continue
-			}
-			attempt++
-			query := compactOptimizeQuery(target, partition)
-			runOptimizeAsync(optimizeCtx, c.ClickHouse, query, chhttp.QueryOptions{
-				QueryID: fmt.Sprintf("partforge-%s-%s-optimize-attempt-%d", item.JobID, item.OutputPartID, attempt),
-			})
-			return
-		}
-	}
-
 	lastParts := summarizePartPartitions(inputPartitions).Count
 	lastProgressAt := time.Now()
-	automaticMergesDisabled := false
-	var optimizeStartParts uint64
 
 	for {
 		activeMerges, err := p.destinationMergeCount(ctx, target)
@@ -393,20 +369,6 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 		if activeMerges == 0 && compactPartitionsNormalized(inputPartitions, partitions) {
 			return nil
 		}
-		if !automaticMergesDisabled && activeMerges == 0 && compactPartitionsReadyForFinal(partitions) {
-			if err := disableAutomaticMerges(ctx, c.ClickHouse, target); err != nil {
-				return fmt.Errorf("disable automatic merges before final compact optimization: %w", err)
-			}
-			automaticMergesDisabled = true
-			lastProgressAt = now
-			continue
-		}
-		if automaticMergesDisabled && activeMerges == 0 && (optimizeStartParts == 0 || activeParts < optimizeStartParts) {
-			optimizeStartParts = activeParts
-			lastProgressAt = now
-			startOptimize(partitions)
-			continue
-		}
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
 			return fmt.Errorf("fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
 		}
@@ -414,28 +376,6 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 			return fmt.Errorf("verify normalized compact output: %w", err)
 		}
 	}
-}
-
-func compactPartitionsReadyForFinal(partitions []PartPartitionStats) bool {
-	for _, partition := range partitions {
-		if partition.Parts > maxVerticalMergeSourceParts {
-			return false
-		}
-	}
-	return true
-}
-
-func disableAutomaticMerges(ctx context.Context, clickHouse chhttp.Client, target mergeWaitTarget) error {
-	return clickHouse.Exec(ctx, "ALTER TABLE "+target.tableSQL()+
-		" MODIFY SETTING max_bytes_to_merge_at_max_space_in_pool = 0, max_bytes_to_merge_at_min_space_in_pool = 0")
-}
-
-func compactOptimizeQuery(target mergeWaitTarget, partition PartPartitionStats) string {
-	query := "OPTIMIZE TABLE " + target.tableSQL()
-	if partition.Parts <= maxVerticalMergeSourceParts {
-		query += " PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " FINAL"
-	}
-	return query + " SETTINGS optimize_throw_if_noop = 1"
 }
 
 func compactPartitionsNormalized(input, output []PartPartitionStats) bool {
@@ -720,13 +660,6 @@ func compactMergeTimeoutsForDeadline(timeout, maxTimeout, remaining time.Duratio
 func compactMergeSettleMinWait(wait time.Duration) time.Duration {
 	if wait == 0 {
 		return DefaultCompactMergeSettleMinWait
-	}
-	return wait
-}
-
-func compactOptimizeFinalAfter(wait time.Duration) time.Duration {
-	if wait == 0 {
-		return DefaultCompactOptimizeFinalAfter
 	}
 	return wait
 }

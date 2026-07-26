@@ -1108,37 +1108,37 @@ func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
 func runWorker(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("worker")
 	var (
-		configPath                = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
-		region                    = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
-		s3Endpoint                = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
-		s5cmdBinary               = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
-		stateTable                = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
-		postgresURL               = fs.String("postgres-url", "", "Postgres state store connection URL")
-		postgresIAMAuth           = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
-		clickHouseURL             = fs.String("clickhouse-url", defaultClickHouseURL, "local worker ClickHouse HTTP URL")
-		clickHouseUser            = fs.String("clickhouse-user", "", "local worker ClickHouse HTTP username")
-		clickHousePassword        = fs.String("clickhouse-password", "", "local worker ClickHouse HTTP password")
-		clickHouseBinary          = fs.String("clickhouse-binary", "clickhouse", "path to the clickhouse binary used to start the local server")
-		clickHouseConfigFile      = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "base clickhouse-server config file for the local worker server")
-		once                      = fs.Bool("once", false, "process one rewrite or compaction work item, then exit")
-		pollInterval              = fs.Duration("poll-interval", 10*time.Second, "how long an idle worker sleeps before checking for work again")
-		workerID                  = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
-		workDir                   = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
-		defaultCompressionCodec   = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
-		mergeMaxRuntime           = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
-		role                      = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
-		compact                   = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
-		compactWindow             = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
-		compactOptimizeFinalAfter = fs.Duration("compact-optimize-final-after", rewrite.DefaultCompactOptimizeFinalAfter, "how long compaction waits with mergeable idle parts before running OPTIMIZE FINAL; 0 uses the default")
-		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
-		metricsPath               = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
-		clickHousePrometheusPort  = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")
-		clickHousePrometheusPath  = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "HTTP path where the local worker ClickHouse exposes native Prometheus metrics")
-		clickHouseScrapeTimeout   = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local worker ClickHouse Prometheus metrics")
-		stateProgressInterval     = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to Postgres; <=0 disables progress writes")
+		configPath               = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		region                   = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		s3Endpoint               = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary              = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		stateTable               = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+		postgresURL              = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth          = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		clickHouseURL            = fs.String("clickhouse-url", defaultClickHouseURL, "local worker ClickHouse HTTP URL")
+		clickHouseUser           = fs.String("clickhouse-user", "", "local worker ClickHouse HTTP username")
+		clickHousePassword       = fs.String("clickhouse-password", "", "local worker ClickHouse HTTP password")
+		clickHouseBinary         = fs.String("clickhouse-binary", "clickhouse", "path to the clickhouse binary used to start the local server")
+		clickHouseConfigFile     = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "base clickhouse-server config file for the local worker server")
+		once                     = fs.Bool("once", false, "process one rewrite or compaction work item, then exit")
+		pollInterval             = fs.Duration("poll-interval", 10*time.Second, "how long an idle worker sleeps before checking for work again")
+		workerID                 = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
+		workDir                  = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
+		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
+		mergeMaxRuntime          = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
+		role                     = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
+		compact                  = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
+		compactWindow            = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
+		metricsAddr              = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
+		metricsPath              = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
+		clickHousePrometheusPort = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")
+		clickHousePrometheusPath = fs.String("clickhouse-prometheus-path", defaultClickHousePrometheusPath, "HTTP path where the local worker ClickHouse exposes native Prometheus metrics")
+		clickHouseScrapeTimeout  = fs.Duration("clickhouse-prometheus-scrape-timeout", defaultClickHousePrometheusScrapeTimeout, "timeout for scraping local worker ClickHouse Prometheus metrics")
+		stateProgressInterval    = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to Postgres; <=0 disables progress writes")
 	)
 	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
 	fs.Duration("compact-merge-max-runtime", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
+	fs.Duration("compact-optimize-final-after", 0, "deprecated; ignored. Compaction uses background force merges")
 	fs.Duration("shutdown-grace-period", 0, "deprecated; ignored. Shutdown cancels active inserts immediately and interrupts compact merge waits")
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -1166,9 +1166,6 @@ func runWorker(ctx context.Context, args []string) error {
 	if *compactWindow < 0 {
 		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
 	}
-	if *compactOptimizeFinalAfter < 0 {
-		return fmt.Errorf("compact-optimize-final-after must be non-negative, got %s", *compactOptimizeFinalAfter)
-	}
 	if *clickHouseScrapeTimeout <= 0 {
 		return fmt.Errorf("clickhouse-prometheus-scrape-timeout must be greater than zero, got %s", *clickHouseScrapeTimeout)
 	}
@@ -1187,10 +1184,6 @@ func runWorker(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("build clickhouse prometheus target: %w", err)
 		}
-	}
-	effectiveCompactOptimizeFinalAfter := *compactOptimizeFinalAfter
-	if effectiveCompactOptimizeFinalAfter == 0 {
-		effectiveCompactOptimizeFinalAfter = rewrite.DefaultCompactOptimizeFinalAfter
 	}
 	slog.Info(
 		"worker started",
@@ -1263,7 +1256,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_merge_timeout", rewrite.DefaultCompactMergeTimeout,
 		"compact_merge_max_timeout", *compactWindow,
 		"compact_merge_settle_min_wait", rewrite.DefaultCompactMergeSettleMinWait,
-		"compact_optimize_final_after", effectiveCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
 		"clickhouse_prometheus_enabled", clickHousePrometheusConfig.Enabled,
@@ -1330,7 +1322,6 @@ func runWorker(ctx context.Context, args []string) error {
 					MergeSelectingSleepMS:         mergeTreeSettings.MergeSelectingSleepMS,
 					MergePoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 					CompactWindow:                 *compactWindow,
-					CompactOptimizeFinalAfter:     effectiveCompactOptimizeFinalAfter,
 					CompactLeaseStaleAfter:        compactStaleAfter,
 					CompactHeartbeatInterval:      compactHeartbeatInterval,
 					CompactProgressInterval:       *stateProgressInterval,
@@ -1625,7 +1616,6 @@ type workerCompactionConfig struct {
 	MergeSelectingSleepMS         uint64
 	MergePoolFreeEntriesThreshold uint64
 	CompactWindow                 time.Duration
-	CompactOptimizeFinalAfter     time.Duration
 	CompactLeaseStaleAfter        time.Duration
 	CompactHeartbeatInterval      time.Duration
 	CompactProgressInterval       time.Duration
@@ -1966,7 +1956,6 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 		WorkDir:             runDirs.Scratch,
 		MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
 		MergeDeadline:       compactDeadline,
-		OptimizeFinalAfter:  cfg.CompactOptimizeFinalAfter,
 		MergeTreeSettings: rewrite.MergeTreeSettings{
 			MergeMaxBlockSize:        cfg.MergeMaxBlockSize,
 			MergeMaxBlockSizeBytes:   cfg.MergeMaxBlockSizeBytes,
