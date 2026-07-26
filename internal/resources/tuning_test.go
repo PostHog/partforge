@@ -45,35 +45,6 @@ func TestInsertThreadCount(t *testing.T) {
 	}
 }
 
-func TestMergeBackgroundPoolSize(t *testing.T) {
-	tests := []struct {
-		cpus int
-		want int
-	}{
-		{cpus: 1, want: 1},
-		{cpus: 2, want: 1},
-		{cpus: 4, want: 1},
-		{cpus: 8, want: 2},
-		{cpus: 16, want: 4},
-	}
-
-	for _, tt := range tests {
-		got, err := MergeBackgroundPoolSize(Limits{CPUs: tt.cpus})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != tt.want {
-			t.Fatalf("MergeBackgroundPoolSize(%d CPUs) = %d, want %d", tt.cpus, got, tt.want)
-		}
-	}
-}
-
-func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {
-	if _, err := MergeBackgroundPoolSize(Limits{}); err == nil {
-		t.Fatal("expected invalid cpu count error")
-	}
-}
-
 func TestMergeTreeSettingsForLimits(t *testing.T) {
 	tests := []struct {
 		name      string

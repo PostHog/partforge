@@ -1584,13 +1584,11 @@ func TestHumanizeLogAttrLeavesOtherNumbersRaw(t *testing.T) {
 
 func TestWorkerCompactionClickHouseTuning(t *testing.T) {
 	got := (workerCompactionConfig{
-		MergeBackgroundPoolSize:       2,
-		MergeConcurrencyRatio:         1,
 		MergeSchedulingPolicy:         "round_robin",
 		MergePoolFreeEntriesThreshold: 1,
 	}).clickHouseTuning()
 
-	if got.BackgroundPoolSize != 2 || got.MergeConcurrencyRatio != 1 || got.MergeSchedulingPolicy != "round_robin" || got.MergePoolFreeEntriesThreshold != 1 {
+	if got.BackgroundPoolSize != 1 || got.MergeConcurrencyRatio != 1 || got.MergeSchedulingPolicy != "round_robin" || got.MergePoolFreeEntriesThreshold != 1 {
 		t.Fatalf("compactor ClickHouse tuning = %+v", got)
 	}
 }

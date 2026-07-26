@@ -50,6 +50,8 @@ const defaultClickHousePrometheusPath = "/metrics"
 const defaultClickHousePrometheusScrapeTimeout = 5 * time.Second
 const defaultCompactWindow = 24 * time.Hour
 const compactSourceMergeWaitCap = 5 * time.Minute
+const compactMergeBackgroundPoolSize = 1
+const compactMergeConcurrencyRatio = 1.0
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 const ecsTaskProtectionTimeout = 5 * time.Second
@@ -1232,11 +1234,6 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge settings: %w", err)
 	}
-	mergeBackgroundPoolSize, err := resources.MergeBackgroundPoolSize(workerLimits)
-	if err != nil {
-		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
-	}
-	mergeConcurrencyRatio := 1.0
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
@@ -1250,9 +1247,9 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_memory_usage", insertSettings["max_memory_usage"],
 		"max_memory_usage_raw", insertSettings["max_memory_usage"],
 		"default_compression_codec", *defaultCompressionCodec,
-		"merge_background_pool_size", mergeBackgroundPoolSize,
-		"merge_concurrency_ratio", mergeConcurrencyRatio,
-		"compact_merge_max_concurrent_merges", mergeBackgroundPoolSize,
+		"merge_background_pool_size", compactMergeBackgroundPoolSize,
+		"merge_concurrency_ratio", compactMergeConcurrencyRatio,
+		"compact_merge_max_concurrent_merges", compactMergeBackgroundPoolSize,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
@@ -1327,8 +1324,6 @@ func runWorker(ctx context.Context, args []string) error {
 					S5cmdBinary:                   *s5cmdBinary,
 					S3Endpoint:                    *s3Endpoint,
 					DefaultCompressionCodec:       *defaultCompressionCodec,
-					MergeBackgroundPoolSize:       mergeBackgroundPoolSize,
-					MergeConcurrencyRatio:         mergeConcurrencyRatio,
 					MergeSchedulingPolicy:         mergeTreeSettings.MergeSchedulingPolicy,
 					MergeMaxBlockSize:             mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:        mergeTreeSettings.MergeMaxBlockSizeBytes,
@@ -1624,8 +1619,6 @@ type workerCompactionConfig struct {
 	S5cmdBinary                   string
 	S3Endpoint                    string
 	DefaultCompressionCodec       string
-	MergeBackgroundPoolSize       int
-	MergeConcurrencyRatio         float64
 	MergeSchedulingPolicy         string
 	MergeMaxBlockSize             uint64
 	MergeMaxBlockSizeBytes        uint64
@@ -1643,8 +1636,8 @@ type workerCompactionConfig struct {
 
 func (cfg workerCompactionConfig) clickHouseTuning() chproc.Tuning {
 	return chproc.Tuning{
-		BackgroundPoolSize:            cfg.MergeBackgroundPoolSize,
-		MergeConcurrencyRatio:         cfg.MergeConcurrencyRatio,
+		BackgroundPoolSize:            compactMergeBackgroundPoolSize,
+		MergeConcurrencyRatio:         compactMergeConcurrencyRatio,
 		MergeSchedulingPolicy:         cfg.MergeSchedulingPolicy,
 		MergePoolFreeEntriesThreshold: cfg.MergePoolFreeEntriesThreshold,
 	}
@@ -2013,7 +2006,7 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 			return fmt.Errorf("stop clickhouse before compact restart: %w", err)
 		}
 		server = nil
-		slog.Info("starting local ClickHouse server after compact restart", "stage", "compact_restart_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID, "background_pool_size", cfg.MergeBackgroundPoolSize, "background_merges_mutations_concurrency_ratio", cfg.MergeConcurrencyRatio, "background_merges_mutations_scheduling_policy", cfg.MergeSchedulingPolicy, "merge_pool_free_entries_threshold", cfg.MergePoolFreeEntriesThreshold)
+		slog.Info("starting local ClickHouse server after compact restart", "stage", "compact_restart_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID, "background_pool_size", compactMergeBackgroundPoolSize, "background_merges_mutations_concurrency_ratio", compactMergeConcurrencyRatio, "background_merges_mutations_scheduling_policy", cfg.MergeSchedulingPolicy, "merge_pool_free_entries_threshold", cfg.MergePoolFreeEntriesThreshold)
 		restarted, err := startServer(ctx, cfg.clickHouseTuning())
 		if err != nil {
 			return err

@@ -15,10 +15,8 @@ const (
 	DefaultCompressionCodec               = "ZSTD(5)"
 	insertMemoryUsagePercent       uint64 = 70
 	insertCPUConcurrencyDivisor           = 2
-	mergeCPUConcurrencyDivisor            = 4
 	mergeMemoryBudgetPercent       uint64 = 60
 	mergeMemoryConcurrencyDivisor  uint64 = 8
-	minMergeBackgroundPoolSize            = 1
 	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
 	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
 	defaultMergeMaxBlockSizeBytes  uint64 = 10 * 1024 * 1024
@@ -33,17 +31,6 @@ const (
 type Limits struct {
 	CPUs        int
 	MemoryBytes uint64
-}
-
-func MergeBackgroundPoolSize(limits Limits) (int, error) {
-	if limits.CPUs < 1 {
-		return 0, fmt.Errorf("cpu limit must be at least 1, got %d", limits.CPUs)
-	}
-	poolSize := limits.CPUs / mergeCPUConcurrencyDivisor
-	if poolSize < minMergeBackgroundPoolSize {
-		return minMergeBackgroundPoolSize, nil
-	}
-	return poolSize, nil
 }
 
 type MergeTreeSettings struct {
