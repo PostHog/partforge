@@ -31,7 +31,7 @@ Core metrics:
 - `partforge_compact_merge_progress_ratio`, `partforge_compact_merge_elapsed_seconds`, `partforge_compact_merge_source_parts`
 - `partforge_compact_merge_rows_read`, `partforge_compact_merge_rows_total`, `partforge_compact_merge_bytes_read`, `partforge_compact_merge_bytes_total`
 
-Read/write counters update live while the `INSERT SELECT` runs, polled from the local ClickHouse `system.processes` for the rewrite query id. Active-part gauges come from `system.parts` while those parts are attached. During compaction, the worker independently polls `system.parts` and `system.merges`, including while `OPTIMIZE FINAL` is blocking. A native merge is identified by `job_id`, the stable compact `output_part_id`, `partition_id`, and ClickHouse `result_part_name`. Compact gauges are removed when the batch ends so finished batches do not remain in live Grafana totals.
+Read/write counters update live while the `INSERT SELECT` runs, polled from the local ClickHouse `system.processes` for the rewrite query id. Active-part gauges come from `system.parts` while those parts are attached. During compaction, the worker independently polls `system.parts` and `system.merges` while ClickHouse selects and runs background merges. A native merge is identified by `job_id`, the stable compact `output_part_id`, `partition_id`, and ClickHouse `result_part_name`. Compact gauges are removed when the batch ends so finished batches do not remain in live Grafana totals.
 
 Workers also write a per-part progress heartbeat to Postgres every `15s` (`-state-progress-interval`, `0` disables) so `job-status` reflects progress even during S3 transfer stages.
 

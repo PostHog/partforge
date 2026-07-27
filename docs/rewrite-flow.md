@@ -2,7 +2,7 @@
 
 This document describes the current part rewrite procedure. Source rewrites produce compact-ready artifacts first. Workers then opportunistically compact those artifacts when no source rewrite work is ready, or finalize the remaining compact-ready artifacts after the configured compaction window.
 
-Compaction only normalizes artifacts that contain multiple physical parts in one destination partition. It processes one artifact at a time and schedules partition-scoped `OPTIMIZE FINAL` merges one at a time.
+Compaction only normalizes artifacts that contain multiple physical parts in one destination partition. It processes one artifact at a time and lets ClickHouse select background merges.
 
 ## Job-Level Flow
 
@@ -78,7 +78,7 @@ Compactor ClickHouse processes start with a single-threaded `round_robin` merge 
 
 The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new background `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, and restarts merges. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
 
-Compaction enables vertical merges with zero activation thresholds, caps ordinary merges at 100 source parts, and forces parts older than one second through ordinary selection. If ClickHouse makes no progress for the settle wait, PartForge disables automatic selection and normalizes each remaining partition with bounded `OPTIMIZE FINAL` passes. For a partition above ClickHouse's 127-part vertical-merge limit, it keeps one active carry part, detaches the rest, and reattaches at most 126 parts before each pass.
+Compaction enables vertical merges with zero activation thresholds, caps ordinary merges at 100 source parts, and forces parts older than one second through ordinary selection. PartForge does not force merges. If ClickHouse has no active merge and makes no part-count progress for five minutes, PartForge checkpoints and uploads any reduction; an unchanged part count fails the task.
 
 ## Merge Wait
 
@@ -94,25 +94,26 @@ graph TD
     G -- Yes --> H[Immediately freeze current parts]
     G -- No --> I{Compaction output settled?}
     I -- Yes --> J[Measure compact output]
-    I -- No --> K{Optimize-final idle threshold reached?}
-    K -- Yes --> L[Run OPTIMIZE FINAL locally]
-    L --> A
+    I -- No --> K{No merge or part-count progress for five minutes?}
+    K -- Yes --> L{Part count reduced?}
+    L -- Yes --> J
+    L -- No --> M[Fail compaction]
     K -- No --> E
 ```
 
 Source rewrites stop waiting as soon as `system.merges` reports no active destination merge, then freeze and upload the current destination parts for later compaction. They do not wait for ClickHouse to select another merge. `-merge-max-runtime` remains the hard cap while merges are active; when worker compaction is enabled, that cap is limited to 5 minutes because later compaction work is responsible for deeper consolidation.
 
-Compaction remains more patient: it uses a 15 minute merge inactivity timeout and the remaining `-compact-window` as its hard merge-wait cap. A compact destination with more than one active output part must keep the same part snapshot idle for the settle wait and have no partition with a pair of active parts that can merge under the 150 GiB target before it is treated as settled. If the hard merge wait times out or merge-wait inspection fails, that is not a rewrite failure; the worker logs the reason and continues with the current parts.
+Compaction remains more patient: fragmented inputs reset a five-minute quiet timer whenever a merge is active or the part count changes, and the remaining `-compact-window` is the hard merge-wait cap. Reaching the hard cap stops the wait and measures the current output rather than failing the task.
 
 ## Worker Compaction
 
 When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then looks for a `COMPACT_READY` artifact containing multiple physical parts in one destination partition. It claims only that artifact and normalizes it. Artifacts that already contain one physical ClickHouse part are promoted directly to `FINISHED`; PartForge does not combine multiple artifacts into one compact job.
 
-The compactor downloads and attaches the claimed artifact before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. The worker stops background merges before attach and starts them afterward. Background merging gets the first opportunity to normalize the artifact. After the settle wait without progress, the worker disables automatic selection and runs partition-scoped `OPTIMIZE FINAL` queries one at a time, temporarily detaching parts as needed so no query sees more than 127 active source parts. It then verifies through `system.merges` and `system.parts` that no merge remains and every original destination partition has exactly one active part. It uploads nothing unless that verification succeeds.
+The compactor downloads and attaches the claimed artifact before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. The worker stops background merges before attach and starts them afterward, then relies entirely on ClickHouse's background merge selector. A fully normalized artifact proceeds immediately. After five minutes without an active merge or part-count change, a reduced artifact is uploaded as a new compact checkpoint for another pass; an unchanged artifact fails.
 
 The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the input back to `COMPACT_READY`. The finalization window is measured from the newest current `COMPACT_READY` or `COMPACTING` timestamp. Successful compact outputs inherit the input compact-ready timestamp.
 
-Live compaction workers heartbeat their claimed `COMPACTING` rows. An independent observer polls `system.parts` and `system.merges` every 5 seconds after merge tuning starts, so observation continues while the merge-wait goroutine is blocked in `OPTIMIZE FINAL`. It publishes each current ClickHouse merge and per-partition input/current part shape to Prometheus, and persists the aggregate stage, active merge count, byte-weighted current merge-wave progress, and current physical part count at `-state-progress-interval`. Observation or progress-write failures cancel and release the batch rather than leaving an apparently healthy stale status. Before claiming more compaction work, workers release `COMPACTING` rows whose heartbeat is stale for the derived lease timeout, currently `-compact-window` with a 5 minute floor. Once a job's compact window has expired, workers stop claiming new compact work for that job. Claimed compaction batches use the same compact-window deadline; when it is reached, the worker measures the current output and uploads it if the active part count was reduced, otherwise it releases the input and finalizes it when the job is eligible. Remaining compact-ready artifacts are promoted to `FINISHED` once there is no source work, in-progress rewrite, failed work, or active non-stale compaction for that job. Each compact-ready artifact that already contains one physical ClickHouse part is finalized immediately.
+Live compaction workers heartbeat their claimed `COMPACTING` rows. An independent observer polls `system.parts` and `system.merges` every 5 seconds after merge tuning starts. It publishes each current ClickHouse merge and per-partition input/current part shape to Prometheus, and persists the aggregate stage, active merge count, byte-weighted current merge-wave progress, and current physical part count at `-state-progress-interval`. Observation or progress-write failures cancel and release the batch rather than leaving an apparently healthy stale status. Before claiming more compaction work, workers release `COMPACTING` rows whose heartbeat is stale for the derived lease timeout, currently `-compact-window` with a 5 minute floor. Once a job's compact window has expired, workers stop claiming new compact work for that job. Claimed compaction batches use the same compact-window deadline; when it is reached, including during fragmented-input normalization, the worker measures the current output and uploads it if the active part count was reduced, otherwise it releases the input and finalizes it when the job is eligible. Remaining compact-ready artifacts are promoted to `FINISHED` once there is no source work, in-progress rewrite, failed work, or active non-stale compaction for that job. Each compact-ready artifact that already contains one physical ClickHouse part is finalized immediately.
 
 `job-status` physical part counters refer to ClickHouse parts, not PartForge state rows. Source rows count the attached source part or persisted rewritten destination part count. Compact rows count the physical destination parts that fed that compact output. Live `COMPACTING` rows report the physical parts actually attached into the local compact table as input and the latest active local ClickHouse parts as output while merges are still running. The compact summary reports finalization blockers and ETA, followed by one row per active compacting batch with its sub-stage and current merge-wave progress; `job-status -parts -json` also exposes the persisted compact fields on each claimed input row.
 

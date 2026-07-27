@@ -252,6 +252,18 @@ func TestCompactMergeTimeoutUntil(t *testing.T) {
 	}
 }
 
+func TestFragmentedCompactWaitDeadlineIsNotFatal(t *testing.T) {
+	if fragmentedCompactWaitIsFatal(true, true, context.DeadlineExceeded) {
+		t.Fatal("expected fragmented compaction deadline to continue to output measurement")
+	}
+	if !fragmentedCompactWaitIsFatal(true, false, context.DeadlineExceeded) {
+		t.Fatal("expected an unrelated fragmented compaction deadline to remain fatal")
+	}
+	if !fragmentedCompactWaitIsFatal(true, true, errors.New("merge failed")) {
+		t.Fatal("expected a real fragmented compaction error to remain fatal")
+	}
+}
+
 func TestCompactMergeTimeoutsForDeadlineKeepsIdleTimeout(t *testing.T) {
 	timeout, maxTimeout := compactMergeTimeoutsForDeadline(15*time.Minute, 24*time.Hour, 2*time.Hour)
 

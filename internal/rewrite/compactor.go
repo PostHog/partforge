@@ -210,9 +210,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	if mergeWaitTimeout, ok := compactMergeTimeoutUntil(c.MergeDeadline, time.Now()); ok {
 		deadlineActive = true
 		if mergeWaitTimeout <= 0 {
-			if normalizing {
-				return CompactResult{}, fmt.Errorf("compact merge deadline reached before fragmented input normalization")
-			}
 			waitForMerges = false
 			slog.Info("compact merge deadline reached before destination merge wait; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 		} else {
@@ -251,11 +248,10 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			return CompactResult{}, observerErr
 		}
 		if err != nil {
-			if normalizing {
-				return CompactResult{}, err
-			}
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
+			} else if fragmentedCompactWaitIsFatal(normalizing, deadlineActive, err) {
+				return CompactResult{}, err
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
 				slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
 			} else if c.mergeStopRequested() && errors.Is(err, context.Canceled) {
@@ -651,6 +647,10 @@ func compactMergeTimeoutUntil(deadline, now time.Time) (time.Duration, bool) {
 		return 0, true
 	}
 	return deadline.Sub(now), true
+}
+
+func fragmentedCompactWaitIsFatal(normalizing, deadlineActive bool, err error) bool {
+	return normalizing && !(deadlineActive && errors.Is(err, context.DeadlineExceeded))
 }
 
 func compactMergeTimeoutsForDeadline(timeout, maxTimeout, remaining time.Duration) (time.Duration, time.Duration) {
