@@ -6,13 +6,214 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/PostHog/partforge/internal/artifact"
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/metrics"
+	"github.com/PostHog/partforge/internal/s3copy"
 )
+
+func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
+	for _, tt := range []struct {
+		name                 string
+		deadline             func() time.Time
+		partsAfterFirstQuery uint64
+		wantReduced          bool
+		wantWait             bool
+		checkWait            bool
+		observerError        bool
+		wantError            string
+	}{
+		{
+			name:                 "deadline expires while waiting without progress",
+			deadline:             func() time.Time { return time.Now().Add(time.Second) },
+			partsAfterFirstQuery: 2,
+			wantWait:             true,
+			checkWait:            true,
+		},
+		{
+			name:                 "expired deadline uploads existing reduction",
+			deadline:             func() time.Time { return time.Now().Add(-time.Second) },
+			partsAfterFirstQuery: 1,
+			wantReduced:          true,
+			checkWait:            true,
+		},
+		{
+			name:                 "observer error remains fatal near deadline",
+			deadline:             func() time.Time { return time.Now().Add(time.Second) },
+			partsAfterFirstQuery: 2,
+			observerError:        true,
+			wantError:            "observe compact merge failures",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			dataPath := filepath.Join(root, "clickhouse", "store", "table")
+			diskPath := filepath.Join(root, "clickhouse")
+			inputDir := filepath.Join(root, "input")
+			partDirs := []string{
+				filepath.Join(root, "parts", "202601_1_1_0"),
+				filepath.Join(root, "parts", "202601_2_2_0"),
+			}
+			for _, partDir := range partDirs {
+				createFrozenPart(t, partDir)
+			}
+			if err := artifact.WriteFinishedTar(filepath.Join(inputDir, "input.tar"), partDirs); err != nil {
+				t.Fatal(err)
+			}
+			binary, copyLog := fakeCompactS5cmd(t, inputDir)
+
+			var partitionQueries atomic.Uint64
+			var mergeCountQueries atomic.Uint64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				query := string(body)
+				switch {
+				case strings.HasPrefix(query, "SELECT arrayElement(data_paths"):
+					_, _ = io.WriteString(w, dataPath+"\n")
+				case strings.HasPrefix(query, "SELECT partition_id, count()"):
+					parts := uint64(2)
+					if partitionQueries.Add(1) > 1 {
+						parts = tt.partsAfterFirstQuery
+					}
+					_, _ = io.WriteString(w, "202601\t"+strconv.FormatUint(parts, 10)+"\t20\t200\n")
+				case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+					mergeCountQueries.Add(1)
+					_, _ = io.WriteString(w, "0\n")
+				case strings.Contains(query, "FROM system.part_log"):
+					if tt.observerError {
+						http.Error(w, "merge observer broke", http.StatusInternalServerError)
+					} else {
+						_, _ = io.WriteString(w, "0\t0\t<none>\n")
+					}
+				case strings.HasPrefix(query, "SELECT partition_id, result_part_name"):
+				case strings.HasPrefix(query, "SELECT name, path, type FROM system.disks"):
+					_, _ = io.WriteString(w, "default\t"+diskPath+"\tlocal\n")
+				case strings.Contains(query, " FREEZE WITH NAME '"):
+					marker := " FREEZE WITH NAME '"
+					freezeName := strings.TrimSuffix(query[strings.Index(query, marker)+len(marker):], "'")
+					if err := writeCompactTestPart(filepath.Join(diskPath, "shadow", freezeName, "store", "abc", "def", "202601_1_2_1")); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+					}
+				case query == "SYSTEM FLUSH LOGS",
+					strings.HasPrefix(query, "CREATE DATABASE "),
+					strings.HasPrefix(query, "CREATE TABLE "),
+					strings.HasPrefix(query, "SYSTEM STOP MERGES "),
+					strings.HasPrefix(query, "SYSTEM START MERGES "),
+					strings.HasPrefix(query, "ALTER TABLE "):
+				default:
+					http.Error(w, "unexpected query: "+query, http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			result, err := (Compactor{
+				S3Copy:             s3copy.Copier{Binary: binary},
+				ClickHouse:         chhttp.Client{URL: server.URL},
+				WorkDir:            filepath.Join(root, "work"),
+				MergeSettleMinWait: time.Second,
+				MergePollInterval:  time.Millisecond,
+				MergeDeadline:      tt.deadline(),
+				MergeTreeSettings: MergeTreeSettings{
+					MergeMaxBlockSize:        32768,
+					MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
+					MergeSelectingSleepMS:    1000,
+					PoolFreeEntriesThreshold: 1,
+					DefaultCompressionCodec:  "ZSTD(5)",
+				},
+			}).Compact(context.Background(), CompactWorkItem{
+				JobID:               "job-1",
+				OutputPartID:        "compact-1",
+				OutputFinishedKey:   "finished/compact-1",
+				DestinationDatabase: "db",
+				DestinationTable:    "events",
+				DestinationSchema:   "CREATE TABLE source.events (x UInt64) ENGINE = MergeTree ORDER BY x",
+				Inputs: []CompactInput{{
+					PartID:          "part-1",
+					Bucket:          "bucket",
+					FinishedKey:     "finished/part-1",
+					Parts:           2,
+					Rows:            20,
+					Bytes:           200,
+					PartitionCounts: map[string]uint64{"202601": 2},
+				}},
+			})
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Reduced != tt.wantReduced {
+				t.Fatalf("reduced = %t, want %t", result.Reduced, tt.wantReduced)
+			}
+			if (result.FinishedKey == "finished/compact-1") != tt.wantReduced {
+				t.Fatalf("finished key = %q, want uploaded %t", result.FinishedKey, tt.wantReduced)
+			}
+			if tt.checkWait && (mergeCountQueries.Load() > 0) != tt.wantWait {
+				t.Fatalf("merge count queries = %d, want wait %t", mergeCountQueries.Load(), tt.wantWait)
+			}
+			calls, err := os.ReadFile(copyLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uploaded := false
+			for _, call := range strings.Split(string(calls), "\n") {
+				if strings.Contains(call, " cp ") && strings.HasSuffix(call, " s3://bucket/finished/compact-1/") {
+					uploaded = true
+				}
+			}
+			if uploaded != tt.wantReduced {
+				t.Fatalf("s5cmd calls = %q, uploaded = %t, want %t", calls, uploaded, tt.wantReduced)
+			}
+		})
+	}
+}
+
+func fakeCompactS5cmd(t *testing.T, inputDir string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	logFile := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\n" +
+		"last=''\n" +
+		"for arg in \"$@\"; do last=\"$arg\"; done\n" +
+		"printf '%s\\n' \"$*\" >> " + shellQuote(logFile) + "\n" +
+		"case \"$last\" in\n" +
+		"  s3://*) exit 0 ;;\n" +
+		"  *) cp " + shellQuote(inputDir) + "/*.tar \"$last\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, logFile
+}
+
+func writeCompactTestPart(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for _, name := range []string{"checksums.txt", "columns.txt", "data.bin"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.T) {
 	var queries []string
@@ -213,6 +414,79 @@ func TestNormalizeCompactInputFailsWithoutProgress(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "made no progress") {
 		t.Fatalf("error = %v, want no-progress failure", err)
+	}
+}
+
+func TestNormalizeCompactInputKeepsQuietTimerAliveDuringMerge(t *testing.T) {
+	var mergeQueries atomic.Uint64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+			count := mergeQueries.Add(1)
+			if count <= 10 {
+				_, _ = io.WriteString(w, "1\n")
+			} else {
+				_, _ = io.WriteString(w, "0\n")
+			}
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			parts := "129"
+			if mergeQueries.Load() > 11 {
+				parts = "128"
+			}
+			_, _ = io.WriteString(w, "202606\t"+parts+"\t100\t1000\n")
+		default:
+			http.Error(w, "unexpected query: "+query, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	p := Processor{
+		ClickHouse:         chhttp.Client{URL: server.URL},
+		MergePollInterval:  time.Millisecond,
+		MergeSettleMinWait: 5 * time.Millisecond,
+	}
+	err := (Compactor{}).normalizeCompactInput(
+		context.Background(),
+		p,
+		CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"},
+		mergeWaitTarget{Database: "db", Table: "events"},
+		[]PartPartitionStats{{PartitionID: "202606", Parts: 129}},
+		metrics.PartStats{Count: 129},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mergeQueries.Load() <= 11 {
+		t.Fatalf("merge queries = %d, expected merge completion and later part reduction", mergeQueries.Load())
+	}
+}
+
+func TestCompactPartitionsNormalizedRequiresSameSinglePartPartitions(t *testing.T) {
+	input := []PartPartitionStats{
+		{PartitionID: "202601", Parts: 4},
+		{PartitionID: "202602", Parts: 3},
+	}
+	for _, tt := range []struct {
+		name   string
+		output []PartPartitionStats
+		want   bool
+	}{
+		{name: "same partitions", output: []PartPartitionStats{{PartitionID: "202602", Parts: 1}, {PartitionID: "202601", Parts: 1}}, want: true},
+		{name: "fragment remains", output: []PartPartitionStats{{PartitionID: "202601", Parts: 2}, {PartitionID: "202602", Parts: 1}}},
+		{name: "partition missing", output: []PartPartitionStats{{PartitionID: "202601", Parts: 1}}},
+		{name: "partition replaced", output: []PartPartitionStats{{PartitionID: "202601", Parts: 1}, {PartitionID: "202603", Parts: 1}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := compactPartitionsNormalized(input, tt.output); got != tt.want {
+				t.Fatalf("compactPartitionsNormalized() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

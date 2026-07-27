@@ -7,10 +7,87 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/metrics"
 )
+
+func TestObserveCompactProgressRecoversMemoryLimitedMerge(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		switch {
+		case query == "SYSTEM FLUSH LOGS",
+			strings.HasPrefix(query, "SYSTEM STOP MERGES "),
+			strings.HasPrefix(query, "SYSTEM START MERGES "),
+			strings.HasPrefix(query, "ALTER TABLE "):
+		case strings.Contains(query, "FROM system.part_log"):
+			_, _ = io.WriteString(w, "1\t1\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
+		case strings.HasPrefix(query, "SELECT partition_id, count()"):
+			_, _ = io.WriteString(w, "202601\t2\t20\t200\n")
+		case strings.HasPrefix(query, "SELECT partition_id, result_part_name"):
+		default:
+			http.Error(w, "unexpected query: "+query, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := (Compactor{
+		ProgressInterval: time.Nanosecond,
+		ReportProgress: func(context.Context, CompactWorkItem, CompactProgressSnapshot) error {
+			cancel()
+			return nil
+		},
+	}).observeCompactProgress(ctx, Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSizeBytes: 8 * 1024 * 1024,
+		},
+	}, CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsQueryWith(queries, "MODIFY SETTING merge_max_block_size_bytes = 4194304") {
+		t.Fatalf("queries = %#v, want merge block bytes halved after memory failure", queries)
+	}
+}
+
+func TestObserveCompactProgressFailsAtMinimumAfterMemoryLimitedMerge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case query == "SYSTEM FLUSH LOGS":
+		case strings.Contains(query, "FROM system.part_log"):
+			_, _ = io.WriteString(w, "1\t1\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
+		default:
+			http.Error(w, "unexpected query: "+query, http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	err := (Compactor{}).observeCompactProgress(context.Background(), Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSizeBytes: minAdaptiveMergeMaxBlockSizeBytes,
+		},
+	}, CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 2})
+	if err == nil || !strings.Contains(err.Error(), "already at minimum") {
+		t.Fatalf("error = %v, want minimum merge block size failure", err)
+	}
+}
 
 func TestObserveCompactProgressFailsAfterThreeNonMemoryMergeFailures(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

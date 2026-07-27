@@ -77,11 +77,11 @@ assert_worker_insert_memory_settings() {
   fi
 }
 
+docker compose down --remove-orphans >/dev/null 2>&1 || true
 rm -rf "$ROOT/.e2e"
 mkdir -p "$DATA_DIR"
 chmod -R a+rwx "$ROOT/.e2e"
 
-docker compose down --remove-orphans >/dev/null 2>&1 || true
 if [[ "${PARTFORGE_E2E_SKIP_BUILD:-}" != "1" ]]; then
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose build worker
 fi
@@ -190,44 +190,80 @@ for i in $(seq 1 "$part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -role=inserter \
+    -merge-max-runtime=1ns \
     -s3-endpoint=http://localstack:4566 \
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
 done
 
-for i in $(seq 1 6); do
-  compact_log="$ROOT/.e2e/compact-${i}.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
-    worker \
-    -role=compactor \
-    -s3-endpoint=http://localstack:4566 \
-    -postgres-url="$POSTGRES_URL" \
-    -compact-window=0s \
-    -compact-optimize-final-after=1s \
-    -once 2>&1 | tee "$compact_log"
+normalized_finalize_log="$ROOT/.e2e/compact-normalized-finalize.log"
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  worker \
+  -role=compactor \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL" \
+  -compact-window=1h \
+  -once 2>&1 | tee "$normalized_finalize_log"
 
-  status="$(
-    CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
-      job-status \
-      -job-id="$JOB_ID" \
-      -postgres-url="$POSTGRES_URL" |
-      sed -n 's/^status: //p'
-  )"
-  if [[ "$status" == "READY_FOR_IMPORT" ]]; then
-    break
-  fi
-done
+if ! grep -F "finalized compact-ready artifacts" "$normalized_finalize_log" >/dev/null; then
+  echo "expected compact worker to finalize normalized artifact" >&2
+  exit 1
+fi
+
+compact_log="$ROOT/.e2e/compact-merge.log"
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  worker \
+  -role=compactor \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL" \
+  -compact-window=1h \
+  -once 2>&1 | tee "$compact_log"
+
+if ! grep -F "claimed compact-ready batch" "$compact_log" >/dev/null; then
+  echo "expected compact worker to claim fragmented artifact" >&2
+  exit 1
+fi
+if ! grep -F "completed compact batch" "$compact_log" >/dev/null; then
+  echo "expected compact worker to complete fragmented artifact" >&2
+  exit 1
+fi
+
+compact_status="$(
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    job-status \
+    -job-id="$JOB_ID" \
+    -parts \
+    -postgres-url="$POSTGRES_URL"
+)"
+if ! grep -E '^compact-[^[:space:]]+[[:space:]]+COMPACT_READY' <<<"$compact_status" >/dev/null; then
+  echo "job-status did not contain compact checkpoint; output:" >&2
+  echo "$compact_status" >&2
+  exit 1
+fi
+
+finalize_log="$ROOT/.e2e/compact-finalize.log"
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  worker \
+  -role=compactor \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL" \
+  -compact-window=0s \
+  -once 2>&1 | tee "$finalize_log"
+
+status="$(
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    job-status \
+    -job-id="$JOB_ID" \
+    -postgres-url="$POSTGRES_URL" |
+    sed -n 's/^status: //p'
+)"
 
 if [[ "${status:-}" != "READY_FOR_IMPORT" ]]; then
   echo "job did not reach READY_FOR_IMPORT; status=${status:-<empty>}" >&2
   exit 1
 fi
-if grep -h "claimed compact-ready batch" "$ROOT"/.e2e/compact-*.log >/dev/null; then
-  echo "compact worker unexpectedly combined normalized artifacts" >&2
-  exit 1
-fi
-if ! grep -h "finalized compact-ready artifacts" "$ROOT"/.e2e/compact-*.log >/dev/null; then
+if ! grep -F "finalized compact-ready artifacts" "$finalize_log" >/dev/null; then
   echo "expected compact worker to finalize normalized artifacts" >&2
   exit 1
 fi

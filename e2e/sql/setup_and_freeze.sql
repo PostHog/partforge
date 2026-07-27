@@ -18,10 +18,10 @@ ORDER BY id;
 SYSTEM STOP MERGES src.events;
 
 INSERT INTO src.events VALUES
-    (1, 'alpha', 10, '2024-01-01'),
-    (2, 'bravo', 20, '2024-01-02');
+	(1, 'alpha', 10, '2024-01-01');
 
 INSERT INTO src.events VALUES
+	(2, 'bravo', 20, '2024-01-02'),
     (3, 'charlie', 30, '2024-01-03'),
     (4, 'delta', 40, '2024-01-04');
 
