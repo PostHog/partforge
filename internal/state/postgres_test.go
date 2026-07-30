@@ -125,6 +125,7 @@ func TestSelectCompactBatchPartsNormalizesIdlePartitionFirst(t *testing.T) {
 			{
 				PartID:                     "busy",
 				DestinationActivePartCount: 2,
+				DestinationActivePartBytes: 1000,
 				DestinationActivePartitionCounts: map[string]uint64{
 					"busy": 2,
 				},
@@ -132,6 +133,7 @@ func TestSelectCompactBatchPartsNormalizesIdlePartitionFirst(t *testing.T) {
 			{
 				PartID:                     "idle",
 				DestinationActivePartCount: 2,
+				DestinationActivePartBytes: 100,
 				DestinationActivePartitionCounts: map[string]uint64{
 					"idle": 2,
 				},
@@ -142,6 +144,40 @@ func TestSelectCompactBatchPartsNormalizesIdlePartitionFirst(t *testing.T) {
 
 	if len(selected) != 1 || selected[0].PartID != "idle" {
 		t.Fatalf("selected = %+v, want idle fragmented artifact alone", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsChoosesLargestEligibleArtifact(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "small",
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition": 2,
+			},
+		},
+		{
+			PartID:                     "large",
+			DestinationActivePartBytes: 1000,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition": 2,
+			},
+		},
+	}}, CompactClaimOptions{})
+
+	if len(selected) != 1 || selected[0].PartID != "large" {
+		t.Fatalf("selected = %+v, want largest eligible artifact", selected)
+	}
+}
+
+func TestCompactCandidateSelectionsOrdersLargestAcrossGroups(t *testing.T) {
+	selections := compactCandidateSelections([]compactGroup{
+		{parts: []Part{{PartID: "small", DestinationActivePartBytes: 100, DestinationActivePartitionCounts: map[string]uint64{"partition": 2}}}},
+		{parts: []Part{{PartID: "large", DestinationActivePartBytes: 1000, DestinationActivePartitionCounts: map[string]uint64{"partition": 2}}}},
+	}, CompactClaimOptions{})
+
+	if len(selections) != 2 || selections[0][0].PartID != "large" {
+		t.Fatalf("selections = %+v, want largest group candidate first", selections)
 	}
 }
 
@@ -297,6 +333,22 @@ func TestValidatePartRejectsPartialSourceRef(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "source_job_id and source_part_id") {
 		t.Fatalf("error = %v, want source ref error", err)
+	}
+}
+
+func TestPartJSONPreservesSourceArtifactBytes(t *testing.T) {
+	part := NewPart("job-1", "part-1", "bucket", "source/part-1", "finished/part-1", time.Now().UTC())
+	part.SourceArtifactBytes = 1234
+	data, err := partJSON(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := partFromJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SourceArtifactBytes != part.SourceArtifactBytes {
+		t.Fatalf("source artifact bytes = %d, want %d", got.SourceArtifactBytes, part.SourceArtifactBytes)
 	}
 }
 

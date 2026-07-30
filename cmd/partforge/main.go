@@ -820,6 +820,7 @@ func registerSourcePartsFromJob(ctx context.Context, store *state.Store, copier 
 		sourceOwnerJobID, sourceOwnerPartID := sourcePartRef(sourcePart)
 		part := state.NewPart(params.JobID, partID, params.Bucket, sourcePart.SourceKey, manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID), time.Now().UTC())
 		part.JobName = params.JobName
+		part.SourceArtifactBytes = sourcePart.SourceArtifactBytes
 		part.SourceJobID = sourceOwnerJobID
 		part.SourcePartID = sourceOwnerPartID
 		part.DestinationDatabase = params.Dest.Database
@@ -1001,6 +1002,7 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 
 	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
 	partState.JobName = params.JobName
+	partState.SourceArtifactBytes = partStats.Bytes
 	slog.Info("registering source part", "stage", "register_parts", "job_id", params.JobID, "worker_id", workerID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
 	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
 		return uploadPartResult{}, fmt.Errorf("create state for %s: %w", sourceKey, err)

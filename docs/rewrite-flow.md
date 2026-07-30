@@ -60,7 +60,7 @@ graph TD
     U --> V[Mark part COMPACT_READY]
 ```
 
-The insert-select step has its own resource retry loop. The worker caps query memory at 70% of detected memory and initially sets `max_threads` and `max_insert_threads` to half the detected CPU count. ClickHouse's native insert block-size settings remain in effect. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
+`upload-freeze` records each source artifact's on-disk byte size, and rewrite workers claim the largest `READY` artifact first. The insert-select step has its own resource retry loop. The worker caps query memory at 70% of detected memory and initially sets `max_threads` and `max_insert_threads` to half the detected CPU count. ClickHouse's native insert block-size settings remain in effect. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
 
 ## Destination Merge Settings
 
@@ -107,7 +107,7 @@ Compaction remains more patient: fragmented inputs reset a five-minute quiet tim
 
 ## Worker Compaction
 
-When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then looks for a `COMPACT_READY` artifact containing multiple physical parts in one destination partition. It claims only that artifact and normalizes it. Artifacts that already contain one physical ClickHouse part are promoted directly to `FINISHED`; PartForge does not combine multiple artifacts into one compact job.
+When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then looks for a `COMPACT_READY` artifact containing multiple physical parts in one destination partition. It preserves the partition-collision rules, then claims the eligible artifact with the largest persisted destination byte size and normalizes it. Artifacts that already contain one physical ClickHouse part are promoted directly to `FINISHED`; PartForge does not combine multiple artifacts into one compact job.
 
 The compactor downloads and attaches the claimed artifact before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. The worker stops background merges before attach and starts them afterward, then relies entirely on ClickHouse's background merge selector. A fully normalized artifact proceeds immediately. After five minutes without an active merge or part-count change, a reduced artifact is uploaded as a new compact checkpoint for another pass; an unchanged artifact fails.
 

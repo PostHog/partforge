@@ -185,6 +185,15 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   -job-id="$COPY_JOB_ID" \
   -postgres-url="$POSTGRES_URL"
 
+largest_source_part_id="$(
+  docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+    "SELECT part_id FROM partforge_state WHERE job_id = '$JOB_ID' ORDER BY COALESCE((data->>'source_artifact_bytes')::bigint, 0) DESC, created_at, job_id, part_id LIMIT 1"
+)"
+if [[ -z "$largest_source_part_id" ]]; then
+  echo "could not determine largest source part" >&2
+  exit 1
+fi
+
 for i in $(seq 1 "$part_count"); do
   worker_log="$ROOT/.e2e/worker-${i}.log"
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
@@ -195,6 +204,10 @@ for i in $(seq 1 "$part_count"); do
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  if (( i == 1 )) && ! grep -F "claimed ready part" "$worker_log" | grep -F "part_id=$largest_source_part_id" >/dev/null; then
+    echo "first worker did not claim largest source part $largest_source_part_id" >&2
+    exit 1
+  fi
 done
 
 normalized_finalize_log="$ROOT/.e2e/compact-normalized-finalize.log"

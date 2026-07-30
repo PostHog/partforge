@@ -87,6 +87,7 @@ type Part struct {
 	Attempts       int    `json:"attempts"`
 	Error          string `json:"error,omitempty"`
 
+	SourceArtifactBytes  uint64   `json:"source_artifact_bytes,omitempty"`
 	DestinationDatabase  string   `json:"destination_database,omitempty"`
 	DestinationTable     string   `json:"destination_table,omitempty"`
 	DestinationSchema    string   `json:"destination_schema,omitempty"`
@@ -590,7 +591,7 @@ func (s *Store) ClaimNextReady(ctx context.Context, workerID string, now time.Ti
 	defer tx.Rollback(ctx)
 
 	var data []byte
-	err = tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE status = $1 ORDER BY created_at, job_id, part_id LIMIT 1 FOR UPDATE SKIP LOCKED`, string(StatusReady)).Scan(&data)
+	err = tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE status = $1 ORDER BY COALESCE((data->>'source_artifact_bytes')::bigint, 0) DESC, created_at, job_id, part_id LIMIT 1 FOR UPDATE SKIP LOCKED`, string(StatusReady)).Scan(&data)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -628,11 +629,7 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 	}
 
 	groups := compactCandidateGroups(candidates, compacting, opts)
-	for _, group := range groups {
-		selected := selectCompactBatchParts(group, opts)
-		if len(selected) == 0 {
-			continue
-		}
+	for _, selected := range compactCandidateSelections(groups, opts) {
 		claimed, err := s.claimCompactParts(ctx, selected, workerID, now)
 		if IsConditionalCheckFailed(err) {
 			continue
@@ -648,6 +645,19 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 		return batch, nil
 	}
 	return nil, nil
+}
+
+func compactCandidateSelections(groups []compactGroup, opts CompactClaimOptions) [][]Part {
+	selections := make([][]Part, 0, len(groups))
+	for _, group := range groups {
+		if selected := selectCompactBatchParts(group, opts); len(selected) > 0 {
+			selections = append(selections, selected)
+		}
+	}
+	sort.SliceStable(selections, func(i, j int) bool {
+		return selections[i][0].DestinationActivePartBytes > selections[j][0].DestinationActivePartBytes
+	})
+	return selections
 }
 
 func (s *Store) listPartsByStatusIndex(ctx context.Context, status Status) ([]Part, error) {
@@ -1130,6 +1140,8 @@ func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Par
 }
 
 func selectFragmentedCompactPart(parts []Part, partitions []string) (Part, bool) {
+	var selected Part
+	found := false
 	for _, part := range parts {
 		eligible := false
 		for _, partitionID := range partitions {
@@ -1141,13 +1153,16 @@ func selectFragmentedCompactPart(parts []Part, partitions []string) (Part, bool)
 		if !eligible {
 			continue
 		}
+		fragmented := false
 		for _, count := range part.DestinationActivePartitionCounts {
-			if count > 1 {
-				return part, true
-			}
+			fragmented = fragmented || count > 1
+		}
+		if fragmented && (!found || part.DestinationActivePartBytes > selected.DestinationActivePartBytes) {
+			selected = part
+			found = true
 		}
 	}
-	return Part{}, false
+	return selected, found
 }
 
 func partitionsWithout(partitions, excluded []string) []string {
