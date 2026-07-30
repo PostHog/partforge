@@ -43,6 +43,16 @@ func TestReduceInsertSelectThreadSettings(t *testing.T) {
 	}
 }
 
+func TestParseQueryProgressIncludesTotalRowsApprox(t *testing.T) {
+	progress, found, err := parseQueryProgress("25\t250\t100\t20\t200\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || progress.ReadRows != 25 || progress.TotalRowsApprox != 100 || progress.WrittenRows != 20 {
+		t.Fatalf("progress = %+v, found = %t", progress, found)
+	}
+}
+
 func TestValidateWorkItemSourceOverrideRequiresDestinationSQL(t *testing.T) {
 	err := validateWorkItemSourceOverride(WorkItem{
 		JobID:        "job-copy",

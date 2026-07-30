@@ -33,6 +33,14 @@ func TestMarkCompactPartFailed(t *testing.T) {
 	}
 }
 
+func TestClearRewriteProgressClearsTotalRowsApprox(t *testing.T) {
+	part := Part{ReadRows: 25, TotalRowsApprox: 100}
+	clearRewriteProgress(&part)
+	if part.ReadRows != 0 || part.TotalRowsApprox != 0 {
+		t.Fatalf("part retained rewrite progress: %+v", part)
+	}
+}
+
 func TestFailedRetryTarget(t *testing.T) {
 	tests := []struct {
 		name string

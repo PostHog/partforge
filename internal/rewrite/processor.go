@@ -1397,7 +1397,7 @@ func (p Processor) destinationFailedMergeCount(ctx context.Context, target merge
 }
 
 func (p Processor) queryProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {
-	query := "SELECT read_rows, read_bytes, written_rows, written_bytes FROM system.processes WHERE query_id = " +
+	query := "SELECT read_rows, read_bytes, total_rows_approx, written_rows, written_bytes FROM system.processes WHERE query_id = " +
 		chhttp.StringLiteral(queryID) + " FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
@@ -1410,7 +1410,7 @@ func (p Processor) queryLogProgress(ctx context.Context, queryID string) (metric
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
 		return metrics.QueryProgress{}, false, err
 	}
-	query := "SELECT read_rows, read_bytes, written_rows, written_bytes FROM system.query_log WHERE query_id = " +
+	query := "SELECT read_rows, read_bytes, read_rows, written_rows, written_bytes FROM system.query_log WHERE query_id = " +
 		chhttp.StringLiteral(queryID) + " AND type = 'QueryFinish' ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
@@ -1420,7 +1420,7 @@ func (p Processor) queryLogProgress(ctx context.Context, queryID string) (metric
 }
 
 func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
-	rows, err := chhttp.FormatTSVStrings(out, 4)
+	rows, err := chhttp.FormatTSVStrings(out, 5)
 	if err != nil {
 		return metrics.QueryProgress{}, false, err
 	}
@@ -1438,19 +1438,24 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 	if err != nil {
 		return metrics.QueryProgress{}, false, err
 	}
-	writtenRows, err := chhttp.ParseUInt(rows[0][2])
+	totalRowsApprox, err := chhttp.ParseUInt(rows[0][2])
 	if err != nil {
 		return metrics.QueryProgress{}, false, err
 	}
-	writtenBytes, err := chhttp.ParseUInt(rows[0][3])
+	writtenRows, err := chhttp.ParseUInt(rows[0][3])
+	if err != nil {
+		return metrics.QueryProgress{}, false, err
+	}
+	writtenBytes, err := chhttp.ParseUInt(rows[0][4])
 	if err != nil {
 		return metrics.QueryProgress{}, false, err
 	}
 	return metrics.QueryProgress{
-		ReadRows:     readRows,
-		ReadBytes:    readBytes,
-		WrittenRows:  writtenRows,
-		WrittenBytes: writtenBytes,
+		ReadRows:        readRows,
+		ReadBytes:       readBytes,
+		TotalRowsApprox: totalRowsApprox,
+		WrittenRows:     writtenRows,
+		WrittenBytes:    writtenBytes,
 	}, true, nil
 }
 

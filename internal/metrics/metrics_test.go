@@ -6,7 +6,31 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/PostHog/partforge/internal/manifest"
 )
+
+func TestQueryProgressMetricsIncludeAndClearTotalRowsApprox(t *testing.T) {
+	prom := NewPrometheus()
+	m := manifest.Manifest{JobID: "job-1", PartID: "part-1"}
+	prom.ObserveProgress(m, QueryProgress{}, QueryProgress{ReadRows: 25, TotalRowsApprox: 100})
+
+	body := compactMetricsBody(t, prom)
+	for _, want := range []string{
+		`partforge_current_read_rows{job_id="job-1",part_id="part-1"} 25`,
+		`partforge_current_total_rows_approx{job_id="job-1",part_id="part-1"} 100`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, body)
+		}
+	}
+
+	prom.ClearCurrentProgress(m)
+	body = compactMetricsBody(t, prom)
+	if !strings.Contains(body, `partforge_current_total_rows_approx{job_id="job-1",part_id="part-1"} 0`) {
+		t.Fatalf("metrics body did not clear total rows estimate:\n%s", body)
+	}
+}
 
 func TestCompactProgressMetricsReconcileAndClear(t *testing.T) {
 	prom := NewPrometheus()

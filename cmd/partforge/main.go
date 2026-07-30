@@ -3711,10 +3711,11 @@ func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 	var progress state.RewriteProgress
 	if snapshot.QueryProgress != nil {
 		progress.QueryProgress = &state.QueryProgress{
-			ReadRows:     snapshot.QueryProgress.ReadRows,
-			ReadBytes:    snapshot.QueryProgress.ReadBytes,
-			WrittenRows:  snapshot.QueryProgress.WrittenRows,
-			WrittenBytes: snapshot.QueryProgress.WrittenBytes,
+			ReadRows:        snapshot.QueryProgress.ReadRows,
+			ReadBytes:       snapshot.QueryProgress.ReadBytes,
+			TotalRowsApprox: snapshot.QueryProgress.TotalRowsApprox,
+			WrittenRows:     snapshot.QueryProgress.WrittenRows,
+			WrittenBytes:    snapshot.QueryProgress.WrittenBytes,
 		}
 	}
 	if snapshot.SourceActivePartStats != nil {
@@ -3757,6 +3758,7 @@ type jobSummary struct {
 	Counts                       map[state.Status]int     `json:"counts"`
 	StatePartStats               []statusPartStats        `json:"-"`
 	InProgressStages             []inProgressStageCount   `json:"in_progress_stages,omitempty"`
+	ActiveRewrites               []activeRewriteSummary   `json:"active_rewrites,omitempty"`
 	Compact                      *compactJobSummary       `json:"compact,omitempty"`
 	CompactingBatches            []compactingBatchSummary `json:"compacting_batches,omitempty"`
 	RewriteCompleted             int                      `json:"rewrite_completed"`
@@ -3788,6 +3790,17 @@ type compactJobSummary struct {
 	BlockedBy        []statusCount `json:"blocked_by,omitempty"`
 	BlockedByMessage string        `json:"blocked_by_message,omitempty"`
 	Reason           string        `json:"reason,omitempty"`
+}
+
+type activeRewriteSummary struct {
+	PartID            string   `json:"part_id"`
+	WorkerID          string   `json:"worker_id,omitempty"`
+	Stage             string   `json:"stage"`
+	Elapsed           string   `json:"elapsed"`
+	ReadRows          uint64   `json:"read_rows"`
+	TotalRowsApprox   uint64   `json:"total_rows_approx"`
+	ProgressPercent   *float64 `json:"progress_percent,omitempty"`
+	ProgressUpdatedAt string   `json:"progress_updated_at,omitempty"`
 }
 
 type compactingBatchSummary struct {
@@ -3989,6 +4002,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 	stateOutputParts := map[state.Status]uint64{}
 	seenCompactProgress := map[string]struct{}{}
 	var compactingBatches []compactingBatchSummary
+	var activeRewrites []activeRewriteSummary
 	for _, part := range parts {
 		counts[part.Status]++
 		if !isGeneratedCompactPart(part) {
@@ -4035,6 +4049,16 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 			stageCounts[stage]++
 			stageInputParts[stage] += partInputParts
 			stageOutputParts[stage] += partOutputParts
+			activeRewrites = append(activeRewrites, activeRewriteSummary{
+				PartID:            part.PartID,
+				WorkerID:          part.WorkerID,
+				Stage:             stage,
+				Elapsed:           formatDurationMs(part.RewriteTotalElapsedMs),
+				ReadRows:          part.ReadRows,
+				TotalRowsApprox:   part.TotalRowsApprox,
+				ProgressPercent:   rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox),
+				ProgressUpdatedAt: part.ProgressUpdatedAt,
+			})
 		}
 		if part.Status == state.StatusFailed {
 			failed = append(failed, failedPart{
@@ -4054,6 +4078,9 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		}
 		return compactingBatches[i].WorkerID < compactingBatches[j].WorkerID
 	})
+	sort.Slice(activeRewrites, func(i, j int) bool {
+		return activeRewrites[i].PartID < activeRewrites[j].PartID
+	})
 
 	total := len(parts)
 	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusSuperseded] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
@@ -4065,6 +4092,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		Counts:                       counts,
 		StatePartStats:               statePartStats(counts, stateInputParts, stateOutputParts),
 		InProgressStages:             inProgressStageCounts(stageCounts, stageInputParts, stageOutputParts),
+		ActiveRewrites:               activeRewrites,
 		Compact:                      compactSummary(parts, counts, opts),
 		CompactingBatches:            compactingBatches,
 		RewriteCompleted:             rewriteCompleted,
@@ -4080,6 +4108,17 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		FailedMerges:                 failedMerges,
 		FailedParts:                  failed,
 	}
+}
+
+func rewriteProgressPercent(readRows, totalRowsApprox uint64) *float64 {
+	if totalRowsApprox == 0 {
+		return nil
+	}
+	progress := float64(readRows) / float64(totalRowsApprox) * 100
+	if progress > 100 {
+		progress = 100
+	}
+	return &progress
 }
 
 func statePartStats(counts map[state.Status]int, inputParts, outputParts map[state.Status]uint64) []statusPartStats {
@@ -4369,6 +4408,20 @@ func printJobSummary(out *os.File, summary jobSummary) {
 		_ = tw.Flush()
 	}
 
+	if len(summary.ActiveRewrites) > 0 {
+		fmt.Fprintln(out, "\nACTIVE REWRITES")
+		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "PART_ID\tWORKER\tSTAGE\tELAPSED\tREAD_ROWS\tTOTAL_ROWS_APPROX\tSELECT_PROGRESS\tPROGRESS_AT")
+		for _, active := range summary.ActiveRewrites {
+			progress := "-"
+			if active.ProgressPercent != nil {
+				progress = fmt.Sprintf("%.1f%%", *active.ProgressPercent)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\n", active.PartID, active.WorkerID, active.Stage, active.Elapsed, active.ReadRows, active.TotalRowsApprox, progress, active.ProgressUpdatedAt)
+		}
+		_ = tw.Flush()
+	}
+
 	if len(summary.CompactingBatches) > 0 {
 		fmt.Fprintln(out, "\nCOMPACTING BATCHES")
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -4442,17 +4495,23 @@ func printPartRowsWithLookup(out *os.File, parts []state.Part, lookupParts []sta
 	now := time.Now().UTC()
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tPARTITIONS\tFAILED_MERGES\tSETTLE_WAIT\tCOMPACT_READY_FOR\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tTOTAL_ROWS_APPROX\tSELECT_PROGRESS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tPARTITIONS\tFAILED_MERGES\tSETTLE_WAIT\tCOMPACT_READY_FOR\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
+		progress := "-"
+		if progressPercent := rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox); progressPercent != nil {
+			progress = fmt.Sprintf("%.1f%%", *progressPercent)
+		}
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
 			part.WorkerID,
 			part.ReadRows,
+			part.TotalRowsApprox,
+			progress,
 			formatBytes(part.ReadBytes),
 			part.WrittenRows,
 			formatBytes(part.WrittenBytes),

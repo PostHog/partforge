@@ -112,6 +112,7 @@ type Part struct {
 	ProgressUpdatedAt                string            `json:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `json:"read_rows,omitempty"`
 	ReadBytes                        uint64            `json:"read_bytes,omitempty"`
+	TotalRowsApprox                  uint64            `json:"total_rows_approx,omitempty"`
 	WrittenRows                      uint64            `json:"written_rows,omitempty"`
 	WrittenBytes                     uint64            `json:"written_bytes,omitempty"`
 	SourceActivePartCount            uint64            `json:"source_active_part_count,omitempty"`
@@ -141,10 +142,11 @@ type Job struct {
 }
 
 type QueryProgress struct {
-	ReadRows     uint64
-	ReadBytes    uint64
-	WrittenRows  uint64
-	WrittenBytes uint64
+	ReadRows        uint64
+	ReadBytes       uint64
+	TotalRowsApprox uint64
+	WrittenRows     uint64
+	WrittenBytes    uint64
 }
 
 type PartStats struct {
@@ -463,6 +465,7 @@ func clearRewriteProgress(part *Part) {
 	part.ProgressUpdatedAt = ""
 	part.ReadRows = 0
 	part.ReadBytes = 0
+	part.TotalRowsApprox = 0
 	part.WrittenRows = 0
 	part.WrittenBytes = 0
 	part.SourceActivePartCount = 0
@@ -1411,6 +1414,7 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 		if progress.QueryProgress != nil {
 			current.ReadRows = progress.QueryProgress.ReadRows
 			current.ReadBytes = progress.QueryProgress.ReadBytes
+			current.TotalRowsApprox = progress.QueryProgress.TotalRowsApprox
 			current.WrittenRows = progress.QueryProgress.WrittenRows
 			current.WrittenBytes = progress.QueryProgress.WrittenBytes
 		}

@@ -1461,7 +1461,7 @@ func TestJobS3PrefixesSkipsBorrowedSourceKey(t *testing.T) {
 }
 
 func TestStateProgress(t *testing.T) {
-	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, WrittenRows: 3, WrittenBytes: 4}
+	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, TotalRowsApprox: 5, WrittenRows: 3, WrittenBytes: 4}
 	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
 	dest := metrics.PartStats{Count: 8, Rows: 9, Bytes: 10}
 	failedMerges := uint64(11)
@@ -1483,7 +1483,7 @@ func TestStateProgress(t *testing.T) {
 		},
 	})
 
-	if progress.QueryProgress == nil || progress.QueryProgress.WrittenBytes != 4 {
+	if progress.QueryProgress == nil || progress.QueryProgress.TotalRowsApprox != 5 || progress.QueryProgress.WrittenBytes != 4 {
 		t.Fatalf("query progress = %+v", progress.QueryProgress)
 	}
 	if progress.SourceActivePartStats == nil || progress.SourceActivePartStats.Rows != 6 {
@@ -1752,6 +1752,36 @@ func TestPrintJobSummaryIncludesInProgressStages(t *testing.T) {
 	}
 }
 
+func TestSummarizeAndPrintActiveRewriteProgress(t *testing.T) {
+	summary := summarizeJob("job-1", []state.Part{
+		{PartID: "part-b", Status: state.StatusInProgress, WorkerID: "worker-2", RewriteStage: "insert_select", RewriteTotalElapsedMs: 2500, ReadRows: 120, TotalRowsApprox: 100, ProgressUpdatedAt: "later"},
+		{PartID: "part-a", Status: state.StatusInProgress, WorkerID: "worker-1", RewriteStage: "insert_select", RewriteTotalElapsedMs: 1500, ReadRows: 25, TotalRowsApprox: 100, ProgressUpdatedAt: "now"},
+		{PartID: "part-unknown", Status: state.StatusInProgress, RewriteStage: "attach_source_part"},
+	})
+
+	if len(summary.ActiveRewrites) != 3 || summary.ActiveRewrites[0].PartID != "part-a" {
+		t.Fatalf("active rewrites = %+v", summary.ActiveRewrites)
+	}
+	if progress := summary.ActiveRewrites[0].ProgressPercent; progress == nil || *progress != 25 {
+		t.Fatalf("part-a progress = %v", progress)
+	}
+	if progress := summary.ActiveRewrites[1].ProgressPercent; progress == nil || *progress != 100 {
+		t.Fatalf("capped part-b progress = %v", progress)
+	}
+	if summary.ActiveRewrites[2].ProgressPercent != nil {
+		t.Fatalf("unknown progress = %v", summary.ActiveRewrites[2].ProgressPercent)
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobSummary(out, summary)
+	})
+	for _, want := range []string{"ACTIVE REWRITES", "TOTAL_ROWS_APPROX", "part-a", "25.0%", "part-b", "100.0%", "part-unknown"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 	summary := jobSummary{
 		JobID:  "job-1",
@@ -1889,7 +1919,7 @@ func TestPrintPartRowsUsesHiddenSupersededInputsForCounts(t *testing.T) {
 		printPartRowsWithLookup(out, displayParts, allParts)
 	})
 
-	want := regexp.MustCompile(`compact-1\s+COMPACT_READY\s+0\s+worker\s+11\s+12\s+KB\s+13\s+14\s+KB\s+15\s+16\s+7\s+2`)
+	want := regexp.MustCompile(`compact-1\s+COMPACT_READY\s+0\s+worker\s+11\s+0\s+-\s+12\s+KB\s+13\s+14\s+KB\s+15\s+16\s+7\s+2`)
 	if !want.MatchString(got) {
 		t.Fatalf("printPartRows output missing hidden input counts:\n%s", got)
 	}

@@ -45,10 +45,11 @@ type CompactMerge struct {
 }
 
 type QueryProgress struct {
-	ReadRows     uint64
-	ReadBytes    uint64
-	WrittenRows  uint64
-	WrittenBytes uint64
+	ReadRows        uint64
+	ReadBytes       uint64
+	TotalRowsApprox uint64
+	WrittenRows     uint64
+	WrittenBytes    uint64
 }
 
 type StageProgress struct {
@@ -119,10 +120,11 @@ type Prometheus struct {
 	rowsWrittenTotal  *prometheus.CounterVec
 	bytesWrittenTotal *prometheus.CounterVec
 
-	currentReadRows     *prometheus.GaugeVec
-	currentReadBytes    *prometheus.GaugeVec
-	currentWrittenRows  *prometheus.GaugeVec
-	currentWrittenBytes *prometheus.GaugeVec
+	currentReadRows        *prometheus.GaugeVec
+	currentReadBytes       *prometheus.GaugeVec
+	currentTotalRowsApprox *prometheus.GaugeVec
+	currentWrittenRows     *prometheus.GaugeVec
+	currentWrittenBytes    *prometheus.GaugeVec
 
 	activePartCount *prometheus.GaugeVec
 	activePartRows  *prometheus.GaugeVec
@@ -212,6 +214,10 @@ func NewPrometheus() *Prometheus {
 		currentReadBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "partforge_current_read_bytes",
 			Help: "Current read bytes for the active source part rewrite query.",
+		}, []string{"job_id", "part_id"}),
+		currentTotalRowsApprox: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "partforge_current_total_rows_approx",
+			Help: "ClickHouse estimate of total rows to read for the active source part rewrite query.",
 		}, []string{"job_id", "part_id"}),
 		currentWrittenRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "partforge_current_written_rows",
@@ -369,6 +375,7 @@ func NewPrometheus() *Prometheus {
 		p.bytesWrittenTotal,
 		p.currentReadRows,
 		p.currentReadBytes,
+		p.currentTotalRowsApprox,
 		p.currentWrittenRows,
 		p.currentWrittenBytes,
 		p.activePartCount,
@@ -583,6 +590,7 @@ func (p *Prometheus) ObserveProgress(m manifest.Manifest, prev QueryProgress, cu
 	currentLabels := prometheus.Labels{"job_id": m.JobID, "part_id": m.PartID}
 	p.currentReadRows.With(currentLabels).Set(float64(current.ReadRows))
 	p.currentReadBytes.With(currentLabels).Set(float64(current.ReadBytes))
+	p.currentTotalRowsApprox.With(currentLabels).Set(float64(current.TotalRowsApprox))
 	p.currentWrittenRows.With(currentLabels).Set(float64(current.WrittenRows))
 	p.currentWrittenBytes.With(currentLabels).Set(float64(current.WrittenBytes))
 }
@@ -591,6 +599,7 @@ func (p *Prometheus) ClearCurrentProgress(m manifest.Manifest) {
 	currentLabels := prometheus.Labels{"job_id": m.JobID, "part_id": m.PartID}
 	p.currentReadRows.With(currentLabels).Set(0)
 	p.currentReadBytes.With(currentLabels).Set(0)
+	p.currentTotalRowsApprox.With(currentLabels).Set(0)
 	p.currentWrittenRows.With(currentLabels).Set(0)
 	p.currentWrittenBytes.With(currentLabels).Set(0)
 }
