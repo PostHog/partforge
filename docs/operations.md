@@ -8,7 +8,7 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 - **`-work-dir`** (default `/tmp/partforge`) — scratch root; put it on fast local disk with headroom (see [deployment.md](deployment.md)). Each claimed part gets its own `run-*` directory, removed when the part finishes.
 - **`-once`** — process one unit of work and exit (used by the e2e script and for controlled draining).
 - **`-poll-interval`** (default `10s`) — how long to wait before re-checking for work when idle.
-- **`-compact-window`** (default `24h`) — how long `COMPACT_READY` artifacts stay eligible for compaction before being promoted to `FINISHED`; also the hard cap on a claimed compact merge wait. `0` finalizes as soon as no useful compaction remains.
+- **`-compact-window`** (default `24h`) — the job-wide compaction period after the last original source artifact finishes rewriting; also the hard deadline for claimed compact merge waits. `0` finalizes as soon as no useful compaction remains.
 - **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the worker destination table before the insert-select.
 - **`-clickhouse-binary`**, **`-clickhouse-config-file`**, **`-clickhouse-url`** — locate the local ClickHouse the worker starts.
 

@@ -1745,7 +1745,11 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		DestinationSchema:   batch.Parts[0].DestinationSchema,
 		Inputs:              compactInputs(batch.Parts),
 	}
-	compactDeadline, err := compactBatchDeadline(batch.Parts, cfg.CompactWindow, time.Now().UTC())
+	jobParts, err := cfg.StateStore.ListJobParts(ctx, batch.JobID)
+	if err != nil {
+		return true, markCompactBatchFailed(fmt.Errorf("list job parts for compact deadline: %w", err))
+	}
+	compactDeadline, err := compactBatchDeadline(jobParts, cfg.CompactWindow, time.Now().UTC())
 	if err != nil {
 		return true, markCompactBatchFailed(err)
 	}
@@ -2283,7 +2287,7 @@ func compactWindowExpired(parts []state.Part, compactWindow time.Duration, now t
 	}
 	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
 	if !ok {
-		if reason == "no current compact-ready or compacting timestamp found" {
+		if reason == "no original compact-ready timestamp found" {
 			return false, nil
 		}
 		return false, errors.New(reason)
@@ -4256,32 +4260,23 @@ func compactFinalizeAfter(parts []state.Part, compactWindow time.Duration, now t
 	if compactWindow <= 0 {
 		return now, true, ""
 	}
-	var compactActivityAt time.Time
+	var rewriteCompletedAt time.Time
 	for _, part := range parts {
-		if !compactWindowAnchorStatus(part.Status) {
+		if isGeneratedCompactPart(part) || strings.TrimSpace(part.CompactReadyAt) == "" {
 			continue
 		}
-		readyAt, err := compactReadySince(part)
+		readyAt, err := time.Parse(time.RFC3339Nano, part.CompactReadyAt)
 		if err != nil {
-			return time.Time{}, false, err.Error()
+			return time.Time{}, false, fmt.Sprintf("parse compact_ready_at for original part %s: %v", part.PartID, err)
 		}
-		if compactActivityAt.IsZero() || readyAt.After(compactActivityAt) {
-			compactActivityAt = readyAt
+		if rewriteCompletedAt.IsZero() || readyAt.After(rewriteCompletedAt) {
+			rewriteCompletedAt = readyAt
 		}
 	}
-	if compactActivityAt.IsZero() {
-		return time.Time{}, false, "no current compact-ready or compacting timestamp found"
+	if rewriteCompletedAt.IsZero() {
+		return time.Time{}, false, "no original compact-ready timestamp found"
 	}
-	return compactActivityAt.Add(compactWindow), true, ""
-}
-
-func compactWindowAnchorStatus(status state.Status) bool {
-	switch status {
-	case state.StatusCompactReady, state.StatusCompacting:
-		return true
-	default:
-		return false
-	}
+	return rewriteCompletedAt.Add(compactWindow), true, ""
 }
 
 func formatStatusCounts(counts []statusCount) string {

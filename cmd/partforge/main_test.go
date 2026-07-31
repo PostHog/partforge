@@ -737,9 +737,9 @@ func TestBuildResetPlanAllowsMissingSupersededByOutput(t *testing.T) {
 func TestFinalizableCompactReadyPartsRequiresNoActiveWork(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	compactReady := state.Part{
-		PartID:    "part-compact",
-		Status:    state.StatusCompactReady,
-		UpdatedAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		PartID:         "part-compact",
+		Status:         state.StatusCompactReady,
+		CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 	}
 
 	_, ok, err := finalizableCompactReadyParts([]state.Part{
@@ -766,9 +766,9 @@ func TestFinalizableCompactReadyPartsWaitsForThreshold(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	_, ok, err := finalizableCompactReadyParts([]state.Part{
 		{
-			PartID:    "part-compact",
-			Status:    state.StatusCompactReady,
-			UpdatedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+			PartID:         "part-compact",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
 		},
 	}, time.Hour, now)
 	if err != nil {
@@ -1045,20 +1045,25 @@ func TestCompactOutputReadyAtUsesLatestInputReadyTime(t *testing.T) {
 	}
 }
 
-func TestCompactBatchDeadlineUsesCompactWindow(t *testing.T) {
+func TestCompactBatchDeadlineUsesJobRewriteCompletion(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	deadline, err := compactBatchDeadline([]state.Part{
 		{
-			PartID:         "part-1",
-			Status:         state.StatusCompacting,
+			PartID:         "part-original-old",
+			Status:         state.StatusSuperseded,
 			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
-			UpdatedAt:      now.Format(time.RFC3339Nano),
 		},
 		{
-			PartID:         "part-2",
-			Status:         state.StatusCompacting,
+			PartID:         "part-original-last",
+			Status:         state.StatusFinished,
 			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
-			UpdatedAt:      now.Format(time.RFC3339Nano),
+		},
+		{
+			PartID:              "compact-generated",
+			Status:              state.StatusCompacting,
+			CompactReadyAt:      now.Add(-5 * time.Minute).Format(time.RFC3339Nano),
+			CompactGeneration:   1,
+			CompactInputPartIDs: []string{"part-original-old"},
 		},
 	}, 24*time.Hour, now)
 	if err != nil {
