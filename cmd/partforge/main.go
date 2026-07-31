@@ -1715,7 +1715,17 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		return cause
 	}
 	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
-		return true, markCompactBatchFailed(fmt.Errorf("enable ECS task scale-in protection: %w", err))
+		stateCtx, cancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		cancel()
+		if releaseErr != nil {
+			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch: %v", err, releaseErr)
+		}
+		if ctx.Err() != nil {
+			slog.Info("worker shutdown requested while enabling ECS task scale-in protection; released compact batch", "stage", "shutdown", "job_id", batch.JobID)
+			return true, nil
+		}
+		return true, fmt.Errorf("enable ECS task scale-in protection: %w", err)
 	}
 
 	inputIDs := compactBatchPartIDs(batch.Parts)
