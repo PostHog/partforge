@@ -107,6 +107,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	slog.Info("prepared import work directory", "stage", "prepare_destination", "job_id", job.JobID, "work_dir", root, "detached_path", detachedPath)
 
 	for idx, artifact := range artifacts {
+		artifactWorkDir := filepath.Join(root, fmt.Sprintf("%06d", idx))
 		artifactStartedAt := time.Now()
 		slog.Info(
 			"importing artifact",
@@ -123,7 +124,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 				return err
 			}
 		}
-		if err := i.importArtifact(ctx, job, artifact, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx)), owner); err != nil {
+		if err := i.importArtifact(ctx, job, artifact, detachedPath, artifactWorkDir, owner); err != nil {
 			if ctx.Err() != nil && job.ReleaseImport != nil {
 				cleanupErr := os.RemoveAll(root)
 				releaseCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -145,6 +146,9 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 			if err := job.MarkImported(ctx, artifact); err != nil {
 				return err
 			}
+		}
+		if err := os.RemoveAll(artifactWorkDir); err != nil {
+			return fmt.Errorf("remove imported artifact work directory %s: %w", artifactWorkDir, err)
 		}
 		slog.Info(
 			"imported artifact",

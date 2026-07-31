@@ -176,6 +176,65 @@ wait
 	}
 }
 
+func TestImportJobCleansEachArtifactWorkDirectory(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "table")
+	if err := os.Mkdir(dataPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	partRoot := filepath.Join(root, "source", "all_1_1_0")
+	createPart(t, partRoot)
+	tarPath := filepath.Join(root, "all_1_1_0.tar")
+	if err := artifact.WriteFinishedTar(tarPath, []string{partRoot}); err != nil {
+		t.Fatal(err)
+	}
+	binary, _ := fakeS5cmdDownload(t, tarPath)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if strings.Contains(string(body), "system.tables") {
+			fmt.Fprintln(w, dataPath)
+		} else if strings.Contains(string(body), "ATTACH PART") {
+			if err := os.RemoveAll(filepath.Join(dataPath, "detached", "all_1_1_0")); err != nil {
+				t.Error(err)
+			}
+		}
+	}))
+	defer server.Close()
+
+	workDir := filepath.Join(root, "work")
+	importsStarted := 0
+	err := (Importer{
+		S3Copy:     s3copy.Copier{Binary: binary},
+		ClickHouse: chhttp.Client{URL: server.URL},
+		WorkDir:    workDir,
+	}).ImportJob(context.Background(), ImportJob{
+		Artifacts: []FinishedArtifact{
+			{Bucket: "bucket", Key: "finished/part-1", PartID: "part-1"},
+			{Bucket: "bucket", Key: "finished/part-2", PartID: "part-2"},
+		},
+		JobID:    "job-1",
+		Database: "db",
+		Table:    "table",
+		MarkImporting: func(context.Context, FinishedArtifact) error {
+			importsStarted++
+			if importsStarted == 2 {
+				if _, err := os.Stat(filepath.Join(workDir, "job-1", "000000")); !os.IsNotExist(err) {
+					return fmt.Errorf("first artifact work directory was not removed: %v", err)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDefaultImportWorkDirUsesClickHouseDisk(t *testing.T) {
 	got := defaultImportWorkDir("/var/lib/clickhouse/")
 	want := filepath.Join("/var/lib/clickhouse", "partforge-import-work")
