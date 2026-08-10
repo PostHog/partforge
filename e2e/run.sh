@@ -8,6 +8,8 @@ CH_HTTP_DOCKER="http://clickhouse:8123"
 POSTGRES_URL="postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable"
 JOB_ID="e2e-job"
 COPY_JOB_ID="e2e-copy-job"
+BACKUP_JOB_ID="e2e-backup-job"
+BACKUP_COPY_JOB_ID="e2e-backup-copy-job"
 JOB_NAME="E2E import"
 
 cd "$ROOT"
@@ -113,6 +115,28 @@ docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null
 
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 
+docker compose exec -T clickhouse clickhouse-client --query \
+  "BACKUP TABLE src.events TO S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')"
+
+docker compose exec -T clickhouse clickhouse-client --query \
+  "INSERT INTO src.events VALUES (5, 'echo', 50, '2024-01-05')"
+
+docker compose exec -T clickhouse clickhouse-client --query \
+  "BACKUP TABLE src.events TO S3('http://localstack:4566/partforge/e2e-native-incremental', 'test', 'test') SETTINGS base_backup = S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')"
+
+# Production backup metadata uses s3:// base locators. ClickHouse preserves the
+# LocalStack HTTP endpoint and credentials, so normalize only this test index.
+docker compose exec -T localstack awslocal s3 cp \
+  s3://partforge/e2e-native-incremental/.backup /tmp/e2e-native-incremental.backup >/dev/null
+docker compose exec -T localstack sed -i \
+  "s#S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')#S3('s3://partforge/e2e-native-backup')#" \
+  /tmp/e2e-native-incremental.backup
+docker compose exec -T localstack grep -F \
+  "<base_backup>S3('s3://partforge/e2e-native-backup')</base_backup>" \
+  /tmp/e2e-native-incremental.backup >/dev/null
+docker compose exec -T localstack awslocal s3 cp \
+  /tmp/e2e-native-incremental.backup s3://partforge/e2e-native-incremental/.backup >/dev/null
+
 clickhouse_owner="$(docker compose exec -T clickhouse stat -c '%u:%g' /var/lib/clickhouse)"
 
 part_count="$(
@@ -125,6 +149,115 @@ if [[ "$part_count" == "0" ]]; then
   echo "no frozen parts found" >&2
   exit 1
 fi
+
+incremental_part_count="$(
+  docker compose exec -T clickhouse clickhouse-client --query \
+    "SELECT countDistinct(_part) FROM src.events"
+)"
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
+  --workdir /work \
+  -v "$ROOT:/work:ro" \
+  worker \
+  upload-backup \
+  -backup=s3://partforge/e2e-native-incremental \
+  -database=src \
+  -table=events \
+  -destination-schema-file=e2e/sql/destination.sql \
+  -insert-select-file=e2e/sql/insert.sql \
+  -bucket=partforge \
+  -prefix=e2e \
+  -job-id="$BACKUP_JOB_ID" \
+  -zero-copy \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+
+backup_part_count="$(
+  docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+    "SELECT count(*) FROM partforge_state WHERE job_id = '$BACKUP_JOB_ID'"
+)"
+if [[ "$backup_part_count" != "$incremental_part_count" ]]; then
+  echo "incremental backup parts=$backup_part_count, expected $incremental_part_count" >&2
+  exit 1
+fi
+
+manifest_count="$(
+  docker compose exec -T localstack awslocal s3 ls \
+    "s3://partforge/e2e/jobs/$BACKUP_JOB_ID/source/" --recursive |
+    awk '$4 ~ /\/manifest.json$/ { count++ } END { print count + 0 }'
+)"
+if [[ "$manifest_count" != "$incremental_part_count" ]]; then
+  echo "zero-copy manifests=$manifest_count, expected $incremental_part_count" >&2
+  exit 1
+fi
+if docker compose exec -T localstack awslocal s3 ls \
+  "s3://partforge/e2e/jobs/$BACKUP_JOB_ID/source/" --recursive |
+  grep -E '/(checksums|columns)\.txt$' >/dev/null; then
+  echo "zero-copy job unexpectedly copied source part data" >&2
+  exit 1
+fi
+
+for i in $(seq 1 "$incremental_part_count"); do
+  backup_worker_log="$ROOT/.e2e/backup-worker-${i}.log"
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    worker \
+    -role=inserter \
+    -merge-max-runtime=1ns \
+    -s3-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL" \
+    -once 2>&1 | tee "$backup_worker_log"
+  if ! grep -F "downloading zero-copy source objects" "$backup_worker_log" >/dev/null; then
+    echo "backup worker did not resolve zero-copy source pointers" >&2
+    exit 1
+  fi
+done
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$BACKUP_JOB_ID" \
+  -delete-s3 \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+
+docker compose exec -T localstack awslocal s3 ls \
+  s3://partforge/e2e-native-backup/.backup >/dev/null
+docker compose exec -T localstack awslocal s3 ls \
+  s3://partforge/e2e-native-incremental/.backup >/dev/null
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
+  --workdir /work \
+  -v "$ROOT:/work:ro" \
+  worker \
+  upload-backup \
+  -backup=s3://partforge/e2e-native-backup \
+  -database=src \
+  -table=events \
+  -destination-schema-file=e2e/sql/destination.sql \
+  -insert-select-file=e2e/sql/insert.sql \
+  -bucket=partforge \
+  -prefix=e2e \
+  -job-id="$BACKUP_COPY_JOB_ID" \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+
+for file in checksums.txt columns.txt; do
+  copied_count="$(
+    docker compose exec -T localstack awslocal s3 ls \
+      "s3://partforge/e2e/jobs/$BACKUP_COPY_JOB_ID/source/" --recursive |
+      awk -v suffix="/$file" '$4 ~ suffix "$" { count++ } END { print count + 0 }'
+  )"
+  if [[ "$copied_count" != "$part_count" ]]; then
+    echo "materialized $file objects=$copied_count, expected $part_count" >&2
+    exit 1
+  fi
+done
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$BACKUP_COPY_JOB_ID" \
+  -delete-s3 \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
   --workdir /work \

@@ -28,6 +28,7 @@ docker compose build worker                     # worker image
 ```
 cmd/partforge/     CLI entrypoint — every subcommand, flag parsing, config resolution
 internal/
+  chbackup/        stream and validate native ClickHouse backup indexes
   freeze/          discover ClickHouse disks; scan shadow/<freeze> for frozen parts
   manifest/        per-part manifest.json; job/part ID derivation
   artifact/        write manifests; build/extract part tarballs

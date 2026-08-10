@@ -146,6 +146,24 @@ For shard fanout, run the first shard with `-destination-schema-file` and `-inse
 
 For schema experiments on the same uploaded source parts, run another `upload-freeze` with `-copy-parts-from-job=<source-job-id>` and the new destination SQL files. This skips local disk scanning and source-part uploads; the new job points at the source job's uploaded `source/` artifacts and writes its own `finished/` artifacts. Jobs that own referenced source parts cannot be deleted, and `delete-job -delete-s3` on copied jobs skips borrowed source prefixes.
 
+#### Native S3 backup alternative
+
+When ClickHouse has already written a native backup to S3, `upload-backup` can create the same source artifacts without access to a ClickHouse node:
+
+```sh
+partforge upload-backup \
+  -backup=s3://clickhouse-backups/path/to/backup \
+  -database=src_db \
+  -table=events \
+  -destination-schema-file=dest.sql \
+  -insert-select-file=insert.sql \
+  -bucket=partforge \
+  -job-name="events migration 001" \
+  -zero-copy
+```
+
+`-backup` must identify the exact prefix containing `.backup`, `metadata/`, and `data/`. For an incremental, the command follows `base_backup` recursively and validates each `base_backup_uuid`; S3 base locators must have the form `S3('s3://bucket/prefix')`. It resolves ClickHouse's checksum-based file reuse, including files made from a base prefix plus an incremental suffix, and registers `READY` rows. By default it materializes each logical part into PartForge's normal source layout. With `-zero-copy`, it stores ordered source pointers and workers download files directly from all referenced backup layers; finished and compacted artifacts still go to the PartForge bucket. Every referenced backup must remain available until the job finishes. Lightweight and encrypted backups are unsupported. `-copy-sql-from-job` is supported in place of the two SQL files.
+
 ### 4. worker
 
 The worker claims the largest `READY` source artifact first, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact the largest eligible finished artifact first before promoting artifacts to `FINISHED`.

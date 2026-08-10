@@ -119,6 +119,68 @@ func TestUploadGlobRetriesCopyCommand(t *testing.T) {
 	}
 }
 
+func TestCopyObjectsRunsBatchFromStdin(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	argsFile := filepath.Join(dir, "args")
+	stdinFile := filepath.Join(dir, "stdin")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s' \"$*\" > %s\ncat > %s\n", shellQuote(argsFile), shellQuote(stdinFile))
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	copier := Copier{Binary: binary, Endpoint: "http://localhost:4566", NumWorkers: 8}
+	err := copier.CopyObjects(context.Background(), []ObjectCopy{
+		{SourceBucket: "backups", SourceKey: "full/data/a.bin", DestinationBucket: "partforge", DestinationKey: "jobs/job/source/a.bin"},
+		{SourceBucket: "backups", SourceKey: "full/data/file with space.bin", DestinationBucket: "partforge", DestinationKey: "jobs/job/source/file with space.bin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(args), "--log=error --retry-count 3 --numworkers 8 --endpoint-url http://localhost:4566 run"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+	stdin, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "cp --raw \"s3://backups/full/data/a.bin\" \"s3://partforge/jobs/job/source/a.bin\"\n" +
+		"cp --raw \"s3://backups/full/data/file with space.bin\" \"s3://partforge/jobs/job/source/file with space.bin\"\n"
+	if string(stdin) != want {
+		t.Fatalf("stdin = %q, want %q", stdin, want)
+	}
+}
+
+func TestDownloadObjectsRunsBatchFromStdin(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	stdinFile := filepath.Join(dir, "stdin")
+	script := fmt.Sprintf("#!/bin/sh\ncat > %s\n", shellQuote(stdinFile))
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	destination := filepath.Join(dir, "part", "data.bin")
+	err := (Copier{Binary: binary}).DownloadObjects(context.Background(), []ObjectDownload{{
+		SourceBucket: "backups", SourceKey: "full/data.bin", DestinationPath: destination,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("cp --raw \"s3://backups/full/data.bin\" %q\n", destination)
+	if string(stdin) != want {
+		t.Fatalf("stdin = %q, want %q", stdin, want)
+	}
+}
+
 func TestUploadDirFailsAfterCopyRetries(t *testing.T) {
 	binary, attemptsFile := fakeS5cmd(t, 10)
 	localDir := t.TempDir()

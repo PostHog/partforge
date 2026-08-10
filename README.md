@@ -103,6 +103,19 @@ partforge import-finished -database=dst_db -table=events_new -job-id=<job-id>
 
 `upload-freeze` prints the `job-id`; `-job-name` is optional and is shown by `list-jobs`. For local compose add `-s3-endpoint=http://localhost:4566 -postgres-url='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable'` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
 
+If the source already exists as a native ClickHouse S3 backup, skip the freeze and source node. `upload-backup` reads its `.backup` index and copies the selected table's logical part files directly between S3 prefixes:
+
+```sh
+partforge upload-backup \
+  -backup=s3://clickhouse-backups/path/to/backup \
+  -database=src_db -table=events \
+  -destination-schema-file=dest.sql -insert-select-file=insert.sql \
+  -bucket=partforge \
+  -zero-copy
+```
+
+The path must be the exact full or incremental backup prefix. Incrementals are resolved through their `base_backup` chain; each locator must use `S3('s3://bucket/prefix')`. `-zero-copy` stores only manifests in the PartForge source prefix; workers fetch source files from every referenced backup layer, while all finished artifacts still use the PartForge bucket. Omit it to materialize an independent copy. Lightweight and encrypted backups are rejected.
+
 For multiple shards with the same destination schema and insert-select, run the first `upload-freeze` with the SQL files and later shards with `-copy-sql-from-job=<first-job-id>`. To test another destination schema against the same uploaded source parts, run `upload-freeze -copy-parts-from-job=<source-job-id>` with the new SQL files.
 
 Part state lifecycle (tracked in Postgres, so a job is resumable):

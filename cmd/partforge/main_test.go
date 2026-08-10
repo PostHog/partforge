@@ -34,6 +34,25 @@ func TestDefaultCompactWindow(t *testing.T) {
 	}
 }
 
+func TestParseBaseBackupS3URI(t *testing.T) {
+	got, err := parseBaseBackupS3URI("S3('s3://backups/full/')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "s3://backups/full" {
+		t.Fatalf("URI = %q, want s3://backups/full", got)
+	}
+	for _, locator := range []string{
+		"Disk('backups', 'full')",
+		"S3('https://example.com/backups/full')",
+		"S3('s3://backups/full', 'key', 'secret')",
+	} {
+		if _, err := parseBaseBackupS3URI(locator); err == nil {
+			t.Fatalf("expected %q to be rejected", locator)
+		}
+	}
+}
+
 func TestDetectECSTaskProtectionWithoutECS(t *testing.T) {
 	t.Setenv("ECS_AGENT_URI", "")
 	protection, err := detectECSTaskProtection(context.Background())

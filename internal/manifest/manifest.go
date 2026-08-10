@@ -46,9 +46,16 @@ type SQLBundle struct {
 }
 
 type S3Refs struct {
-	Bucket      string `json:"bucket"`
-	SourceKey   string `json:"source_key"`
-	FinishedKey string `json:"finished_key"`
+	Bucket        string         `json:"bucket"`
+	SourceKey     string         `json:"source_key"`
+	FinishedKey   string         `json:"finished_key"`
+	SourceObjects []SourceObject `json:"source_objects,omitempty"`
+}
+
+type SourceObject struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+	Path   string `json:"path"`
 }
 
 func (m Manifest) Validate() error {
@@ -66,6 +73,14 @@ func (m Manifest) Validate() error {
 	}
 	if m.S3.Bucket == "" || m.S3.SourceKey == "" || m.S3.FinishedKey == "" {
 		return Error("manifest is missing S3 references")
+	}
+	for _, object := range m.S3.SourceObjects {
+		if object.Bucket == "" || object.Key == "" || object.Path == "" {
+			return Error("manifest source object is missing bucket, key, or path")
+		}
+		if strings.ContainsAny(object.Bucket+object.Key, "\x00\r\n") || object.Path == "." || object.Path == ".." || strings.HasPrefix(object.Path, "../") || strings.ContainsRune(object.Path, '\\') || strings.HasPrefix(object.Path, "/") || path.Clean(object.Path) != object.Path {
+			return Error("manifest contains an unsafe source object")
+		}
 	}
 	return nil
 }

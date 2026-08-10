@@ -91,3 +91,39 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	}
 	return closeErr
 }
+
+func ConcatFiles(dst string, sources []string) (err error) {
+	if len(sources) == 0 {
+		return fmt.Errorf("at least one source file is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := out.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(dst)
+		}
+	}()
+	for _, source := range sources {
+		in, openErr := os.Open(source)
+		if openErr != nil {
+			return openErr
+		}
+		_, copyErr := io.Copy(out, in)
+		closeErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}

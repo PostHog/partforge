@@ -47,6 +47,8 @@ Combine the S3 permissions with `rds-db:connect` for the Postgres database user.
 
 `s3:DeleteObject` is needed because workers replace finished-artifact prefixes (`s5cmd rm` then upload) and admin `-delete-s3` operations remove artifacts.
 
+`upload-backup` additionally needs `s3:GetObject` on every prefix in the ClickHouse backup chain. With `-zero-copy`, workers need that permission too for the lifetime of the job. Neither needs `s3:ListBucket` there because the indexes and pointer manifests name exact objects; destination permissions are the same `partforge/*` permissions above.
+
 ### Storage matters
 
 Worker scratch (`-work-dir`) holds the local ClickHouse data plus downloaded source parts, and compaction transiently holds downloaded tarballs, extracted parts, merge output, and re-uploaded tarballs at once. It must be **fast local disk with enough headroom**:
@@ -71,6 +73,7 @@ See [operations.md](operations.md) for the full flag set and metrics.
 `worker` is the only stage that belongs on ECS. The other two need local access to a ClickHouse node's disks and generally run there:
 
 - **`upload-freeze`** must run where it can read the source ClickHouse data disks reported by `system.disks`.
+- **`upload-backup`** can run anywhere with network access to S3 and Postgres; source part data is copied S3-to-S3 or left in place with `-zero-copy`.
 - **`import-finished`** must run where its work-dir shares a filesystem with the destination table's `detached` directory (parts are moved, not copied).
 
 Both still need the same S3 and Postgres access as the workers.

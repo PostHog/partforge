@@ -27,6 +27,19 @@ type Copier struct {
 	NumWorkers int
 }
 
+type ObjectCopy struct {
+	SourceBucket      string
+	SourceKey         string
+	DestinationBucket string
+	DestinationKey    string
+}
+
+type ObjectDownload struct {
+	SourceBucket    string
+	SourceKey       string
+	DestinationPath string
+}
+
 type CommandError struct {
 	Binary string
 	Args   []string
@@ -67,6 +80,39 @@ func (c Copier) DownloadFile(ctx context.Context, bucket, key, localPath string)
 	return c.runS5cmd(ctx, c.copyArgs(s3URI(bucket, key), localPath), nil)
 }
 
+func (c Copier) CopyObjects(ctx context.Context, copies []ObjectCopy) error {
+	if len(copies) == 0 {
+		return nil
+	}
+	var commands strings.Builder
+	for _, copy := range copies {
+		if copy.SourceBucket == "" || copy.SourceKey == "" || copy.DestinationBucket == "" || copy.DestinationKey == "" {
+			return fmt.Errorf("S3 object copy is missing source or destination bucket or key")
+		}
+		source := s3URI(copy.SourceBucket, copy.SourceKey)
+		destination := s3URI(copy.DestinationBucket, copy.DestinationKey)
+		fmt.Fprintf(&commands, "cp --raw %q %q\n", source, destination)
+	}
+	return c.runS5cmdInput(ctx, c.args("run"), []byte(commands.String()), nil)
+}
+
+func (c Copier) DownloadObjects(ctx context.Context, downloads []ObjectDownload) error {
+	if len(downloads) == 0 {
+		return nil
+	}
+	var commands strings.Builder
+	for _, download := range downloads {
+		if download.SourceBucket == "" || download.SourceKey == "" || download.DestinationPath == "" {
+			return fmt.Errorf("S3 object download is missing source bucket, key, or destination path")
+		}
+		if err := os.MkdirAll(filepath.Dir(download.DestinationPath), 0o755); err != nil {
+			return err
+		}
+		fmt.Fprintf(&commands, "cp --raw %q %q\n", s3URI(download.SourceBucket, download.SourceKey), download.DestinationPath)
+	}
+	return c.runS5cmdInput(ctx, c.args("run"), []byte(commands.String()), nil)
+}
+
 func (c Copier) DeletePrefix(ctx context.Context, bucket, prefix string) error {
 	target, err := deletePrefixTarget(bucket, prefix)
 	if err != nil {
@@ -84,10 +130,14 @@ func (c Copier) DeletePrefixIfExists(ctx context.Context, bucket, prefix string)
 }
 
 func (c Copier) runS5cmd(ctx context.Context, fullArgs []string, acceptErr func(error) bool) error {
+	return c.runS5cmdInput(ctx, fullArgs, nil, acceptErr)
+}
+
+func (c Copier) runS5cmdInput(ctx context.Context, fullArgs []string, input []byte, acceptErr func(error) bool) error {
 	maxAttempts := s5cmdRetries + 1
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := c.runArgs(ctx, fullArgs)
+		err := c.runArgs(ctx, fullArgs, input)
 		if err == nil || (acceptErr != nil && acceptErr(err)) {
 			return nil
 		}
@@ -113,7 +163,7 @@ func (c Copier) runS5cmd(ctx context.Context, fullArgs []string, acceptErr func(
 	return fmt.Errorf("s5cmd command failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
-func (c Copier) runArgs(ctx context.Context, fullArgs []string) error {
+func (c Copier) runArgs(ctx context.Context, fullArgs []string, input []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -123,6 +173,9 @@ func (c Copier) runArgs(ctx context.Context, fullArgs []string) error {
 	}
 	cmd := exec.Command(binary, fullArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

@@ -45,3 +45,24 @@ func TestDerivePartIDIncludesPartIdentity(t *testing.T) {
 		t.Fatal("expected part name to affect derived part id")
 	}
 }
+
+func TestManifestRejectsUnsafeSourceObjectPath(t *testing.T) {
+	m := Manifest{
+		Version: Version,
+		JobID:   "job-1",
+		PartID:  "part-1",
+		Source:  TableRef{Database: "src", Table: "events"},
+		Dest:    TableRef{Database: "dst", Table: "events"},
+		Part:    SourcePart{Disk: "backup", Name: "all_1_1_0"},
+		SQL:     SQLBundle{SourceSchema: "source", DestinationSchema: "destination", InsertSelect: "insert"},
+		S3: S3Refs{
+			Bucket:        "partforge",
+			SourceKey:     "source/part-1",
+			FinishedKey:   "finished/part-1",
+			SourceObjects: []SourceObject{{Bucket: "backups", Key: "data.bin", Path: "../data.bin"}},
+		},
+	}
+	if err := m.Validate(); err == nil {
+		t.Fatal("expected unsafe source object path error")
+	}
+}

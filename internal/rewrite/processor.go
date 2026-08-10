@@ -339,21 +339,6 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	if err := p.S3Copy.DownloadPrefix(ctx, item.Bucket, item.SourceKey, sourceRoot); err != nil {
 		return ProcessResult{}, fmt.Errorf("download source artifact %s: %w", item.SourceKey, err)
 	}
-	sourceStats, err := fileutil.StatDir(sourceRoot)
-	if err != nil {
-		return ProcessResult{}, fmt.Errorf("stat downloaded source artifact %s: %w", item.SourceKey, err)
-	}
-	downloadElapsed := time.Since(downloadStartedAt)
-	slog.Info(
-		"downloaded source artifact",
-		"stage", "download_source",
-		"job_id", item.JobID,
-		"part_id", item.PartID,
-		"files", sourceStats.Files,
-		"bytes", sourceStats.Bytes,
-		"elapsed", downloadElapsed,
-		"bytes_per_second", ratePerSecond(sourceStats.Bytes, downloadElapsed),
-	)
 
 	if err := p.reportStageProgress(ctx, progressManifest, stageTracker, stageReadManifest); err != nil {
 		return ProcessResult{}, err
@@ -379,6 +364,30 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	if m.S3.Bucket != item.Bucket || m.S3.SourceKey != item.SourceKey {
 		return ProcessResult{}, fmt.Errorf("work item S3 reference does not match manifest")
 	}
+	if len(m.S3.SourceObjects) > 0 {
+		if err := p.reportStageProgress(ctx, progressManifest, stageTracker, stageDownloadSource); err != nil {
+			return ProcessResult{}, err
+		}
+		slog.Info("downloading zero-copy source objects", "stage", "download_source", "job_id", item.JobID, "part_id", item.PartID, "objects", len(m.S3.SourceObjects))
+		if err := downloadManifestSourceObjects(ctx, p.S3Copy, m.S3.SourceObjects, sourceRoot); err != nil {
+			return ProcessResult{}, fmt.Errorf("download zero-copy source objects: %w", err)
+		}
+	}
+	sourceStats, err := fileutil.StatDir(sourceRoot)
+	if err != nil {
+		return ProcessResult{}, fmt.Errorf("stat downloaded source artifact %s: %w", item.SourceKey, err)
+	}
+	downloadElapsed := time.Since(downloadStartedAt)
+	slog.Info(
+		"downloaded source artifact",
+		"stage", "download_source",
+		"job_id", item.JobID,
+		"part_id", item.PartID,
+		"files", sourceStats.Files,
+		"bytes", sourceStats.Bytes,
+		"elapsed", downloadElapsed,
+		"bytes_per_second", ratePerSecond(sourceStats.Bytes, downloadElapsed),
+	)
 	m.JobID = item.JobID
 	m.PartID = item.PartID
 	m.S3.FinishedKey = item.FinishedKey
@@ -443,6 +452,42 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		DestinationStats:      rewriteResult.DestinationStats,
 		DestinationPartitions: rewriteResult.DestinationPartitions,
 	}, nil
+}
+
+func downloadManifestSourceObjects(ctx context.Context, copier s3copy.Copier, objects []manifest.SourceObject, root string) error {
+	groups := make(map[string][]manifest.SourceObject)
+	var paths []string
+	for _, object := range objects {
+		if _, exists := groups[object.Path]; !exists {
+			paths = append(paths, object.Path)
+		}
+		groups[object.Path] = append(groups[object.Path], object)
+	}
+	segmentRoot := filepath.Join(root, ".partforge-segments")
+	var downloads []s3copy.ObjectDownload
+	multipart := make(map[string][]string)
+	for _, path := range paths {
+		group := groups[path]
+		if len(group) == 1 {
+			downloads = append(downloads, s3copy.ObjectDownload{SourceBucket: group[0].Bucket, SourceKey: group[0].Key, DestinationPath: filepath.Join(root, filepath.FromSlash(path))})
+			continue
+		}
+		groupIndex := len(multipart)
+		for i, object := range group {
+			segmentPath := filepath.Join(segmentRoot, strconv.Itoa(groupIndex), strconv.Itoa(i))
+			downloads = append(downloads, s3copy.ObjectDownload{SourceBucket: object.Bucket, SourceKey: object.Key, DestinationPath: segmentPath})
+			multipart[path] = append(multipart[path], segmentPath)
+		}
+	}
+	if err := copier.DownloadObjects(ctx, downloads); err != nil {
+		return err
+	}
+	for path, segments := range multipart {
+		if err := fileutil.ConcatFiles(filepath.Join(root, filepath.FromSlash(path)), segments); err != nil {
+			return err
+		}
+	}
+	return os.RemoveAll(segmentRoot)
 }
 
 func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot string, stageTracker *rewriteStageTracker) (result rewriteResult, err error) {

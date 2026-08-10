@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/PostHog/partforge/internal/artifact"
+	"github.com/PostHog/partforge/internal/chbackup"
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/chproc"
 	"github.com/PostHog/partforge/internal/ddl"
@@ -52,6 +53,7 @@ const defaultCompactWindow = 24 * time.Hour
 const compactSourceMergeWaitCap = 5 * time.Minute
 const compactMergeBackgroundPoolSize = 1
 const compactMergeConcurrencyRatio = 1.0
+const maxBackupChainDepth = 100
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 2 * time.Minute
 const ecsTaskProtectionTimeout = 5 * time.Second
@@ -69,6 +71,14 @@ type commandHelp struct {
 }
 
 var commandHelps = []commandHelp{
+	{
+		Name:    "upload-backup",
+		Usage:   "[flags]",
+		Summary: "Materialize parts from a native ClickHouse S3 backup, then create READY work rows in Postgres.",
+		Details: `The backup must be an exact native-backup prefix containing .backup, metadata/, and data/. The command follows incremental base_backup links, resolves ClickHouse file deduplication, and copies each logical part S3-to-S3 into the normal PartForge source-artifact layout. With -zero-copy, it stores source pointers and workers download part files directly from the backup chain. Lightweight and encrypted backups are rejected.
+
+Required: -backup, -database, -table, -bucket, and either both -destination-schema-file and -insert-select-file or -copy-sql-from-job.`,
+	},
 	{
 		Name:    "upload-freeze",
 		Usage:   "[flags]",
@@ -256,6 +266,8 @@ func run() error {
 	defer stop()
 
 	switch os.Args[1] {
+	case "upload-backup":
+		return runUploadBackup(ctx, os.Args[2:])
 	case "upload-freeze":
 		return runUploadFreeze(ctx, os.Args[2:])
 	case "worker":
@@ -390,6 +402,409 @@ func runHelp(args []string) error {
 		return errors.New("help accepts at most one command")
 	}
 	return nil
+}
+
+func runUploadBackup(ctx context.Context, args []string) error {
+	fs := newCommandFlagSet("upload-backup")
+	var (
+		configPath            = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		backupURI             = fs.String("backup", "", "exact s3://bucket/prefix of a native ClickHouse backup")
+		database              = fs.String("database", "", "source database stored in the backup")
+		table                 = fs.String("table", "", "source table stored in the backup")
+		destinationSchemaFile = fs.String("destination-schema-file", "", "path to SQL file containing the full destination CREATE TABLE")
+		insertSelectFile      = fs.String("insert-select-file", "", "path to SQL file containing INSERT INTO destination SELECT ... FROM source")
+		copySQLFromJob        = fs.String("copy-sql-from-job", "", "existing job id to copy destination schema and insert-select SQL from")
+		jobID                 = fs.String("job-id", "", "job id to store in manifests and Postgres; empty generates one")
+		jobName               = fs.String("job-name", "", "readable job name shown by list-jobs")
+		bucket                = fs.String("bucket", "", "S3 bucket for materialized source and finished part artifacts")
+		prefix                = fs.String("prefix", "partforge", "S3 key prefix under the artifact bucket")
+		workDir               = fs.String("work-dir", "", "parent directory for the downloaded backup index; empty uses the system temporary directory")
+		stateTable            = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+		region                = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		s3Endpoint            = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers value per copy process; <=0 auto-scales from copy-concurrency")
+		copyConcurrency       = fs.Int("copy-concurrency", 0, "number of backup parts to materialize concurrently; <=0 uses detected CPU count")
+		zeroCopy              = fs.Bool("zero-copy", false, "store source-file pointers instead of copying backup part data into the artifact bucket")
+		postgresURL           = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth       = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+	)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "upload-backup"); err != nil {
+		return err
+	}
+	if *backupURI == "" || *database == "" || *table == "" || *bucket == "" {
+		return errors.New("backup, database, table, and bucket are required")
+	}
+	if err := validateUploadFreezeSQLInputs(*destinationSchemaFile, *insertSelectFile, *copySQLFromJob); err != nil {
+		return err
+	}
+	resolvedCopyConcurrency, err := resolveUploadConcurrency(*copyConcurrency)
+	if err != nil {
+		return err
+	}
+
+	if *workDir != "" {
+		if err := os.MkdirAll(*workDir, 0o755); err != nil {
+			return fmt.Errorf("create work directory: %w", err)
+		}
+	}
+	tempDir, err := os.MkdirTemp(*workDir, "partforge-upload-backup-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tempDir)
+
+	copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
+	layers, err := downloadBackupChain(ctx, copier, *backupURI, tempDir)
+	if err != nil {
+		return err
+	}
+	backupPlan, err := chbackup.Prepare(layers, *database, *table)
+	if err != nil {
+		return err
+	}
+	backupInfo := backupPlan.Info()
+
+	metadataPath := filepath.Join(tempDir, "source.sql")
+	if err := downloadBackupFile(ctx, copier, backupInfo.Metadata, metadataPath); err != nil {
+		return fmt.Errorf("download source table metadata: %w", err)
+	}
+	sourceSchema, err := readRequiredFile(metadataPath)
+	if err != nil {
+		return err
+	}
+	if _, err := ddl.NormalizeCreateTable(sourceSchema); err != nil {
+		return fmt.Errorf("source schema is not supported by worker: %w", err)
+	}
+
+	var stateStore *state.Store
+	getStateStore := func() (*state.Store, error) {
+		if stateStore != nil {
+			return stateStore, nil
+		}
+		store, err := state.New(ctx, state.Config{Region: *region, Endpoint: *postgresURL, IAMAuth: *postgresIAMAuth, Table: *stateTable})
+		if err != nil {
+			return nil, err
+		}
+		stateStore = store
+		return stateStore, nil
+	}
+	destinationSchema, insertSelect, err := readUploadFreezeSQL(ctx, *destinationSchemaFile, *insertSelectFile, *copySQLFromJob, getStateStore, copier)
+	if err != nil {
+		return err
+	}
+	destination, err := destinationTableRefFromSchema(destinationSchema)
+	if err != nil {
+		return err
+	}
+	if destination.Database == *database && destination.Table == *table {
+		return errors.New("source and destination table names must differ inside the worker")
+	}
+
+	resolvedJobID := strings.TrimSpace(*jobID)
+	if resolvedJobID == "" {
+		resolvedJobID, err = manifest.NewJobID()
+		if err != nil {
+			return fmt.Errorf("generate job id: %w", err)
+		}
+	}
+	stateStore, err = getStateStore()
+	if err != nil {
+		return err
+	}
+	effectiveConcurrency := min(resolvedCopyConcurrency, backupInfo.PartCount)
+	copier.NumWorkers = resolveS5cmdNumWorkers(*s5cmdNumWorkers, effectiveConcurrency)
+	params := materializeBackupPartParams{
+		JobID:             resolvedJobID,
+		JobName:           strings.TrimSpace(*jobName),
+		BackupURI:         strings.TrimRight(*backupURI, "/"),
+		Source:            manifest.TableRef{Database: *database, Table: *table},
+		Dest:              destination,
+		SourceSchema:      sourceSchema,
+		DestinationSchema: destinationSchema,
+		InsertSelect:      insertSelect,
+		Bucket:            *bucket,
+		Prefix:            *prefix,
+		PartsTotal:        backupInfo.PartCount,
+		ZeroCopy:          *zeroCopy,
+		StateStore:        stateStore,
+		Copier:            copier,
+	}
+
+	startedAt := time.Now()
+	completed := 0
+	var copiedBytes uint64
+	nextIndex := 1
+	batch := make([]backupPartTask, 0, effectiveConcurrency)
+	copyBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		err := processTasksInParallel(ctx, batch, effectiveConcurrency, func(ctx context.Context, workerID int, task backupPartTask) (backupPartResult, error) {
+			return materializeBackupPart(ctx, workerID, task, params)
+		}, func(result backupPartResult) {
+			completed++
+			copiedBytes += result.Bytes
+			slog.Info("backup part copy progress", "stage", "copy_backup_parts", "job_id", resolvedJobID, "completed_parts", completed, "parts_total", backupInfo.PartCount, "part_id", result.PartID, "copied_bytes", copiedBytes)
+		}, "backup part copy")
+		batch = batch[:0]
+		return err
+	}
+
+	if err := backupPlan.ScanParts(func(part chbackup.Part) error {
+		batch = append(batch, backupPartTask{Index: nextIndex, Part: part})
+		nextIndex++
+		if len(batch) == effectiveConcurrency {
+			return copyBatch()
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := copyBatch(); err != nil {
+		return err
+	}
+
+	slog.Info("upload-backup complete", "stage", "complete", "job_id", resolvedJobID, "parts", completed, "copied_bytes", copiedBytes, "elapsed", time.Since(startedAt))
+	fmt.Println(resolvedJobID)
+	return nil
+}
+
+type backupPartTask struct {
+	Index int
+	Part  chbackup.Part
+}
+
+type backupPartResult struct {
+	Index  int
+	PartID string
+	Bytes  uint64
+}
+
+type materializeBackupPartParams struct {
+	JobID             string
+	JobName           string
+	BackupURI         string
+	Source            manifest.TableRef
+	Dest              manifest.TableRef
+	SourceSchema      string
+	DestinationSchema string
+	InsertSelect      string
+	Bucket            string
+	Prefix            string
+	PartsTotal        int
+	ZeroCopy          bool
+	StateStore        *state.Store
+	Copier            s3copy.Copier
+}
+
+func materializeBackupPart(ctx context.Context, workerID int, task backupPartTask, params materializeBackupPartParams) (backupPartResult, error) {
+	part := task.Part
+	relativePath := path.Join("data", chbackup.EscapeForFileName(params.Source.Database), chbackup.EscapeForFileName(params.Source.Table), part.Name)
+	partID := manifest.DerivePartID("backup", relativePath, part.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect)
+	sourceKey := manifest.SourcePartPrefix(params.Prefix, params.JobID, partID)
+	finishedKey := manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID)
+	createdAt := time.Now().UTC()
+
+	dir, err := os.MkdirTemp("", "partforge-backup-part-*")
+	if err != nil {
+		return backupPartResult{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	copies := make([]s3copy.ObjectCopy, 0, len(part.Files))
+	sourceObjects := make([]manifest.SourceObject, 0, len(part.Files))
+	for _, file := range part.Files {
+		if file.Size == 0 {
+			localPath := filepath.Join(dir, filepath.FromSlash(file.Name))
+			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+				return backupPartResult{}, err
+			}
+			if err := os.WriteFile(localPath, nil, 0o644); err != nil {
+				return backupPartResult{}, err
+			}
+			continue
+		}
+		if params.ZeroCopy {
+			for _, segment := range file.Segments {
+				sourceObjects = append(sourceObjects, manifest.SourceObject{Bucket: segment.Bucket, Key: segment.Key, Path: file.Name})
+			}
+			continue
+		}
+		if len(file.Segments) == 1 {
+			segment := file.Segments[0]
+			copies = append(copies, s3copy.ObjectCopy{
+				SourceBucket:      segment.Bucket,
+				SourceKey:         segment.Key,
+				DestinationBucket: params.Bucket,
+				DestinationKey:    path.Join(sourceKey, file.Name),
+			})
+			continue
+		}
+		localPath := filepath.Join(dir, filepath.FromSlash(file.Name))
+		if err := downloadBackupFile(ctx, params.Copier, file, localPath); err != nil {
+			return backupPartResult{}, fmt.Errorf("materialize incremental file %s: %w", file.Name, err)
+		}
+	}
+
+	m := manifest.Manifest{
+		Version:   manifest.Version,
+		JobID:     params.JobID,
+		PartID:    partID,
+		Freeze:    params.BackupURI,
+		Source:    params.Source,
+		Dest:      params.Dest,
+		Part:      manifest.SourcePart{Disk: "backup", Name: part.Name, RelativePath: relativePath},
+		SQL:       manifest.SQLBundle{SourceSchema: params.SourceSchema, DestinationSchema: params.DestinationSchema, InsertSelect: params.InsertSelect},
+		S3:        manifest.S3Refs{Bucket: params.Bucket, SourceKey: sourceKey, FinishedKey: finishedKey, SourceObjects: sourceObjects},
+		CreatedAt: createdAt,
+	}
+	if err := artifact.WriteManifest(dir, m); err != nil {
+		return backupPartResult{}, err
+	}
+	manifestInfo, err := os.Stat(filepath.Join(dir, artifact.ManifestName))
+	if err != nil {
+		return backupPartResult{}, err
+	}
+	if uint64(manifestInfo.Size()) > ^uint64(0)-part.Bytes {
+		return backupPartResult{}, fmt.Errorf("source artifact %s size overflows uint64", part.Name)
+	}
+	artifactBytes := part.Bytes + uint64(manifestInfo.Size())
+
+	slog.Info("materializing backup part", "stage", "copy_backup_parts", "job_id", params.JobID, "worker_id", workerID, "part_index", task.Index, "parts_total", params.PartsTotal, "part", part.Name, "part_id", partID, "files", len(part.Files), "bytes", artifactBytes)
+	if err := params.Copier.CopyObjects(ctx, copies); err != nil {
+		return backupPartResult{}, fmt.Errorf("copy backup part %s: %w", part.Name, err)
+	}
+	if err := params.Copier.UploadDir(ctx, dir, params.Bucket, sourceKey); err != nil {
+		return backupPartResult{}, fmt.Errorf("upload backup part metadata %s: %w", part.Name, err)
+	}
+
+	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
+	partState.JobName = params.JobName
+	partState.SourceArtifactBytes = artifactBytes
+	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
+		return backupPartResult{}, fmt.Errorf("create state for %s: %w", sourceKey, err)
+	}
+	return backupPartResult{Index: task.Index, PartID: partID, Bytes: artifactBytes}, nil
+}
+
+func downloadBackupChain(ctx context.Context, copier s3copy.Copier, backupURI, dir string) ([]chbackup.Layer, error) {
+	currentURI := strings.TrimRight(strings.TrimSpace(backupURI), "/")
+	seen := make(map[string]struct{})
+	var layers []chbackup.Layer
+	var expectedUUID string
+	for depth := 0; depth < maxBackupChainDepth; depth++ {
+		if _, exists := seen[currentURI]; exists {
+			return nil, fmt.Errorf("ClickHouse backup chain contains a cycle at %s", currentURI)
+		}
+		seen[currentURI] = struct{}{}
+		bucket, prefix, err := parseS3Path(currentURI)
+		if err != nil {
+			return nil, err
+		}
+		indexPath := filepath.Join(dir, fmt.Sprintf("layer-%03d.backup", depth))
+		slog.Info("downloading ClickHouse backup index", "stage", "download_backup_index", "backup", currentURI, "layer", depth)
+		if err := copier.DownloadFile(ctx, bucket, path.Join(prefix, ".backup"), indexPath); err != nil {
+			return nil, fmt.Errorf("download ClickHouse backup index %s: %w", currentURI, err)
+		}
+		index, err := os.Open(indexPath)
+		if err != nil {
+			return nil, err
+		}
+		header, readErr := chbackup.ReadHeader(index)
+		closeErr := index.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read ClickHouse backup index %s: %w", currentURI, readErr)
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if expectedUUID != "" && header.UUID != expectedUUID {
+			return nil, fmt.Errorf("base backup %s has UUID %q, expected %q", currentURI, header.UUID, expectedUUID)
+		}
+		layers = append(layers, chbackup.Layer{Bucket: bucket, Prefix: prefix, IndexPath: indexPath})
+		if header.BaseBackup == "" {
+			return layers, nil
+		}
+		if header.BaseUUID == "" {
+			return nil, fmt.Errorf("incremental backup %s is missing base_backup_uuid", currentURI)
+		}
+		incrementalURI := currentURI
+		currentURI, err = parseBaseBackupS3URI(header.BaseBackup)
+		if err != nil {
+			return nil, fmt.Errorf("incremental backup %s: %w", incrementalURI, err)
+		}
+		expectedUUID = header.BaseUUID
+	}
+	return nil, fmt.Errorf("ClickHouse backup chain exceeds %d layers", maxBackupChainDepth)
+}
+
+func parseBaseBackupS3URI(locator string) (string, error) {
+	locator = strings.TrimSpace(locator)
+	const prefix = "S3('"
+	const suffix = "')"
+	if !strings.HasPrefix(locator, prefix) || !strings.HasSuffix(locator, suffix) {
+		return "", fmt.Errorf("unsupported base backup locator %q; expected S3('s3://bucket/prefix')", locator)
+	}
+	uri := strings.TrimSuffix(strings.TrimPrefix(locator, prefix), suffix)
+	if strings.ContainsRune(uri, '\'') {
+		return "", fmt.Errorf("unsupported quoted base backup URI in %q", locator)
+	}
+	if _, _, err := parseS3Path(uri); err != nil {
+		return "", fmt.Errorf("invalid base backup locator %q: %w", locator, err)
+	}
+	return strings.TrimRight(uri, "/"), nil
+}
+
+func downloadBackupFile(ctx context.Context, copier s3copy.Copier, file chbackup.File, destination string) error {
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	if file.Size == 0 {
+		return os.WriteFile(destination, nil, 0o644)
+	}
+	if len(file.Segments) == 0 {
+		return fmt.Errorf("backup file %s has no source segments", file.Name)
+	}
+	if len(file.Segments) == 1 {
+		segment := file.Segments[0]
+		return copier.DownloadFile(ctx, segment.Bucket, segment.Key, destination)
+	}
+	segmentDir, err := os.MkdirTemp(filepath.Dir(destination), "partforge-backup-segments-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(segmentDir)
+	downloads := make([]s3copy.ObjectDownload, 0, len(file.Segments))
+	paths := make([]string, 0, len(file.Segments))
+	for i, segment := range file.Segments {
+		segmentPath := filepath.Join(segmentDir, strconv.Itoa(i))
+		downloads = append(downloads, s3copy.ObjectDownload{SourceBucket: segment.Bucket, SourceKey: segment.Key, DestinationPath: segmentPath})
+		paths = append(paths, segmentPath)
+	}
+	if err := copier.DownloadObjects(ctx, downloads); err != nil {
+		return err
+	}
+	return fileutil.ConcatFiles(destination, paths)
+}
+
+func parseS3Path(value string) (string, string, error) {
+	if !strings.HasPrefix(value, "s3://") {
+		return "", "", fmt.Errorf("backup must be an s3:// URI")
+	}
+	remainder := strings.TrimPrefix(value, "s3://")
+	bucket, prefix, ok := strings.Cut(remainder, "/")
+	prefix = strings.Trim(prefix, "/")
+	if !ok || bucket == "" || prefix == "" {
+		return "", "", fmt.Errorf("backup must include an S3 bucket and exact backup prefix")
+	}
+	if strings.ContainsAny(bucket+prefix, "*?[]{}\r\n") {
+		return "", "", fmt.Errorf("backup S3 URI contains unsupported characters")
+	}
+	return bucket, prefix, nil
 }
 
 func runUploadFreeze(ctx context.Context, args []string) error {
@@ -837,11 +1252,15 @@ func registerSourcePartsFromJob(ctx context.Context, store *state.Store, copier 
 type uploadPartFunc func(context.Context, int, uploadPartTask) (uploadPartResult, error)
 
 func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurrency int, upload uploadPartFunc, onResult func(uploadPartResult)) error {
+	return processTasksInParallel(ctx, tasks, concurrency, upload, onResult, "part upload")
+}
+
+func processTasksInParallel[T, R any](ctx context.Context, tasks []T, concurrency int, process func(context.Context, int, T) (R, error), onResult func(R), description string) error {
 	if concurrency < 1 {
 		return errors.New("upload concurrency must be at least 1")
 	}
-	if upload == nil {
-		return errors.New("upload function is required")
+	if process == nil {
+		return fmt.Errorf("%s function is required", description)
 	}
 	if len(tasks) == 0 {
 		return nil
@@ -853,8 +1272,8 @@ func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurre
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	taskCh := make(chan uploadPartTask)
-	resultCh := make(chan uploadPartResult)
+	taskCh := make(chan T)
+	resultCh := make(chan R)
 	errCh := make(chan error, 1)
 
 	var wg sync.WaitGroup
@@ -866,7 +1285,7 @@ func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurre
 				if uploadCtx.Err() != nil {
 					return
 				}
-				result, err := upload(uploadCtx, workerID, task)
+				result, err := process(uploadCtx, workerID, task)
 				if err != nil {
 					select {
 					case errCh <- err:
@@ -913,7 +1332,7 @@ func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurre
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				return fmt.Errorf("part upload workers stopped after %d of %d parts", completed, len(tasks))
+				return fmt.Errorf("%s workers stopped after %d of %d tasks", description, completed, len(tasks))
 			}
 			completed++
 			if onResult != nil {

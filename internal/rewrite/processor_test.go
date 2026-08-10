@@ -1268,6 +1268,34 @@ func TestWorkerFreezeNameNeedsNoClickHouseEscaping(t *testing.T) {
 	}
 }
 
+func TestDownloadManifestSourceObjectsConcatenatesSegments(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(t.TempDir(), "s5cmd")
+	first := filepath.Join(root, ".partforge-segments", "0", "0")
+	second := filepath.Join(root, ".partforge-segments", "0", "1")
+	script := "#!/bin/sh\n" +
+		"printf first > " + shellQuote(first) + "\n" +
+		"printf second > " + shellQuote(second) + "\n" +
+		"cat >/dev/null\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	objects := []manifest.SourceObject{
+		{Bucket: "base", Key: "data/prefix", Path: "projection/data.bin"},
+		{Bucket: "incremental", Key: "data/suffix", Path: "projection/data.bin"},
+	}
+	if err := downloadManifestSourceObjects(context.Background(), s3copy.Copier{Binary: binary}, objects, root); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "projection", "data.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "firstsecond" {
+		t.Fatalf("concatenated file = %q, want firstsecond", got)
+	}
+}
+
 func fakeS5cmdRecorder(t *testing.T) (string, string) {
 	t.Helper()
 	dir := t.TempDir()

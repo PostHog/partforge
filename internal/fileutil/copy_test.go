@@ -52,3 +52,26 @@ func TestMoveDirRejectsExistingDestination(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestConcatFiles(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	if err := os.WriteFile(first, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("-suffix"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "out", "combined")
+	if err := ConcatFiles(destination, []string{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "base-suffix" {
+		t.Fatalf("combined contents = %q", got)
+	}
+}
