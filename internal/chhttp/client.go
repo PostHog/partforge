@@ -59,6 +59,7 @@ func (c Client) QueryStringWithOptions(ctx context.Context, query string, opts Q
 	if err != nil {
 		return "", err
 	}
+	req.Close = true
 	if c.User != "" {
 		req.SetBasicAuth(c.User, c.Password)
 	}

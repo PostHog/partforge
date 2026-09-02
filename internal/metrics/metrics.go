@@ -493,6 +493,7 @@ func (p *Prometheus) scrapeClickHouse(ctx context.Context) (map[string]*dto.Metr
 	if err != nil {
 		return nil, true, fmt.Errorf("build ClickHouse Prometheus scrape request: %w", err)
 	}
+	req.Close = true
 	req.Header.Set("Accept", string(expfmt.NewFormat(expfmt.TypeTextPlain)))
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
