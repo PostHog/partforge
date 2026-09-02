@@ -2,7 +2,13 @@ INSERT INTO dst.events_new
 SELECT
     id,
     name,
-    concat(toString(amount), substring(JSONCleanPostHogEventProperties(concat('{"id":', toString(id), '}')), 1, 0)) AS amount_text,
+    concat(
+        toString(amount),
+        substring(JSONCleanPostHogEventProperties(concat('{"id":', toString(id), '}')), 1, 0),
+        substring(JSONCleanPostHogPersonProperties(concat('{"id":', toString(id), '}')), 1, 0),
+        substring(JSONDropKeys(['drop'])(concat('{"id":', toString(id), '}')), 1, 0),
+        substring(JSONStripEmptyStringsAndNulls(concat('{"id":', toString(id), '}')), 1, 0)
+    ) AS amount_text,
     event_date,
     1 AS migrated
 FROM

@@ -7,6 +7,7 @@ import shutil
 import sys
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -34,35 +35,24 @@ def url_for(base_url: str, name: str) -> str:
     return f"{base_url.rstrip('/')}/{name.lstrip('/')}"
 
 
-def resolve_release(repository: str, release: str) -> str:
-    if release != "latest":
-        return release
-
-    url = f"https://api.github.com/repos/{repository}/releases/latest"
+def resolve_revision(repository: str, revision: str) -> str:
+    url = f"https://api.github.com/repos/{repository}/commits/{revision}"
     try:
         with urllib.request.urlopen(url) as response:
             payload = json.load(response)
     except urllib.error.URLError as error:
-        raise RuntimeError(f"failed to resolve latest release for {repository}: {error}") from error
+        raise RuntimeError(f"failed to resolve {repository}@{revision}: {error}") from error
 
-    tag_name = payload.get("tag_name")
-    if not isinstance(tag_name, str) or not tag_name:
-        raise ValueError(f"latest release for {repository} did not include tag_name")
-    return tag_name
+    commit = payload.get("sha")
+    if not isinstance(commit, str) or not commit:
+        raise ValueError(f"{repository}@{revision} did not resolve to a commit")
+    return commit
 
 
-def source_urls(config: dict[str, Any]) -> tuple[str, str]:
-    release_base_url = config.get("release_base_url")
-    config_base_url = config.get("config_base_url")
-    if isinstance(release_base_url, str) and isinstance(config_base_url, str):
-        return release_base_url, config_base_url
-
+def source_url(config: dict[str, Any]) -> str:
     repository = require_str(config, "repository")
-    release = resolve_release(repository, require_str(config, "release"))
-    return (
-        f"https://github.com/{repository}/releases/download/{release}",
-        f"https://raw.githubusercontent.com/{repository}/{release}/udf",
-    )
+    revision = resolve_revision(repository, require_str(config, "revision"))
+    return f"https://raw.githubusercontent.com/{repository}/{revision}"
 
 
 def download(url: str, destination: Path) -> None:
@@ -71,6 +61,25 @@ def download(url: str, destination: Path) -> None:
             shutil.copyfileobj(response, output)
     except urllib.error.URLError as error:
         raise RuntimeError(f"failed to download {url}: {error}") from error
+
+
+def install_function_config(manifest_url: str, names: list[str], destination: Path) -> None:
+    try:
+        with urllib.request.urlopen(manifest_url) as response:
+            source = ET.parse(response).getroot()
+    except (urllib.error.URLError, ET.ParseError) as error:
+        raise RuntimeError(f"failed to load UDF manifest {manifest_url}: {error}") from error
+
+    functions = {function.findtext("name"): function for function in source.findall("function")}
+    missing = [name for name in names if name not in functions]
+    if missing:
+        raise ValueError(f"UDF manifest is missing functions: {', '.join(missing)}")
+
+    selected = ET.Element("functions")
+    for name in names:
+        selected.append(functions[name])
+    ET.indent(selected)
+    ET.ElementTree(selected).write(destination, encoding="unicode")
 
 
 def chown_clickhouse(paths: list[Path]) -> None:
@@ -93,8 +102,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def install_udfs(config_path: Path, arch: str, config_dir: Path, data_path: Path) -> None:
     config = load_config(config_path)
-    release_base_url, config_base_url = source_urls(config)
-    loader_config_name = require_str(config, "loader_config_name")
+    base_url = source_url(config)
+    manifest_path = require_str(config, "manifest_path")
+    binary_source_path = require_str(config, "binary_path")
     udfs = config.get("udfs")
     if not isinstance(udfs, list) or not udfs:
         raise ValueError("missing non-empty list field: udfs")
@@ -108,25 +118,37 @@ def install_udfs(config_path: Path, arch: str, config_dir: Path, data_path: Path
     installed_paths = [config_d_dir, user_defined_dir, user_scripts_dir]
 
     loader_config_path = config_d_dir / "clickhouse-util-udfs.xml"
-    download(url_for(config_base_url, loader_config_name), loader_config_path)
+    loader_config_path.write_text(
+        "<clickhouse><user_defined_executable_functions_config>"
+        "/etc/clickhouse-server/user_defined/*_function.xml"
+        "</user_defined_executable_functions_config></clickhouse>\n"
+    )
     loader_config_path.chmod(0o644)
     installed_paths.append(loader_config_path)
 
+    function_names: list[str] = []
+    binaries: list[str] = []
     for udf in udfs:
         if not isinstance(udf, dict):
             raise ValueError("each UDF entry must be a YAML object")
 
-        binary_name = require_str(udf, "binary_name")
-        config_name = require_str(udf, "config_name")
-        config_dest_name = require_str(udf, "config_dest_name")
+        binaries.append(require_str(udf, "binary_name"))
+        names = udf.get("function_names")
+        if not isinstance(names, list) or not names or not all(isinstance(name, str) and name for name in names):
+            raise ValueError("each UDF entry must have non-empty string list field: function_names")
+        function_names.extend(names)
 
+    source_arch = {"amd64": "x86_64", "arm64": "aarch64"}[arch]
+    for binary_name in binaries:
         binary_path = user_scripts_dir / binary_name
-        config_path = user_defined_dir / config_dest_name
-        download(url_for(release_base_url, f"{binary_name}-linux-{arch}"), binary_path)
-        download(url_for(config_base_url, config_name), config_path)
+        download(url_for(base_url, f"{binary_source_path}/{binary_name}_{source_arch}"), binary_path)
         binary_path.chmod(0o550)
-        config_path.chmod(0o644)
-        installed_paths.extend([binary_path, config_path])
+        installed_paths.append(binary_path)
+
+    function_config_path = user_defined_dir / "clickhouse-util-udfs_function.xml"
+    install_function_config(url_for(base_url, manifest_path), function_names, function_config_path)
+    function_config_path.chmod(0o644)
+    installed_paths.append(function_config_path)
 
     chown_clickhouse(installed_paths)
 
