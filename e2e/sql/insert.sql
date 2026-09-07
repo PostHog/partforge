@@ -12,7 +12,7 @@ SELECT
     event_date,
     JSONCleanPostHogTemporaryProperties(
         concat('{"$set":{"id":', toString(id), '},"permanent":true}')
-    ) = concat('{"$set":{"id":', toString(id), '}}') AS migrated
+    ) = concat('{"$set":{"id":', toString(id), '}}') AND s3_migrated AS migrated
 FROM
 (
     SELECT * FROM src.events WHERE id % 3 = 0
@@ -20,7 +20,9 @@ FROM
     SELECT * FROM src.events WHERE id % 3 = 1
     UNION ALL
     SELECT * FROM src.events WHERE id % 3 = 2
-)
+) AS source
+-- No explicit credentials: the worker's default profile must allow its AWS identity.
+CROSS JOIN s3('http://localstack:4566/partforge/e2e-s3-credentials.tsv', 'TSV', 's3_migrated UInt8') AS flags
 SETTINGS
     max_block_size = 1,
     min_insert_block_size_rows = 0,

@@ -17,7 +17,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     GOPROXY=off CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=readonly -o /out/partforge ./cmd/partforge
 
-FROM ghcr.io/posthog/clickhouse-posthog:26.8.2.7-posthog-r1 AS clickhouse
+FROM ghcr.io/posthog/clickhouse-posthog:26.8.2.7-posthog-r4 AS clickhouse
 
 FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
@@ -47,6 +47,7 @@ RUN chmod 0755 /usr/local/bin/install-clickhouse-util-udfs \
         install-clickhouse-util-udfs /etc/partforge/clickhouse-util-udfs.yml "$TARGETARCH"
 
 FROM clickhouse-runtime AS worker
+COPY --chown=clickhouse:clickhouse clickhouse/users.d/partforge.xml /etc/clickhouse-server/users.d/partforge.xml
 COPY --from=build /out/partforge /usr/local/bin/partforge
 COPY --from=s5cmd /s5cmd /usr/local/bin/s5cmd
 COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/etc/clickhouse-server/config.d/clickhouse-util-udfs.xml /etc/clickhouse-server/config.d/clickhouse-util-udfs.xml

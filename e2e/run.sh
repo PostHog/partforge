@@ -104,6 +104,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 docker compose exec -T localstack awslocal s3 mb s3://partforge >/dev/null 2>&1 || true
+printf '1\n' | docker compose exec -T localstack awslocal s3 cp - s3://partforge/e2e-s3-credentials.tsv >/dev/null
 
 for _ in $(seq 1 60); do
   if docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null 2>&1; then
