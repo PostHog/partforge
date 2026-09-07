@@ -7,6 +7,7 @@ udfs:
     function_names:
       - JSONCleanPostHogEventProperties
       - JSONCleanPostHogPersonProperties
+      - JSONCleanPostHogTemporaryProperties
   - binary_name: json_drop_keys_udf
     function_names:
       - JSONDropKeys

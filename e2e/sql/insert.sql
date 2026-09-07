@@ -10,7 +10,9 @@ SELECT
         substring(JSONStripEmptyStringsAndNulls(concat('{"id":', toString(id), '}')), 1, 0)
     ) AS amount_text,
     event_date,
-    1 AS migrated
+    JSONCleanPostHogTemporaryProperties(
+        concat('{"$set":{"id":', toString(id), '},"permanent":true}')
+    ) = concat('{"$set":{"id":', toString(id), '}}') AS migrated
 FROM
 (
     SELECT * FROM src.events WHERE id % 3 = 0
