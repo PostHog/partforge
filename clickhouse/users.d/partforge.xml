@@ -1,6 +1,7 @@
 <clickhouse>
     <profiles>
         <default>
+            <optimize_on_insert>0</optimize_on_insert>
             <!-- Worker SQL uses the same AWS identity as the worker process. -->
             <s3_allow_server_credentials_in_user_queries>1</s3_allow_server_credentials_in_user_queries>
         </default>
