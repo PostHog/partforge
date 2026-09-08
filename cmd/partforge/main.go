@@ -71,6 +71,7 @@ type commandHelp struct {
 }
 
 var commandHelps = []commandHelp{
+	{Name: "migrate", Usage: "[flags]", Summary: "Apply pending Postgres state schema migrations.", Details: "Run once before starting workers. Adopts existing state tables. Stop workers while migrating; schema changes and backfills run in one transaction."},
 	{
 		Name:    "upload-backup",
 		Usage:   "[flags]",
@@ -266,6 +267,8 @@ func run() error {
 	defer stop()
 
 	switch os.Args[1] {
+	case "migrate":
+		return runMigrate(ctx, os.Args[2:])
 	case "upload-backup":
 		return runUploadBackup(ctx, os.Args[2:])
 	case "upload-freeze":
@@ -1725,6 +1728,7 @@ func runWorker(ctx context.Context, args []string) error {
 			if roleSettings.Compact {
 				didCompactWork, err := runWorkerCompaction(ctx, workerCompactionConfig{
 					StateStore:                    stateStore,
+					Once:                          *once,
 					WorkerID:                      resolvedWorkerID,
 					WorkDir:                       *workDir,
 					ClickHouseURL:                 *clickHouseURL,
@@ -2018,6 +2022,7 @@ func createWorkerRunDirs(workDir string) (workerRunDirs, error) {
 }
 
 type workerCompactionConfig struct {
+	Once                          bool
 	StateStore                    *state.Store
 	WorkerID                      string
 	WorkDir                       string
@@ -2068,38 +2073,17 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			return false, err
 		}
 	}
-	if cfg.CompactLeaseStaleAfter > 0 {
-		now := time.Now().UTC()
-		released, err := cfg.StateStore.ReleaseStaleCompactingParts(ctx, now, cfg.CompactLeaseStaleAfter)
-		if err != nil {
-			if ctx.Err() != nil {
-				slog.Info("worker shutdown requested while releasing stale compact work", "stage", "shutdown")
-				return false, nil
-			}
-			return false, err
-		}
-		if released > 0 {
-			slog.Warn("released stale compacting parts", "stage", "release_stale_compact", "worker_id", cfg.WorkerID, "released", released, "stale_after", cfg.CompactLeaseStaleAfter)
-		}
+	finalized, err := cfg.StateStore.MaintainCompaction(ctx, cfg.CompactWindow, cfg.CompactLeaseStaleAfter, time.Now().UTC(), cfg.Once)
+	if err != nil {
+		return false, err
 	}
-	finalization := compactFinalizationResult{}
-	if cfg.CompactWindow > 0 {
-		var err error
-		finalization, err = finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
-		if err != nil {
-			return false, err
-		}
-		if finalization.Finalized > 0 {
-			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalization.Finalized)
-			return true, nil
-		}
-		if len(finalization.ExpiredJobIDs) > 0 {
-			slog.Info("skipping compact claims for jobs past compact window", "stage", "claim_compact", "worker_id", cfg.WorkerID, "jobs", len(finalization.ExpiredJobIDs))
-		}
+	if finalized > 0 {
+		slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalized)
+		return true, nil
 	}
 	slog.Info("claiming compact-ready batch", "stage", "claim_compact", "worker_id", cfg.WorkerID)
 	batch, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
-		ExcludedJobIDs: finalization.ExpiredJobIDs,
+		CompactWindow: cfg.CompactWindow,
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -2109,14 +2093,6 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		return false, err
 	}
 	if batch == nil {
-		finalization, err := finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
-		if err != nil {
-			return false, err
-		}
-		if finalization.Finalized > 0 {
-			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalization.Finalized)
-			return true, nil
-		}
 		return false, nil
 	}
 	currentBatch := func() state.CompactBatch {
@@ -2174,11 +2150,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		DestinationSchema:   batch.Parts[0].DestinationSchema,
 		Inputs:              compactInputs(batch.Parts),
 	}
-	jobParts, err := cfg.StateStore.ListJobParts(ctx, batch.JobID)
-	if err != nil {
-		return true, markCompactBatchFailed(fmt.Errorf("list job parts for compact deadline: %w", err))
-	}
-	compactDeadline, err := compactBatchDeadline(jobParts, cfg.CompactWindow, time.Now().UTC())
+	compactDeadline, err := cfg.StateStore.CompactDeadline(ctx, batch.JobID, cfg.CompactWindow)
 	if err != nil {
 		return true, markCompactBatchFailed(err)
 	}
@@ -2191,13 +2163,13 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		}
 		slog.Info("compact window expired before compact batch started; released", "stage", "compact_window_expired", "job_id", batch.JobID, "output_part_id", outputPartID)
 		finalizeCtx, finalizeCancel := workerStateUpdateContext()
-		finalization, finalizeErr := finalizeCompactReadyJob(finalizeCtx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
+		finalized, finalizeErr := cfg.StateStore.FinalizeCompactReadyJob(finalizeCtx, batch.JobID, cfg.CompactWindow, time.Now().UTC())
 		finalizeCancel()
 		if finalizeErr != nil {
 			return true, finalizeErr
 		}
-		if finalization.Finalized > 0 {
-			slog.Info("finalized compact-ready artifacts after compact window expiration", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalization.Finalized)
+		if finalized > 0 {
+			slog.Info("finalized compact-ready artifacts after compact window expiration", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalized)
 		}
 		return true, nil
 	}
@@ -2274,14 +2246,14 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			return true, nil
 		}
 		finalizeCtx, finalizeCancel := workerStateUpdateContext()
-		finalization, finalizeErr := finalizeCompactReadyJob(finalizeCtx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
+		finalized, finalizeErr := cfg.StateStore.FinalizeCompactReadyJob(finalizeCtx, batch.JobID, cfg.CompactWindow, time.Now().UTC())
 		finalizeCancel()
 		if finalizeErr != nil {
 			cleanupCompactNow()
 			return true, finalizeErr
 		}
-		if finalization.Finalized > 0 {
-			slog.Info("finalized compact-ready artifacts after no-reduction compaction", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalization.Finalized)
+		if finalized > 0 {
+			slog.Info("finalized compact-ready artifacts after no-reduction compaction", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalized)
 		}
 		cleanupCompactNow()
 		return true, nil
@@ -2591,59 +2563,6 @@ func compactClaimSplayMax(compactWindow time.Duration) time.Duration {
 	return 250 * time.Millisecond
 }
 
-type compactFinalizationResult struct {
-	Finalized     int
-	ExpiredJobIDs map[string]struct{}
-}
-
-func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWindow time.Duration, now time.Time) (compactFinalizationResult, error) {
-	result := compactFinalizationResult{ExpiredJobIDs: map[string]struct{}{}}
-	jobIDs, err := store.ListJobIDsByStatus(ctx, state.StatusCompactReady)
-	if err != nil {
-		return result, err
-	}
-	for _, jobID := range jobIDs {
-		jobResult, err := finalizeCompactReadyJob(ctx, store, jobID, compactWindow, now)
-		if err != nil {
-			return result, err
-		}
-		result.Finalized += jobResult.Finalized
-		for expiredJobID := range jobResult.ExpiredJobIDs {
-			result.ExpiredJobIDs[expiredJobID] = struct{}{}
-		}
-	}
-	return result, nil
-}
-
-func finalizeCompactReadyJob(ctx context.Context, store *state.Store, jobID string, compactWindow time.Duration, now time.Time) (compactFinalizationResult, error) {
-	result := compactFinalizationResult{ExpiredJobIDs: map[string]struct{}{}}
-	parts, err := store.ListJobParts(ctx, jobID)
-	if err != nil {
-		return result, err
-	}
-	expired, err := compactWindowExpired(parts, compactWindow, now)
-	if err != nil {
-		return result, err
-	}
-	if expired {
-		result.ExpiredJobIDs[jobID] = struct{}{}
-	}
-	compactReady, ok, err := finalizableCompactReadyParts(parts, compactWindow, now)
-	if err != nil {
-		return result, err
-	}
-	if !ok {
-		return result, nil
-	}
-	for _, part := range compactReady {
-		if err := store.MarkCompactReadyFinished(ctx, part, now); err != nil {
-			return result, err
-		}
-		result.Finalized++
-	}
-	return result, nil
-}
-
 func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duration, now time.Time) ([]state.Part, bool, error) {
 	compactReady := compactReadyParts(parts)
 	if len(compactReady) == 0 {
@@ -2860,6 +2779,27 @@ func runImportFinished(ctx context.Context, args []string) error {
 			return stateStore.MarkImportFailed(ctx, part, cause, time.Now().UTC())
 		},
 	})
+}
+
+func runMigrate(ctx context.Context, args []string) error {
+	fs := newCommandFlagSet("migrate")
+	configPath := fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+	stateTable := fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+	region := fs.String("aws-region", "", "AWS region for Postgres IAM auth")
+	postgresURL := fs.String("postgres-url", "", "Postgres state store connection URL")
+	postgresIAMAuth := fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "migrate"); err != nil {
+		return err
+	}
+	applied, err := state.Migrate(ctx, state.Config{Region: *region, Endpoint: *postgresURL, IAMAuth: *postgresIAMAuth, Table: *stateTable})
+	if err != nil {
+		return err
+	}
+	slog.Info("state schema is up to date", "migrations_applied", applied, "state_table", *stateTable)
+	return nil
 }
 
 func runListJobs(ctx context.Context, args []string) error {

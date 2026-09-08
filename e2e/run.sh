@@ -114,6 +114,9 @@ for _ in $(seq 1 60); do
 done
 docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null
 
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker migrate -postgres-url="$POSTGRES_URL"
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker migrate -postgres-url="$POSTGRES_URL"
+
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 
 docker compose exec -T clickhouse clickhouse-client --query \

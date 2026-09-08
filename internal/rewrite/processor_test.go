@@ -17,6 +17,7 @@ import (
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/freeze"
 	"github.com/PostHog/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/metrics"
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
@@ -967,19 +968,33 @@ func TestInsertSelectRetryBackoff(t *testing.T) {
 	}
 }
 
-func TestShouldReportProgress(t *testing.T) {
-	now := time.Unix(100, 0)
-	if shouldReportProgress(0, time.Time{}, now) {
-		t.Fatal("expected disabled interval to skip progress report")
+func TestQueryProgressSharesStageHeartbeat(t *testing.T) {
+	tracker := newRewriteStageTracker(time.Now(), stageInsertSelect)
+	var snapshots []ProgressSnapshot
+	p := Processor{progressTracker: tracker, ReportProgress: func(_ context.Context, _ manifest.Manifest, snapshot ProgressSnapshot) error {
+		snapshots = append(snapshots, snapshot)
+		return nil
+	}}
+	p.recordQueryProgress(metrics.QueryProgress{ReadRows: 10})
+	p.recordQueryProgress(metrics.QueryProgress{ReadRows: 20})
+	if len(snapshots) != 0 {
+		t.Fatal("query polling wrote progress")
 	}
-	if !shouldReportProgress(15*time.Second, time.Time{}, now) {
-		t.Fatal("expected first progress report")
+	m := manifest.Manifest{JobID: "job", PartID: "part"}
+	if err := p.reportStageSnapshot(context.Background(), m, tracker); err != nil {
+		t.Fatal(err)
 	}
-	if shouldReportProgress(15*time.Second, now.Add(-14*time.Second), now) {
-		t.Fatal("expected interval gate to skip report")
+	if len(snapshots) != 1 || snapshots[0].QueryProgress.ReadRows != 20 || snapshots[0].StageProgress.Stage != stageInsertSelect {
+		t.Fatalf("combined snapshots: %+v", snapshots)
 	}
-	if !shouldReportProgress(15*time.Second, now.Add(-15*time.Second), now) {
-		t.Fatal("expected interval gate to allow report")
+	if err := p.reportFinalQueryProgress(context.Background(), m, metrics.QueryProgress{ReadRows: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.reportStageSnapshot(context.Background(), m, tracker); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 3 || snapshots[1].QueryProgress.ReadRows != 30 || snapshots[2].QueryProgress.ReadRows != 30 {
+		t.Fatalf("final snapshots: %+v", snapshots)
 	}
 }
 
@@ -1076,44 +1091,33 @@ func TestProgressHeartbeatDisabled(t *testing.T) {
 	}
 }
 
-func TestProgressHeartbeatReportFailureContinues(t *testing.T) {
-	reportErr := errors.New("progress update failed")
-	attempts := make(chan struct{}, 8)
+func TestProgressHeartbeatReportFailureCancelsProcessing(t *testing.T) {
+	reportErr := errors.New("lost ownership")
 	reports := 0
-	processor := Processor{
-		ProgressInterval: time.Millisecond,
-		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
-			reports++
-			attempts <- struct{}{}
-			if reports == 2 {
-				return reportErr
-			}
-			return nil
-		},
-	}
-
-	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
-	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker)
+	processor := Processor{ProgressInterval: time.Millisecond, ReportProgress: func(context.Context, manifest.Manifest, ProgressSnapshot) error {
+		reports++
+		if reports > 1 {
+			return reportErr
+		}
+		return nil
+	}}
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{}, newRewriteStageTracker(time.Now(), stageProcessPart))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		if err := heartbeat.Stop(); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	for i := 0; i < 4; i++ {
-		select {
-		case <-attempts:
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for heartbeat report")
-		}
-	}
 	select {
 	case <-heartbeat.Context().Done():
-		t.Fatal("heartbeat context was canceled by report failure")
-	default:
+	case <-time.After(time.Second):
+		t.Fatal("processing was not canceled")
+	}
+	if err := heartbeat.Stop(); !errors.Is(err, reportErr) {
+		t.Fatalf("stop error = %v", err)
+	}
+	if reports != 2 {
+		t.Fatalf("reports = %d", reports)
+	}
+	if _, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{}, newRewriteStageTracker(time.Now(), stageProcessPart)); !errors.Is(err, reportErr) {
+		t.Fatalf("initial report error = %v", err)
 	}
 }
 
