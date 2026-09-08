@@ -121,6 +121,9 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "promote insert partition p1") || inserts != 1 || truncates != 0 || exchanged {
 					t.Fatalf("promotion failure retried or completed: err=%v inserts=%d truncates=%d exchanged=%t", err, inserts, truncates, exchanged)
 				}
+				if !strings.Contains(err.Error(), "chunk=1/3 _part_offset=[0,3) completed_chunks=0 insert_attempts=1 source_rows=7") {
+					t.Fatalf("promotion failure lost chunk context: %v", err)
+				}
 				return
 			}
 			if err != nil {
@@ -148,6 +151,53 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 				if id != fmt.Sprintf("partforge-job-part-attempt-%d", i+1) {
 					t.Fatalf("query IDs must remain unique across chunks: %v", ids)
 				}
+			}
+		})
+	}
+}
+
+func TestInsertFailureNote(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		minimum    uint64
+		failInsert int
+	}{
+		{"later chunk", "chunk=2/3 _part_offset=[3,5) completed_chunks=1 insert_attempts=2 source_rows=7", 2, 2},
+		{"unchunked", "chunk=1/1 _part_offset=[0,7) completed_chunks=0 insert_attempts=1 source_rows=7", 0, 1},
+		{"finalization", "insert finalization (chunks=3 completed_chunks=3 insert_attempts=3 source_rows=7)", 2, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inserts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				query := string(body)
+				if strings.HasPrefix(query, "SELECT count(),") && strings.Contains(query, "system.parts") {
+					fmt.Fprint(w, "1\t7\t100\n")
+				}
+				if strings.HasPrefix(query, "INSERT ") {
+					inserts++
+					if inserts == tc.failInsert {
+						http.Error(w, "MEMORY_LIMIT_EXCEEDED", 500)
+					}
+				}
+				if strings.HasPrefix(query, "EXCHANGE TABLES ") {
+					http.Error(w, "exchange failed", 500)
+				}
+			}))
+			defer server.Close()
+			err := (Processor{
+				ClickHouse: chhttp.Client{URL: server.URL}, InsertChunkMinRows: tc.minimum,
+				InsertSettings: chhttp.QuerySettings{"max_threads": "1", "max_insert_threads": "1", "max_block_size": "8192"},
+			}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
+				Source: manifest.TableRef{Database: "db", Table: "src"},
+				Dest:   manifest.TableRef{Database: "db", Table: "dst"},
+				SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO db.dst SELECT * FROM db.src"},
+			}, 7)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("failure note = %v, want %q", err, tc.want)
+			}
+			if tc.failInsert > 0 && !strings.Contains(err.Error(), "MEMORY_LIMIT_EXCEEDED") {
+				t.Fatalf("lost ClickHouse failure: %v", err)
 			}
 		})
 	}

@@ -22,6 +22,55 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
+func TestProcessPartFailureIncludesSourceLocation(t *testing.T) {
+	m := manifest.Manifest{
+		Version: manifest.Version, JobID: "original-job", PartID: "original-part",
+		Source: manifest.TableRef{Database: "db", Table: "src"},
+		Dest:   manifest.TableRef{Database: "db", Table: "dst"},
+		Part:   manifest.SourcePart{Disk: "default", Name: "202601_1_1_0", RelativePath: "store/202601_1_1_0"},
+		SQL:    manifest.SQLBundle{SourceSchema: "source DDL", DestinationSchema: "destination DDL", InsertSelect: "INSERT SELECT"},
+		S3:     manifest.S3Refs{Bucket: "backup-bucket", SourceKey: "jobs/original/source/part", FinishedKey: "finished"},
+	}
+	fixture := t.TempDir()
+	if err := artifact.WriteManifest(fixture, m); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PARTFORGE_TEST_MANIFEST", filepath.Join(fixture, artifact.ManifestName))
+	binary := filepath.Join(t.TempDir(), "s5cmd")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nset -eu\nfor dest do :; done\nmkdir -p \"$dest\"\ncp \"$PARTFORGE_TEST_MANIFEST\" \"$dest/manifest.json\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{stageDownloadSource, stagePrepareWorkerTables} {
+		t.Run(stage, func(t *testing.T) {
+			cause := errors.New("test failure")
+			_, err := (Processor{
+				WorkDir: t.TempDir(), S3Copy: s3copy.Copier{Binary: binary},
+				ReportProgress: func(_ context.Context, _ manifest.Manifest, snapshot ProgressSnapshot) error {
+					if snapshot.StageProgress != nil && snapshot.StageProgress.Stage == stage {
+						return cause
+					}
+					return nil
+				},
+			}).ProcessPart(context.Background(), WorkItem{
+				JobID: "copied-job", PartID: "copied-part", SourceJobID: m.JobID, SourcePartID: m.PartID,
+				Bucket: m.S3.Bucket, SourceKey: m.S3.SourceKey, FinishedKey: "copy-finished", Attempt: 2,
+				DestinationDatabase: "db", DestinationTable: "dst", DestinationSchema: m.SQL.DestinationSchema, InsertSelect: m.SQL.InsertSelect,
+			})
+			if !errors.Is(err, cause) {
+				t.Fatalf("lost failure cause: %v", err)
+			}
+			for _, detail := range []string{"stage=" + stage, "part_attempt=2", `source_manifest="s3://backup-bucket/jobs/original/source/part/manifest.json"`} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("failure %q is missing %q", err, detail)
+				}
+			}
+			if stage == stagePrepareWorkerTables && !strings.Contains(err.Error(), "source_table=`db`.`src` source_part=\"202601_1_1_0\"") {
+				t.Errorf("missing source part identity: %v", err)
+			}
+		})
+	}
+}
+
 func TestReduceInsertSelectSettings(t *testing.T) {
 	next, reduced, err := reduceInsertSelectSettings(chhttp.QuerySettings{
 		"max_threads":        "8",

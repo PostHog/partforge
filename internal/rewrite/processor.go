@@ -308,6 +308,20 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 
 	progressManifest := manifest.Manifest{JobID: item.JobID, PartID: item.PartID}
 	stageTracker := newRewriteStageTracker(startedAt, stageProcessPart)
+	var sourceManifest *manifest.Manifest
+	defer func() {
+		if err == nil {
+			return
+		}
+		details := fmt.Sprintf("stage=%s part_attempt=%d source_manifest=%q",
+			stageTracker.Snapshot(time.Now()).Stage, item.Attempt,
+			"s3://"+item.Bucket+"/"+strings.TrimRight(item.SourceKey, "/")+"/"+artifact.ManifestName)
+		if sourceManifest != nil {
+			details += fmt.Sprintf(" source_table=%s source_part=%q",
+				chhttp.TableSQL(sourceManifest.Source.Database, sourceManifest.Source.Table), sourceManifest.Part.Name)
+		}
+		err = fmt.Errorf("%s: %w", details, err)
+	}()
 	defer p.recorder().ClearStageProgress(progressManifest)
 	heartbeat, err := p.startProgressHeartbeat(ctx, progressManifest, stageTracker)
 	if err != nil {
@@ -349,6 +363,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
 	}
+	sourceManifest = &m
 	slog.Info(
 		"read source manifest",
 		"stage", "read_manifest",
@@ -657,7 +672,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 	chunks := insertChunkCount(sourceRows, p.InsertChunkMinRows)
 	if chunks > 1 {
 		if err := p.prepareInsertChunks(ctx, m); err != nil {
-			return err
+			return fmt.Errorf("prepare insert chunks (chunks=%d source_rows=%d): %w", chunks, sourceRows, err)
 		}
 	}
 	recorder := p.recorder()
@@ -671,7 +686,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 	if chunks > 1 {
 		completed.TotalRowsApprox = sourceRows
 	}
-	var chunk, start uint64
+	var chunk, start, end uint64
 	var promotionElapsed time.Duration
 	var successfulAttemptElapsed time.Duration
 	defer func() {
@@ -681,6 +696,13 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 		if retErr != nil {
 			result = "failed"
 			wasted = elapsed
+			if chunk < chunks {
+				retErr = fmt.Errorf("chunk=%d/%d _part_offset=[%d,%d) completed_chunks=%d insert_attempts=%d source_rows=%d: %w",
+					chunk+1, chunks, start, end, chunk, attempt, sourceRows, retErr)
+			} else {
+				retErr = fmt.Errorf("insert finalization (chunks=%d completed_chunks=%d insert_attempts=%d source_rows=%d): %w",
+					chunks, chunk, attempt, sourceRows, retErr)
+			}
 		} else if retries == 0 {
 			wasted = 0
 		}
@@ -693,7 +715,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			"max_block_size", settings["max_block_size"])
 	}()
 	for chunk < chunks {
-		end := start + sourceRows/chunks
+		end = start + sourceRows/chunks
 		if chunk < sourceRows%chunks {
 			end++
 		}
