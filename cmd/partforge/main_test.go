@@ -1485,6 +1485,7 @@ func TestJobS3PrefixesSkipsBorrowedSourceKey(t *testing.T) {
 }
 
 func TestStateProgress(t *testing.T) {
+	percent := 12.5
 	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, TotalRowsApprox: 5, WrittenRows: 3, WrittenBytes: 4}
 	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
 	dest := metrics.PartStats{Count: 8, Rows: 9, Bytes: 10}
@@ -1492,7 +1493,7 @@ func TestStateProgress(t *testing.T) {
 	stageStartedAt := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 
 	progress := stateProgress(rewrite.ProgressSnapshot{
-		QueryProgress:              &query,
+		InsertProgressPercent: &percent, QueryProgress: &query,
 		SourceActivePartStats:      &source,
 		DestinationActivePartStats: &dest,
 		DestinationFailedMerges:    &failedMerges,
@@ -1507,6 +1508,9 @@ func TestStateProgress(t *testing.T) {
 		},
 	})
 
+	if progress.InsertProgressPercent == nil || *progress.InsertProgressPercent != percent {
+		t.Fatalf("insert progress = %v", progress.InsertProgressPercent)
+	}
 	if progress.QueryProgress == nil || progress.QueryProgress.TotalRowsApprox != 5 || progress.QueryProgress.WrittenBytes != 4 {
 		t.Fatalf("query progress = %+v", progress.QueryProgress)
 	}
@@ -2518,4 +2522,22 @@ cp %s "$last"
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func TestChunkedRewriteProgressOverridesQueryRatio(t *testing.T) {
+	for _, value := range []float64{0, 37.5, 100} {
+		part := state.Part{PartID: "chunked", Status: state.StatusInProgress, RewriteStage: "insert_select",
+			ReadRows: 100, TotalRowsApprox: 100, InsertProgressPercent: &value}
+		summary := summarizeJob("job", []state.Part{part})
+		if got := summary.ActiveRewrites[0].ProgressPercent; got == nil || *got != value {
+			t.Fatalf("progress = %v, want %g", got, value)
+		}
+		got := captureFileOutput(t, func(out *os.File) { printJobSummary(out, summary) })
+		if !strings.Contains(got, fmt.Sprintf("%.1f%%", value)) {
+			t.Fatalf("whole-part percentage missing: %s", got)
+		}
+		if got := partRewriteProgressPercent(part); got == nil || *got != value {
+			t.Fatalf("part details progress = %v, want %g", got, value)
+		}
+	}
 }

@@ -3,13 +3,48 @@ package rewrite
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/metrics"
 )
 
 const DefaultInsertChunkMinRows uint64 = 10_000_000
+
+// Keep completed work separate from the current attempt, which can be discarded.
+type insertProgress struct {
+	start, end, total uint64
+	completed         metrics.QueryProgress
+}
+
+func (p insertProgress) snapshot(current metrics.QueryProgress, committed bool) ProgressSnapshot {
+	if p.total == 0 {
+		return ProgressSnapshot{QueryProgress: &current}
+	}
+	progress := p.completed
+	progress.ReadRows += current.ReadRows
+	progress.ReadBytes += current.ReadBytes
+	progress.WrittenRows += current.WrittenRows
+	progress.WrittenBytes += current.WrittenBytes
+	fraction := float64(0)
+	if current.TotalRowsApprox > 0 {
+		fraction = min(1, float64(current.ReadRows)/float64(current.TotalRowsApprox))
+		// Extrapolate the current range's read estimate over the remaining input.
+		// Reads may exceed source rows, e.g. UNION ALL scans or granule boundaries.
+		progress.TotalRowsApprox = p.completed.ReadRows + uint64(math.Ceil(
+			float64(current.TotalRowsApprox)*float64(p.total-p.start)/float64(p.end-p.start)))
+	}
+	if committed {
+		fraction = 1 // Also completes ranges whose SELECT reads or writes zero rows.
+		if p.end == p.total {
+			progress.TotalRowsApprox = progress.ReadRows
+		}
+	}
+	percent := 100 * (float64(p.start) + float64(p.end-p.start)*fraction) / float64(p.total)
+	return ProgressSnapshot{QueryProgress: &progress, InsertProgressPercent: &percent}
+}
 
 func insertChunkCount(rows, minRows uint64) uint64 {
 	if minRows == 0 {

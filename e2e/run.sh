@@ -350,6 +350,14 @@ for i in $(seq 1 "$part_count"); do
   fi
 done
 
+# Whole-part progress and write totals must survive every chunk boundary.
+chunk_progress="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT data->>'insert_progress_percent', data->>'written_rows' FROM partforge_state WHERE job_id = '$JOB_ID' AND part_id = '$largest_source_part_id'")"
+if [[ "$chunk_progress" != "100|3" ]]; then
+  echo "chunked rewrite progress=$chunk_progress, expected 100|3" >&2
+  exit 1
+fi
+
 # Empty rewrites finish immediately and remain importable without S3 artifacts.
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   --workdir /work -v "$ROOT:/work:ro" worker upload-freeze \

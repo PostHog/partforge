@@ -12,6 +12,7 @@ import (
 
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/metrics"
 )
 
 func TestInsertChunkCount(t *testing.T) {
@@ -40,6 +41,7 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 				Dest:   manifest.TableRef{Database: "db", Table: "dst"},
 				SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO db.dst SELECT * FROM db.src"},
 			}
+			var snapshots []ProgressSnapshot
 			var ranges, threads, ids []string
 			var staged, completed []int
 			inserts, truncates, moves := 0, 0, 0
@@ -92,7 +94,16 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 					exchanged = true
 				case query == "CREATE TABLE `db`.`dst__partforge_completed` AS `db`.`dst`",
 					query == "DROP TABLE `db`.`dst__partforge_completed` SYNC",
-					query == "SYSTEM FLUSH LOGS", strings.Contains(query, "system.query_log"):
+					query == "SYSTEM FLUSH LOGS":
+				case strings.Contains(query, "system.query_log"):
+					switch inserts {
+					case 1:
+						fmt.Fprint(w, "6\t60\t6\t3\t30\n")
+					case 3:
+						fmt.Fprint(w, "4\t40\t4\t2\t20\n")
+					case 4:
+						fmt.Fprint(w, "0\t0\t0\t0\t0\n")
+					}
 				default:
 					t.Errorf("unexpected query: %s", query)
 				}
@@ -100,6 +111,10 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 			defer server.Close()
 			err := (Processor{
 				ClickHouse: chhttp.Client{URL: server.URL}, InsertChunkMinRows: 2,
+				ReportProgress: func(_ context.Context, _ manifest.Manifest, snapshot ProgressSnapshot) error {
+					snapshots = append(snapshots, snapshot)
+					return nil
+				},
 				InsertSettings: chhttp.QuerySettings{"max_threads": "4", "max_insert_threads": "4", "max_block_size": "8192"},
 			}).runInsertSelectWithRetries(context.Background(), m, 7)
 			if failMove {
@@ -110,6 +125,17 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			last := snapshots[len(snapshots)-1]
+			if last.InsertProgressPercent == nil || *last.InsertProgressPercent != 100 ||
+				last.QueryProgress.ReadRows != 10 || last.QueryProgress.ReadBytes != 100 ||
+				last.QueryProgress.WrittenRows != 5 || last.QueryProgress.WrittenBytes != 50 {
+				t.Fatalf("lost cumulative progress or empty final chunk: %+v / %+v", last, last.QueryProgress)
+			}
+			for _, snapshot := range snapshots {
+				if snapshot.InsertProgressPercent == nil {
+					t.Fatal("chunked attempt omitted whole-part progress")
+				}
 			}
 			wantRanges := []string{insertChunkFilter(m.Source, 0, 3), insertChunkFilter(m.Source, 3, 5), insertChunkFilter(m.Source, 3, 5), insertChunkFilter(m.Source, 5, 7)}
 			if !reflect.DeepEqual(ranges, wantRanges) || !reflect.DeepEqual(threads, []string{"4", "4", "2", "2"}) {
@@ -133,5 +159,41 @@ func TestInsertChunksRejectFilterOverride(t *testing.T) {
 	}, 2)
 	if err == nil || !strings.Contains(err.Error(), "reserves additional_table_filters") {
 		t.Fatalf("expected rejected filter override, got %v", err)
+	}
+}
+
+func TestInsertProgress(t *testing.T) {
+	p := insertProgress{start: 20, end: 40, total: 100,
+		completed: metrics.QueryProgress{ReadRows: 60, ReadBytes: 600, WrittenRows: 10, WrittenBytes: 100, TotalRowsApprox: 300}}
+	for _, tc := range []struct {
+		name         string
+		current      metrics.QueryProgress
+		committed    bool
+		percent      float64
+		reads, total uint64
+	}{
+		{"new attempt retains completed work", metrics.QueryProgress{}, false, 20, 60, 300},
+		{"half of second chunk", metrics.QueryProgress{ReadRows: 30, TotalRowsApprox: 60}, false, 30, 90, 300},
+		{"clamp read ahead to current chunk", metrics.QueryProgress{ReadRows: 70, TotalRowsApprox: 60}, false, 40, 130, 300},
+		{"empty chunk committed", metrics.QueryProgress{}, true, 40, 60, 300},
+		{"unknown estimate stays at completed boundary", metrics.QueryProgress{ReadRows: 30}, false, 20, 90, 300},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.snapshot(tc.current, tc.committed)
+			if got.InsertProgressPercent == nil || *got.InsertProgressPercent != tc.percent ||
+				got.QueryProgress.ReadRows != tc.reads || got.QueryProgress.TotalRowsApprox != tc.total {
+				t.Fatalf("progress = %+v / %+v, want percent=%g reads=%d total=%d", got, got.QueryProgress, tc.percent, tc.reads, tc.total)
+			}
+		})
+	}
+	// Empty completed input must still show 100%, even without read counters.
+	empty := (insertProgress{start: 80, end: 100, total: 100}).snapshot(metrics.QueryProgress{}, true)
+	if *empty.InsertProgressPercent != 100 {
+		t.Fatalf("empty final chunk = %+v", empty)
+	}
+	current := metrics.QueryProgress{ReadRows: 5, TotalRowsApprox: 20}
+	unchunked := (insertProgress{}).snapshot(current, false)
+	if unchunked.InsertProgressPercent != nil || *unchunked.QueryProgress != current {
+		t.Fatalf("changed unchunked progress: %+v", unchunked)
 	}
 }

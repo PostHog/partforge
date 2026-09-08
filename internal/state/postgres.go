@@ -111,6 +111,7 @@ type Part struct {
 	CompactActiveMerges        uint64  `json:"compact_active_merges,omitempty"`
 	CompactMergeProgress       float64 `json:"compact_merge_progress,omitempty"`
 
+	InsertProgressPercent            *float64          `json:"insert_progress_percent,omitempty"`
 	ProgressUpdatedAt                string            `json:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `json:"read_rows,omitempty"`
 	ReadBytes                        uint64            `json:"read_bytes,omitempty"`
@@ -194,6 +195,7 @@ type CompactBatch struct {
 }
 
 type RewriteProgress struct {
+	InsertProgressPercent      *float64
 	QueryProgress              *QueryProgress
 	SourceActivePartStats      *PartStats
 	DestinationActivePartStats *PartStats
@@ -464,6 +466,7 @@ func setStatus(part *Part, status Status, now time.Time) {
 }
 
 func clearRewriteProgress(part *Part) {
+	part.InsertProgressPercent = nil
 	part.ProgressUpdatedAt = ""
 	part.ReadRows = 0
 	part.ReadBytes = 0
@@ -1433,6 +1436,9 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 	}, func(current *Part) error {
 		current.UpdatedAt = formatTime(now)
 		current.ProgressUpdatedAt = formatTime(now)
+		if progress.InsertProgressPercent != nil {
+			current.InsertProgressPercent = progress.InsertProgressPercent
+		}
 		if progress.QueryProgress != nil {
 			current.ReadRows = progress.QueryProgress.ReadRows
 			current.ReadBytes = progress.QueryProgress.ReadBytes

@@ -116,6 +116,7 @@ type MergeTreeSettings struct {
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
 
 type ProgressSnapshot struct {
+	InsertProgressPercent      *float64
 	QueryProgress              *metrics.QueryProgress
 	SourceActivePartStats      *metrics.PartStats
 	DestinationActivePartStats *metrics.PartStats
@@ -669,10 +670,15 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 	}
 	recorder := p.recorder()
 	recorder.InsertSelectStarted(m)
+	defer recorder.ClearCurrentProgress(m)
 	settings := cloneQuerySettings(p.InsertSettings)
 	startedAt := time.Now()
 	attempt := 0
 	retries := 0
+	var completed metrics.QueryProgress
+	if chunks > 1 {
+		completed.TotalRowsApprox = sourceRows
+	}
 	var chunk, start uint64
 	var promotionElapsed time.Duration
 	var successfulAttemptElapsed time.Duration
@@ -707,9 +713,13 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			slog.Info("inserting source chunk", "job_id", m.JobID, "part_id", m.PartID,
 				"chunk", chunk+1, "chunks", chunks, "start_offset", start, "end_offset", end, "source_rows", sourceRows)
 		}
+		tracker := insertProgress{}
+		if chunks > 1 {
+			tracker = insertProgress{start: start, end: end, total: sourceRows, completed: completed}
+		}
 		attempt++
 		attemptStartedAt := time.Now()
-		err := p.runInsertSelect(ctx, m, attempt, settings)
+		current, err := p.runInsertSelect(ctx, m, attempt, settings, tracker)
 		attemptElapsed := time.Since(attemptStartedAt)
 		if err != nil {
 			recorder.ObserveInsertAttempt(m, "failed", attemptElapsed)
@@ -750,6 +760,13 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m); resetErr != nil {
 				return fmt.Errorf("insert-select failed with retryable resource error (%w), but reset destination table failed: %v", err, resetErr)
 			}
+			if chunks > 1 {
+				snapshot := tracker.snapshot(metrics.QueryProgress{}, false)
+				recorder.ObserveProgress(m, *snapshot.QueryProgress, *snapshot.QueryProgress)
+				if err := p.reportProgress(ctx, m, snapshot); err != nil {
+					return err
+				}
+			}
 			if err := sleepOrDone(ctx, backoff); err != nil {
 				return err
 			}
@@ -765,6 +782,12 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 				return err
 			}
 			promotionElapsed += time.Since(promotionStartedAt)
+			snapshot := tracker.snapshot(current, true)
+			completed = *snapshot.QueryProgress
+			recorder.ObserveProgress(m, completed, completed)
+			if err := p.reportProgress(ctx, m, snapshot); err != nil {
+				return err
+			}
 			slog.Info("completed source chunk", "job_id", m.JobID, "part_id", m.PartID,
 				"chunk", chunk+1, "chunks", chunks, "completed_source_rows", end, "source_rows", sourceRows)
 		}
@@ -998,10 +1021,16 @@ func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Mani
 	return false, nil
 }
 
-func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {
+func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings, tracker insertProgress) (metrics.QueryProgress, error) {
 	queryID := fmt.Sprintf("partforge-%s-%s-attempt-%d", m.JobID, m.PartID, attempt)
 	queryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	baseline := tracker.snapshot(metrics.QueryProgress{}, false)
+	p.recorder().ObserveProgress(m, *baseline.QueryProgress, *baseline.QueryProgress)
+	if err := p.reportProgress(ctx, m, baseline); err != nil {
+		return metrics.QueryProgress{}, err
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -1013,7 +1042,6 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 
 	recorder := p.recorder()
 	progress := metrics.QueryProgress{}
-	defer recorder.ClearCurrentProgress(m)
 	lastProgressReport := time.Time{}
 
 	ticker := time.NewTicker(time.Second)
@@ -1022,35 +1050,38 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 		select {
 		case err := <-errCh:
 			if err != nil {
-				return err
+				return progress, err
 			}
 			finalProgress, found, err := p.queryLogProgress(ctx, queryID)
 			if err != nil {
-				return fmt.Errorf("read final query progress: %w", err)
+				return progress, fmt.Errorf("read final query progress: %w", err)
 			}
 			if found {
-				recorder.ObserveProgress(m, progress, finalProgress)
-				if err := p.reportProgress(ctx, m, ProgressSnapshot{QueryProgress: &finalProgress}); err != nil {
-					return err
+				snapshot := tracker.snapshot(finalProgress, false)
+				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
+				progress = finalProgress
+				if err := p.reportProgress(ctx, m, snapshot); err != nil {
+					return progress, err
 				}
 			}
-			return nil
+			return progress, nil
 		case <-ticker.C:
 			now := time.Now()
 			current, found, err := p.queryProgress(ctx, queryID)
 			if err != nil {
 				cancel()
 				<-errCh
-				return fmt.Errorf("read live query progress: %w", err)
+				return progress, fmt.Errorf("read live query progress: %w", err)
 			}
 			if found {
-				recorder.ObserveProgress(m, progress, current)
+				snapshot := tracker.snapshot(current, false)
+				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
 				progress = current
 				if shouldReportProgress(p.ProgressInterval, lastProgressReport, now) {
-					if err := p.reportProgress(ctx, m, ProgressSnapshot{QueryProgress: &current}); err != nil {
+					if err := p.reportProgress(ctx, m, snapshot); err != nil {
 						cancel()
 						<-errCh
-						return err
+						return progress, err
 					}
 					lastProgressReport = now
 				}
@@ -1058,7 +1089,7 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 		case <-ctx.Done():
 			cancel()
 			<-errCh
-			return ctx.Err()
+			return progress, ctx.Err()
 		}
 	}
 }

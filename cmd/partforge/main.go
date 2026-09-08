@@ -4147,7 +4147,7 @@ func waitCompactHeartbeat(errCh <-chan error) error {
 }
 
 func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
-	var progress state.RewriteProgress
+	progress := state.RewriteProgress{InsertProgressPercent: snapshot.InsertProgressPercent}
 	if snapshot.QueryProgress != nil {
 		progress.QueryProgress = &state.QueryProgress{
 			ReadRows:        snapshot.QueryProgress.ReadRows,
@@ -4495,7 +4495,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 				Elapsed:           formatDurationMs(part.RewriteTotalElapsedMs),
 				ReadRows:          part.ReadRows,
 				TotalRowsApprox:   part.TotalRowsApprox,
-				ProgressPercent:   rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox),
+				ProgressPercent:   partRewriteProgressPercent(part),
 				ProgressUpdatedAt: part.ProgressUpdatedAt,
 			})
 		}
@@ -4547,6 +4547,14 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		FailedMerges:                 failedMerges,
 		FailedParts:                  failed,
 	}
+}
+
+func partRewriteProgressPercent(part state.Part) *float64 {
+	if part.InsertProgressPercent != nil {
+		return part.InsertProgressPercent
+	}
+	// Jobs reported by older workers have only query counters.
+	return rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox)
 }
 
 func rewriteProgressPercent(readRows, totalRowsApprox uint64) *float64 {
@@ -4929,7 +4937,7 @@ func printPartRowsWithLookup(out *os.File, parts []state.Part, lookupParts []sta
 	for _, part := range parts {
 		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
 		progress := "-"
-		if progressPercent := rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox); progressPercent != nil {
+		if progressPercent := partRewriteProgressPercent(part); progressPercent != nil {
 			progress = fmt.Sprintf("%.1f%%", *progressPercent)
 		}
 		fmt.Fprintf(
