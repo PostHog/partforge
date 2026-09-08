@@ -656,10 +656,36 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	return result, nil
 }
 
-func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) error {
+func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) (retErr error) {
+	recorder := p.recorder()
+	recorder.InsertSelectStarted(m)
 	settings := cloneQuerySettings(p.InsertSettings)
-	for attempt := 1; ; attempt++ {
-		if err := p.runInsertSelect(ctx, m, attempt, settings); err != nil {
+	startedAt := time.Now()
+	attempt := 0
+	var successfulAttemptElapsed time.Duration
+	defer func() {
+		elapsed := time.Since(startedAt)
+		result := "completed"
+		wasted := elapsed - successfulAttemptElapsed
+		if retErr != nil {
+			result = "failed"
+		} else if attempt == 1 {
+			wasted = 0
+		}
+		recorder.ObserveInsertSelect(m, result, attempt, elapsed, wasted)
+		slog.Info("insert-select summary", "job_id", m.JobID, "part_id", m.PartID,
+			"result", result, "attempts", attempt, "elapsed", elapsed,
+			"wasted_elapsed", wasted, "successful_attempt_elapsed", successfulAttemptElapsed,
+			"max_threads", settings["max_threads"], "max_insert_threads", settings["max_insert_threads"],
+			"max_block_size", settings["max_block_size"])
+	}()
+	for {
+		attempt++
+		attemptStartedAt := time.Now()
+		err := p.runInsertSelect(ctx, m, attempt, settings)
+		attemptElapsed := time.Since(attemptStartedAt)
+		if err != nil {
+			recorder.ObserveInsertAttempt(m, "failed", attemptElapsed)
 			if !retryableInsertSelectError(err) {
 				return fmt.Errorf("attempt %d (max_threads=%s, max_insert_threads=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], err)
 			}
@@ -686,6 +712,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 				"job_id", m.JobID,
 				"part_id", m.PartID,
 				"attempt", attempt,
+				"attempt_elapsed", attemptElapsed,
 				"next_attempt", attempt+1,
 				"backoff", backoff.String(),
 				"max_threads", nextSettings["max_threads"],
@@ -705,6 +732,8 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			settings = nextSettings
 			continue
 		}
+		successfulAttemptElapsed = attemptElapsed
+		recorder.ObserveInsertAttempt(m, "completed", attemptElapsed)
 		return nil
 	}
 }

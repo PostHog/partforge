@@ -35,6 +35,49 @@ Read/write counters and ClickHouse's estimated total rows to read update live wh
 
 Workers also write a per-part progress heartbeat to Postgres every `15s` (`-state-progress-interval`, `0` disables) so `job-status` reflects progress even during S3 transfer stages.
 
+### Insert retry cost
+
+Three metric families measure the insert-select retry loop:
+
+| Metric | Meaning |
+| --- | --- |
+| `partforge_insert_attempt_duration_seconds` | Histogram per attempt, labeled `result="completed"` or `"failed"`. Its `_count` counts attempts; `_sum` measures their wall time, including progress reporting. Excludes time between attempts. |
+| `partforge_insert_duration_seconds` | Histogram per part's insert loop, including all attempts, table resets, codec setup, and backoff. Labels: `result` and `retried="true"` or `"false"` (whether a second attempt actually started). |
+| `partforge_insert_wasted_seconds_total` | Time outside the successful attempt for retried inserts. First-attempt success adds zero. A terminal failure or cancellation adds the entire loop duration, including interrupted recovery. Same labels as insert duration. |
+
+All three include `job_id`, `source_table`, and `destination_table`; scraped `pod` and `environment` labels allow per-worker breakdowns. Attempts update when each attempt ends. Whole-loop duration and wasted time update together when the loop exits, even on error. Running attempts and abrupt worker deaths are not included until/unless their observation executes. These are cumulative PartForge process metrics and survive local ClickHouse restarts; worker restarts reset them. Use `increase` before summing across workers. Very short-lived processes or events before the first scrape can be missed.
+
+The `insert-select summary` log records `job_id`, `part_id`, `result`, `attempts`, `elapsed`, `wasted_elapsed`, `successful_attempt_elapsed`, and the final thread/block settings. Retry warnings also record `attempt_elapsed` and the error. This gives per-part detail without a metric series for every part or setting value.
+
+Use these expressions in Grafana Explore, replacing `JOB_ID` (add an `environment` filter if needed):
+
+```promql
+# Failed attempts in the last hour, including failures eventually recovered.
+sum(increase(partforge_insert_attempt_duration_seconds_count{job_id="JOB_ID",result="failed"}[1h]))
+
+# Percentage of finished insert loops that needed at least one retry.
+100 * sum(increase(partforge_insert_duration_seconds_count{job_id="JOB_ID",retried="true"}[1h]))
+/ sum(increase(partforge_insert_duration_seconds_count{job_id="JOB_ID"}[1h]))
+
+# Wasted worker-hours, split between recovered inserts and terminal failures.
+sum by (result) (increase(partforge_insert_wasted_seconds_total{job_id="JOB_ID"}[1h])) / 3600
+
+# Actual average insertion seconds per successfully inserted part, retries included.
+sum(increase(partforge_insert_duration_seconds_sum{job_id="JOB_ID",result="completed"}[1h]))
+/ sum(increase(partforge_insert_duration_seconds_count{job_id="JOB_ID",result="completed"}[1h]))
+
+# Time multiplier from retries on successfully inserted parts: 1 = no overhead, 3 = 3x.
+sum(increase(partforge_insert_duration_seconds_sum{job_id="JOB_ID",result="completed"}[1h]))
+/ (
+  sum(increase(partforge_insert_duration_seconds_sum{job_id="JOB_ID",result="completed"}[1h]))
+  - sum(increase(partforge_insert_wasted_seconds_total{job_id="JOB_ID",result="completed"}[1h]))
+)
+```
+
+The estimated average without retry waste is the actual average divided by that multiplier. For example, two failed attempts totaling 17s, 3s of recovery/backoff, and a 10s successful attempt produce 30s actual, 20s wasted, and a 3x multiplier. The baseline is the successful attempt on those same parts at their final settings; it is not a prediction of how fast different settings would run. These figures cover insertion only, exclude download/merge/upload, and sum worker wall time rather than CPU time or job elapsed time. Empty windows leave ratios undefined rather than claiming zero overhead.
+
+Each part starts from the original insert settings; reductions only apply within that part's retry loop. A high retried-part percentage together with a large multiplier is evidence to investigate initial settings using the logged errors and final settings. A high failure count alone does not establish high cost: early failures may be cheap. Compare similar parts and jobs when evaluating a configuration change; part sizes vary, and a later manual requeue is a separate insert loop.
+
 ## Inspecting jobs
 
 ```sh

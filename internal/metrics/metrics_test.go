@@ -32,6 +32,38 @@ func TestQueryProgressMetricsIncludeAndClearTotalRowsApprox(t *testing.T) {
 	}
 }
 
+func TestInsertRetryMetrics(t *testing.T) {
+	prom := NewPrometheus()
+	m := manifest.Manifest{JobID: "job-1", PartID: "part-1"}
+	prom.InsertSelectStarted(m)
+	if body := compactMetricsBody(t, prom); !strings.Contains(body, `partforge_insert_attempt_duration_seconds_count{destination_table=".",job_id="job-1",result="failed",source_table="."} 0`) {
+		t.Fatalf("missing initial zero-valued attempt counter:\n%s", body)
+	}
+	prom.ObserveInsertAttempt(m, "failed", 8*time.Second)
+	prom.ObserveInsertAttempt(m, "failed", 9*time.Second)
+	prom.ObserveInsertAttempt(m, "completed", 10*time.Second)
+	// Two failed attempts plus three seconds of recovery: 30s total / 10s useful = 3x.
+	prom.ObserveInsertSelect(m, "completed", 3, 30*time.Second, 20*time.Second)
+	prom.InsertSelectStarted(m) // Starting the next part must not reset counters.
+	prom.ObserveInsertSelect(m, "completed", 1, 5*time.Second, 0)
+	prom.ObserveInsertSelect(m, "failed", 1, 2*time.Second, 2*time.Second)
+	body := compactMetricsBody(t, prom)
+	for _, want := range []string{
+		`partforge_insert_attempt_duration_seconds_count{destination_table=".",job_id="job-1",result="failed",source_table="."} 2`,
+		`partforge_insert_attempt_duration_seconds_sum{destination_table=".",job_id="job-1",result="failed",source_table="."} 17`,
+		`partforge_insert_attempt_duration_seconds_count{destination_table=".",job_id="job-1",result="completed",source_table="."} 1`,
+		`partforge_insert_duration_seconds_sum{destination_table=".",job_id="job-1",result="completed",retried="true",source_table="."} 30`,
+		`partforge_insert_duration_seconds_count{destination_table=".",job_id="job-1",result="completed",retried="true",source_table="."} 1`,
+		`partforge_insert_wasted_seconds_total{destination_table=".",job_id="job-1",result="completed",retried="true",source_table="."} 20`,
+		`partforge_insert_wasted_seconds_total{destination_table=".",job_id="job-1",result="completed",retried="false",source_table="."} 0`,
+		`partforge_insert_wasted_seconds_total{destination_table=".",job_id="job-1",result="failed",retried="false",source_table="."} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestCompactProgressMetricsReconcileAndClear(t *testing.T) {
 	prom := NewPrometheus()
 	prom.CompactionStarted("job-1", "compact-1", 2, PartStats{Count: 8, Rows: 800, Bytes: 8_000})

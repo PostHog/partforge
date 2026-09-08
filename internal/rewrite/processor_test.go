@@ -18,6 +18,7 @@ import (
 	"github.com/PostHog/partforge/internal/chhttp"
 	"github.com/PostHog/partforge/internal/freeze"
 	"github.com/PostHog/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/metrics"
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
@@ -308,6 +309,114 @@ func TestMergePoolByteSettingsUseTargetPartSize(t *testing.T) {
 	}
 }
 
+type insertMetricsRecorder struct {
+	metrics.Noop
+	started, attempts, failedAttempts, summaries int
+	result                                       string
+	elapsed, wasted, successfulAttemptElapsed    time.Duration
+}
+
+func (r *insertMetricsRecorder) InsertSelectStarted(manifest.Manifest) { r.started++ }
+
+func (r *insertMetricsRecorder) ObserveInsertAttempt(_ manifest.Manifest, result string, elapsed time.Duration) {
+	r.attempts++
+	if result == "failed" {
+		r.failedAttempts++
+	} else {
+		r.successfulAttemptElapsed = elapsed
+	}
+}
+
+func (r *insertMetricsRecorder) ObserveInsertSelect(_ manifest.Manifest, result string, attempts int, elapsed, wasted time.Duration) {
+	r.summaries++
+	r.result, r.elapsed, r.wasted = result, elapsed, wasted
+	if attempts != r.attempts {
+		panic("insert summary attempt count does not match recorded attempts")
+	}
+}
+
+func TestInsertRetryTiming(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		failFirst, failReset   bool
+		cancelRecovery         bool
+		insertError            string
+		wantAttempts, wantFail int
+		wantResult             string
+	}{
+		{name: "first attempt succeeds", wantAttempts: 1, wantResult: "completed"},
+		{name: "retry succeeds", failFirst: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 2, wantFail: 1, wantResult: "completed"},
+		{name: "non retryable failure", failFirst: true, insertError: "Syntax error", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+		{name: "reset fails", failFirst: true, failReset: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+		{name: "recovery canceled", failFirst: true, cancelRecovery: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			inserts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				query := string(body)
+				switch {
+				case strings.HasPrefix(query, "INSERT "):
+					inserts++
+					if tc.failFirst && inserts == 1 {
+						http.Error(w, tc.insertError, http.StatusInternalServerError)
+					}
+				case strings.HasPrefix(query, "DROP TABLE "):
+					if tc.failReset {
+						http.Error(w, "reset failed", http.StatusInternalServerError)
+					}
+				case strings.HasPrefix(query, "ALTER TABLE "):
+					if tc.cancelRecovery {
+						cancel()
+					}
+				case strings.HasPrefix(query, "CREATE TABLE "), query == "SYSTEM FLUSH LOGS", strings.Contains(query, "system.query_log"):
+				default:
+					t.Errorf("unexpected query: %s", query)
+				}
+			}))
+			defer server.Close()
+			recorder := &insertMetricsRecorder{}
+			err := (Processor{
+				ClickHouse: chhttp.Client{URL: server.URL}, Metrics: recorder,
+				InsertSettings:    chhttp.QuerySettings{"max_threads": "2", "max_block_size": "8192"},
+				MergeTreeSettings: MergeTreeSettings{DefaultCompressionCodec: "ZSTD(5)"},
+			}).runInsertSelectWithRetries(ctx, manifest.Manifest{
+				JobID: "job-1", PartID: "part-1", Dest: manifest.TableRef{Database: "db", Table: "dst"},
+				SQL: manifest.SQLBundle{InsertSelect: "INSERT INTO db.dst SELECT 1"},
+			}, "CREATE TABLE db.dst (x UInt64) ENGINE = MergeTree ORDER BY x")
+			if (err != nil) != (tc.wantResult == "failed") {
+				t.Fatalf("unexpected result: %v", err)
+			}
+			if recorder.started != 1 || recorder.summaries != 1 || recorder.attempts != tc.wantAttempts || recorder.failedAttempts != tc.wantFail || recorder.result != tc.wantResult {
+				t.Fatalf("unexpected metrics: %+v", recorder)
+			}
+			if recorder.elapsed <= 0 {
+				t.Fatalf("expected positive elapsed time: %+v", recorder)
+			}
+			switch {
+			case tc.wantResult == "failed":
+				if recorder.wasted != recorder.elapsed {
+					t.Fatalf("terminal failure must account for all elapsed time: %+v", recorder)
+				}
+			case tc.wantAttempts == 1:
+				if recorder.wasted != 0 {
+					t.Fatalf("first-attempt success wasted time: %+v", recorder)
+				}
+			default:
+				if recorder.wasted < time.Second || recorder.wasted != recorder.elapsed-recorder.successfulAttemptElapsed {
+					t.Fatalf("waste must include backoff and exclude successful attempt: %+v", recorder)
+				}
+			}
+		})
+	}
+}
+
 func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	var queries []string
 	var attempts []string
@@ -339,7 +448,9 @@ func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	}))
 	defer server.Close()
 
+	recorder := &insertMetricsRecorder{}
 	err := (Processor{
+		Metrics:    recorder,
 		ClickHouse: chhttp.Client{URL: server.URL},
 		InsertSettings: chhttp.QuerySettings{
 			"max_threads":        "4",
@@ -359,6 +470,9 @@ func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	}, "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY x")
 	if err == nil {
 		t.Fatal("expected retryable insert error after reduced retry")
+	}
+	if recorder.result != "failed" || recorder.attempts != 3 || recorder.failedAttempts != 3 || recorder.wasted != recorder.elapsed || recorder.wasted < 3*time.Second {
+		t.Fatalf("exhausted retries must include every attempt and backoff: %+v", recorder)
 	}
 
 	if want := []string{"4/2/", "2/1/16384", "1/1/8192"}; !reflect.DeepEqual(attempts, want) {
