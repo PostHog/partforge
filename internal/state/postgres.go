@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	rdsauth "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -57,6 +58,7 @@ type Config struct {
 }
 
 type Store struct {
+	tableName         string
 	pool              *pgxpool.Pool
 	tableSQL          string
 	statusIndexSQL    string
@@ -174,6 +176,7 @@ func clonePartitionCounts(counts map[string]uint64) map[string]uint64 {
 }
 
 type CompactClaimOptions struct {
+	CompactWindow        time.Duration
 	ExcludedJobIDs       map[string]struct{}
 	JobID                string
 	Bucket               string
@@ -209,6 +212,18 @@ type RewriteStageProgress struct {
 }
 
 func New(ctx context.Context, cfg Config) (*Store, error) {
+	store, err := openStore(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.checkSchema(ctx); err != nil {
+		store.pool.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func openStore(ctx context.Context, cfg Config) (*Store, error) {
 	if strings.TrimSpace(cfg.Table) == "" {
 		cfg.Table = defaultStateTable
 	}
@@ -236,13 +251,10 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	store := &Store{
 		pool:              pool,
+		tableName:         strings.TrimSpace(cfg.Table),
 		tableSQL:          tableSQL,
 		statusIndexSQL:    statusIndexSQL,
 		jobStatusIndexSQL: jobStatusIndexSQL,
-	}
-	if err := store.ensureSchema(ctx); err != nil {
-		pool.Close()
-		return nil, err
 	}
 	return store, nil
 }
@@ -307,29 +319,6 @@ func quoteIndexName(table, suffix string) string {
 		base = base[:maxBaseLen]
 	}
 	return pgx.Identifier{base + "_" + suffix}.Sanitize()
-}
-
-func (s *Store) ensureSchema(ctx context.Context) error {
-	statements := []string{
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			job_id text NOT NULL,
-			part_id text NOT NULL,
-			status text NOT NULL,
-			worker_id text NOT NULL DEFAULT '',
-			created_at text NOT NULL,
-			updated_at text NOT NULL,
-			data jsonb NOT NULL,
-			PRIMARY KEY (job_id, part_id)
-		)`, s.tableSQL),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (status, created_at, job_id, part_id)`, s.statusIndexSQL, s.tableSQL),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (job_id, status, part_id)`, s.jobStatusIndexSQL, s.tableSQL),
-	}
-	for _, statement := range statements {
-		if _, err := s.pool.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("ensure postgres state schema: %w", err)
-		}
-	}
-	return nil
 }
 
 func NewPart(jobID, partID, bucket, sourceKey, finishedKey string, now time.Time) Part {
@@ -399,15 +388,73 @@ func partFromJSON(data []byte) (Part, error) {
 	return part, nil
 }
 
-func (s *Store) savePartTx(ctx context.Context, tx pgx.Tx, part Part) error {
+const partColumns = "job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at"
+
+// Full writes derive scheduling values once and persist them alongside the JSON.
+func partWriteValues(part Part) ([]any, error) {
 	data, err := partJSON(part)
+	if err != nil {
+		return nil, err
+	}
+	partitions, fragmented, single := 0, false, true
+	for id, count := range part.DestinationActivePartitionCounts {
+		if strings.TrimSpace(id) == "" || count == 0 {
+			continue
+		}
+		partitions++
+		fragmented = fragmented || count > 1
+		single = single && count == 1
+	}
+	eligible := strings.TrimSpace(part.DestinationDatabase) != "" && strings.TrimSpace(part.DestinationTable) != "" && strings.TrimSpace(part.DestinationSchema) != "" && part.DestinationActivePartCount > 0 && fragmented
+	normalized := part.DestinationActivePartCount == 1 && partitions == 1 && single
+	var staleAt, originalReadyAt *time.Time
+	if part.Status == StatusCompacting {
+		for _, value := range []string{part.UpdatedAt, part.CompactingAt} {
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, value)
+			if err != nil {
+				return nil, fmt.Errorf("compact time for %s/%s: %w", part.JobID, part.PartID, err)
+			}
+			if staleAt == nil || parsed.Before(*staleAt) {
+				staleAt = &parsed
+			}
+		}
+		if staleAt == nil {
+			return nil, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
+		}
+	}
+	if !isGeneratedCompactPart(part) && strings.TrimSpace(part.CompactReadyAt) != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, part.CompactReadyAt)
+		if err != nil {
+			return nil, fmt.Errorf("compact-ready time for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		originalReadyAt = &parsed
+	}
+	return []any{part.JobID, part.PartID, string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data,
+		pgtype.Numeric{Int: new(big.Int).SetUint64(part.SourceArtifactBytes), Valid: true},
+		pgtype.Numeric{Int: new(big.Int).SetUint64(part.DestinationActivePartBytes), Valid: true},
+		eligible, normalized, staleAt, originalReadyAt}, nil
+}
+
+func (s *Store) insertPartTx(ctx context.Context, tx pgx.Tx, part Part) error {
+	values, err := partWriteValues(part)
 	if err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx,
-		`UPDATE `+s.tableSQL+` SET status = $1, worker_id = $2, created_at = $3, updated_at = $4, data = $5 WHERE job_id = $6 AND part_id = $7`,
-		string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data, part.JobID, part.PartID,
-	)
+	_, err = tx.Exec(ctx, `INSERT INTO `+s.tableSQL+` (`+partColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values...)
+	return err
+}
+
+func (s *Store) savePartTx(ctx context.Context, tx pgx.Tx, part Part) error {
+	values, err := partWriteValues(part)
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE `+s.tableSQL+` SET status=$3, worker_id=$4, created_at=$5, updated_at=$6, data=$7,
+ source_artifact_bytes=$8, compact_bytes=$9, compact_eligible=$10, compact_normalized=$11,
+ compact_stale_at=$12, original_compact_ready_at=$13 WHERE job_id=$1 AND part_id=$2`, values...)
 	if err != nil {
 		return err
 	}
@@ -508,10 +555,6 @@ func (s *Store) CreatePart(ctx context.Context, part Part) error {
 	if err := validatePart(part); err != nil {
 		return err
 	}
-	data, err := partJSON(part)
-	if err != nil {
-		return err
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -529,10 +572,7 @@ func (s *Store) CreatePart(ctx context.Context, part Part) error {
 			return fmt.Errorf("source part reference for %s/%s does not match source artifact %s/%s", part.JobID, part.PartID, source.JobID, source.PartID)
 		}
 	}
-	_, err = tx.Exec(ctx,
-		`INSERT INTO `+s.tableSQL+` (job_id, part_id, status, worker_id, created_at, updated_at, data) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		part.JobID, part.PartID, string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data,
-	)
+	err = s.insertPartTx(ctx, tx, part)
 	if err != nil {
 		return fmt.Errorf("create state item for %s/%s: %w", part.JobID, part.PartID, err)
 	}
@@ -580,6 +620,10 @@ func (s *Store) MarkCompactReady(ctx context.Context, part Part, workerID, finis
 	return nil
 }
 
+func (s *Store) readyClaimQuery() string {
+	return `SELECT data FROM ` + s.tableSQL + ` WHERE status = 'READY' ORDER BY source_artifact_bytes DESC, created_at, job_id, part_id LIMIT 1 FOR UPDATE SKIP LOCKED`
+}
+
 func (s *Store) ClaimNextReady(ctx context.Context, workerID string, now time.Time) (*Part, error) {
 	if strings.TrimSpace(workerID) == "" {
 		return nil, errors.New("worker id is required")
@@ -591,7 +635,7 @@ func (s *Store) ClaimNextReady(ctx context.Context, workerID string, now time.Ti
 	defer tx.Rollback(ctx)
 
 	var data []byte
-	err = tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE status = $1 ORDER BY COALESCE((data->>'source_artifact_bytes')::bigint, 0) DESC, created_at, job_id, part_id LIMIT 1 FOR UPDATE SKIP LOCKED`, string(StatusReady)).Scan(&data)
+	err = tx.QueryRow(ctx, s.readyClaimQuery()).Scan(&data)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -616,72 +660,77 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 	if strings.TrimSpace(workerID) == "" {
 		return nil, errors.New("worker id is required")
 	}
-	candidates, err := s.listPartsByStatusIndex(ctx, StatusCompactReady)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("query compact-ready parts: %w", err)
+		return nil, err
 	}
-	if len(candidates) == 0 {
+	defer tx.Rollback(ctx)
+	query, args := s.compactClaimQuery(opts, now)
+	var data []byte
+	err = tx.QueryRow(ctx, query, args...).Scan(&data)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
-	compacting, err := s.listPartsByStatusIndex(ctx, StatusCompacting)
 	if err != nil {
-		return nil, fmt.Errorf("query compacting parts: %w", err)
+		return nil, fmt.Errorf("claim compact-ready part: %w", err)
 	}
-
-	groups := compactCandidateGroups(candidates, compacting, opts)
-	for _, selected := range compactCandidateSelections(groups, opts) {
-		claimed, err := s.claimCompactParts(ctx, selected, workerID, now)
-		if IsConditionalCheckFailed(err) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		batch, err := compactBatchFromParts(claimed)
-		if err != nil {
-			_ = s.ReleaseCompactBatch(ctx, CompactBatch{JobID: claimed[0].JobID, Parts: claimed}, workerID, now)
-			return nil, err
-		}
-		return batch, nil
-	}
-	return nil, nil
-}
-
-func compactCandidateSelections(groups []compactGroup, opts CompactClaimOptions) [][]Part {
-	selections := make([][]Part, 0, len(groups))
-	for _, group := range groups {
-		if selected := selectCompactBatchParts(group, opts); len(selected) > 0 {
-			selections = append(selections, selected)
-		}
-	}
-	sort.SliceStable(selections, func(i, j int) bool {
-		return selections[i][0].DestinationActivePartBytes > selections[j][0].DestinationActivePartBytes
-	})
-	return selections
-}
-
-func (s *Store) listPartsByStatusIndex(ctx context.Context, status Status) ([]Part, error) {
-	rows, err := s.pool.Query(ctx, `SELECT data FROM `+s.tableSQL+` WHERE status = $1 ORDER BY created_at, job_id, part_id`, string(status))
+	part, err := partFromJSON(data)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var parts []Part
-	for rows.Next() {
-		var data []byte
-		if err := rows.Scan(&data); err != nil {
-			return nil, err
-		}
-		part, err := partFromJSON(data)
-		if err != nil {
-			return nil, err
-		}
-		parts = append(parts, part)
-	}
-	if err := rows.Err(); err != nil {
+	setStatus(&part, StatusCompacting, now)
+	part.CompactingAt = formatTime(now)
+	part.WorkerID = workerID
+	part.Error = ""
+	part.CompactCooldownUntil = ""
+	batch, err := compactBatchFromParts([]Part{part})
+	if err != nil {
 		return nil, err
 	}
-	return parts, nil
+	if err := s.savePartTx(ctx, tx, part); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+// Claim the largest eligible unlocked artifact using the compact queue index.
+func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time) (string, []any) {
+	args := []any{}
+	bind := func(v any) string { args = append(args, v); return fmt.Sprintf("$%d", len(args)) }
+	filters := []string{"p.status = 'COMPACT_READY'", "p.compact_eligible"}
+	for _, filter := range []struct{ field, value string }{
+		{"p.job_id", opts.JobID}, {"p.data->>'bucket'", opts.Bucket},
+		{"p.data->>'destination_database'", opts.DestinationDatabase},
+		{"p.data->>'destination_table'", opts.DestinationTable},
+		{"p.data->>'destination_schema'", opts.DestinationSchema},
+	} {
+		if filter.value != "" {
+			filters = append(filters, filter.field+" = "+bind(filter.value))
+		}
+	}
+	if len(opts.ExcludedJobIDs) > 0 {
+		ids := make([]string, 0, len(opts.ExcludedJobIDs))
+		for id := range opts.ExcludedJobIDs {
+			ids = append(ids, id)
+		}
+		filters = append(filters, "NOT (p.job_id = ANY("+bind(ids)+"::text[]))")
+	}
+	required := ""
+	if len(opts.RequiredPartitionIDs) > 0 {
+		required = " AND partition.key = ANY(" + bind(opts.RequiredPartitionIDs) + "::text[])"
+		filters = append(filters, "EXISTS (SELECT FROM jsonb_each_text(p.data->'destination_active_partition_counts') partition WHERE btrim(partition.key) <> '' AND partition.value::numeric > 0"+required+")")
+	}
+	from := s.tableSQL + " p"
+	if opts.CompactWindow > 0 {
+		cutoff := bind(now.Add(-opts.CompactWindow))
+		// A lateral join lets Postgres memoize the deadline by job while walking the queue.
+		from += " LEFT JOIN LATERAL (SELECT original_compact_ready_at FROM " + s.tableSQL + " original WHERE original.job_id = p.job_id AND original_compact_ready_at IS NOT NULL ORDER BY original_compact_ready_at DESC LIMIT 1) deadline ON true"
+		filters = append(filters, "COALESCE(deadline.original_compact_ready_at > "+cutoff+", true)")
+	}
+	return "SELECT p.data FROM " + from + " WHERE " + strings.Join(filters, " AND ") + " ORDER BY p.compact_bytes DESC, p.created_at, p.job_id, p.part_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED", args
 }
 
 func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
@@ -760,28 +809,33 @@ func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, w
 	if strings.TrimSpace(workerID) == "" {
 		return false, errors.New("worker id is required")
 	}
-	finalizeRequested := false
+	requested := false
 	for _, part := range batch.Parts {
-		updated, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-			return compactOwnedOrUnownedReady(current, workerID)
-		}, func(current *Part) error {
-			setStatus(current, StatusCompacting, now)
-			if strings.TrimSpace(current.CompactingAt) == "" {
-				current.CompactingAt = formatTime(now)
-			}
-			current.WorkerID = workerID
-			current.Error = ""
-			current.CompactCooldownUntil = ""
-			return nil
-		})
+		finalize, err := s.updateCompactProgress(ctx, part, workerID, []byte(`{}`), now)
 		if err != nil {
 			return false, fmt.Errorf("heartbeat compacting part %s/%s: %w", part.JobID, part.PartID, err)
 		}
-		if strings.TrimSpace(updated.CompactFinalizeRequestedAt) != "" {
-			finalizeRequested = true
-		}
+		requested = requested || finalize
 	}
-	return finalizeRequested, nil
+	return requested, nil
+}
+
+// One conditional statement preserves ownership and finalization requests while
+// patching only progress fields, rather than reading and rewriting the full part.
+func (s *Store) updateCompactProgress(ctx context.Context, part Part, workerID string, patch []byte, now time.Time) (bool, error) {
+	var requested bool
+	err := s.pool.QueryRow(ctx, `UPDATE `+s.tableSQL+` SET status = 'COMPACTING', worker_id = $1, updated_at = $2,
+ compact_stale_at = LEAST($2::text::timestamptz, COALESCE(NULLIF(btrim(data->>'compacting_at'), '')::timestamptz, $2::text::timestamptz)),
+ data = (data - 'error' - 'compact_cooldown_until') || $3::jsonb ||
+ jsonb_build_object('status', 'COMPACTING', 'worker_id', $1::text, 'updated_at', $2::text,
+ 'compacting_at', COALESCE(NULLIF(btrim(data->>'compacting_at'), ''), $2::text))
+ WHERE job_id = $4 AND part_id = $5 AND
+ ((status = 'COMPACTING' AND worker_id = $1) OR (status = 'COMPACT_READY' AND btrim(worker_id) = ''))
+ RETURNING COALESCE(btrim(data->>'compact_finalize_requested_at'), '') <> ''`, workerID, formatTime(now), patch, part.JobID, part.PartID).Scan(&requested)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s did not match expected state", part.JobID, part.PartID)}
+	}
+	return requested, err
 }
 
 func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now time.Time) error {
@@ -817,34 +871,21 @@ func (s *Store) UpdateCompactProgress(ctx context.Context, batch CompactBatch, o
 	if progress.MergeProgress < 0 {
 		return fmt.Errorf("compact merge progress must be non-negative, got %f", progress.MergeProgress)
 	}
+	patch, err := json.Marshal(map[string]any{
+		"compact_progress_at": formatTime(now), "compact_output_part_id": outputPartID,
+		"compact_input_part_count": inputStats.Count, "compact_input_rows": inputStats.Rows, "compact_input_bytes": inputStats.Bytes,
+		"compact_output_part_count": outputStats.Count, "compact_output_rows": outputStats.Rows, "compact_output_bytes": outputStats.Bytes,
+		"compact_stage": strings.TrimSpace(progress.Stage), "compact_active_merges": progress.ActiveMerges, "compact_merge_progress": progress.MergeProgress,
+	})
+	if err != nil {
+		return err
+	}
 	for _, part := range batch.Parts {
-		_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-			return compactOwnedOrUnownedReady(current, workerID)
-		}, func(current *Part) error {
-			setStatus(current, StatusCompacting, now)
-			if strings.TrimSpace(current.CompactingAt) == "" {
-				current.CompactingAt = formatTime(now)
-			}
-			current.WorkerID = workerID
-			current.CompactProgressAt = formatTime(now)
-			current.CompactOutputPartID = outputPartID
-			current.CompactInputPartCount = inputStats.Count
-			current.CompactInputRows = inputStats.Rows
-			current.CompactInputBytes = inputStats.Bytes
-			current.CompactOutputPartCount = outputStats.Count
-			current.CompactOutputRows = outputStats.Rows
-			current.CompactOutputBytes = outputStats.Bytes
-			current.CompactStage = strings.TrimSpace(progress.Stage)
-			current.CompactActiveMerges = progress.ActiveMerges
-			current.CompactMergeProgress = progress.MergeProgress
-			current.Error = ""
-			current.CompactCooldownUntil = ""
-			return nil
-		})
-		if err != nil {
+		if _, err := s.updateCompactProgress(ctx, part, workerID, patch, now); err != nil {
 			return fmt.Errorf("update compact progress for %s/%s: %w", part.JobID, part.PartID, err)
 		}
 	}
+
 	return nil
 }
 
@@ -852,53 +893,19 @@ func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, 
 	if staleAfter <= 0 {
 		return 0, fmt.Errorf("compact stale timeout must be greater than zero, got %s", staleAfter)
 	}
-	parts, err := s.listPartsByStatusIndex(ctx, StatusCompacting)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("query compacting parts: %w", err)
+		return 0, err
 	}
-	cutoff := now.Add(-staleAfter)
-	released := 0
-	for _, part := range parts {
-		staleAt, err := compactStaleTime(part)
-		if err != nil {
-			return released, err
-		}
-		if staleAt.After(cutoff) {
-			continue
-		}
-		ok, err := s.releaseStaleCompactingPart(ctx, part, now)
-		if err != nil {
-			return released, err
-		}
-		if ok {
-			released++
-		}
-	}
-	return released, nil
-}
-
-func (s *Store) releaseStaleCompactingPart(ctx context.Context, part Part, now time.Time) (bool, error) {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusCompacting && current.UpdatedAt == part.UpdatedAt
-	}, func(current *Part) error {
-		setStatus(current, StatusCompactReady, now)
-		if strings.TrimSpace(current.CompactReadyAt) == "" {
-			current.CompactReadyAt = compactReadyAtForRelease(part, now)
-		}
-		current.WorkerID = ""
-		current.CompactingAt = ""
-		current.Error = ""
-		current.CompactCooldownUntil = ""
-		clearCompactProgress(current)
-		return nil
-	})
-	if IsConditionalCheckFailed(err) {
-		return false, nil
-	}
+	defer tx.Rollback(ctx)
+	n, err := s.releaseStaleCompactingPartsTx(ctx, tx, now, staleAfter)
 	if err != nil {
-		return false, fmt.Errorf("release stale compacting part %s/%s: %w", part.JobID, part.PartID, err)
+		return 0, err
 	}
-	return true, nil
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, output Part, workerID string, now time.Time) error {
@@ -927,16 +934,10 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	}
 	defer tx.Rollback(ctx)
 
-	outputData, err := partJSON(output)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO `+s.tableSQL+` (job_id, part_id, status, worker_id, created_at, updated_at, data) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		output.JobID, output.PartID, string(output.Status), output.WorkerID, output.CreatedAt, output.UpdatedAt, outputData,
-	); err != nil {
+	if err := s.insertPartTx(ctx, tx, output); err != nil {
 		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 	}
+
 	for _, part := range batch.Parts {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err != nil {
@@ -979,144 +980,6 @@ func (s *Store) MarkCompactReadyFinished(ctx context.Context, part Part, now tim
 	return nil
 }
 
-type compactGroup struct {
-	key                    string
-	parts                  []Part
-	compactingPartitionIDs []string
-}
-
-func compactCandidateGroups(parts, compacting []Part, opts CompactClaimOptions) []compactGroup {
-	groupsByKey := map[string][]Part{}
-	var order []string
-	for _, part := range parts {
-		if strings.TrimSpace(part.DestinationDatabase) == "" ||
-			strings.TrimSpace(part.DestinationTable) == "" ||
-			strings.TrimSpace(part.DestinationSchema) == "" ||
-			part.DestinationActivePartCount == 0 ||
-			len(part.DestinationActivePartitionCounts) == 0 ||
-			!matchesCompactClaimOptions(part, opts) {
-			continue
-		}
-		key := compactGroupKey(part)
-		if _, ok := groupsByKey[key]; !ok {
-			order = append(order, key)
-		}
-		groupsByKey[key] = append(groupsByKey[key], part)
-	}
-	compactingPartitionsByKey := compactingPartitionIDsByGroup(compacting)
-	groups := make([]compactGroup, 0, len(order))
-	for _, key := range order {
-		groupParts := groupsByKey[key]
-		sort.SliceStable(groupParts, func(i, j int) bool {
-			if groupParts[i].CompactGeneration != groupParts[j].CompactGeneration {
-				return groupParts[i].CompactGeneration < groupParts[j].CompactGeneration
-			}
-			if groupParts[i].UpdatedAt != groupParts[j].UpdatedAt {
-				return groupParts[i].UpdatedAt < groupParts[j].UpdatedAt
-			}
-			return groupParts[i].PartID < groupParts[j].PartID
-		})
-		groups = append(groups, compactGroup{
-			key:                    key,
-			parts:                  groupParts,
-			compactingPartitionIDs: compactingPartitionsByKey[key],
-		})
-	}
-	return groups
-}
-
-func compactGroupKey(part Part) string {
-	return strings.Join([]string{part.JobID, part.Bucket, part.DestinationDatabase, part.DestinationTable, part.DestinationSchema}, "\x00")
-}
-
-func compactingPartitionIDsByGroup(parts []Part) map[string][]string {
-	sets := map[string]map[string]struct{}{}
-	for _, part := range parts {
-		if part.Status != StatusCompacting ||
-			strings.TrimSpace(part.DestinationDatabase) == "" ||
-			strings.TrimSpace(part.DestinationTable) == "" ||
-			strings.TrimSpace(part.DestinationSchema) == "" {
-			continue
-		}
-		key := compactGroupKey(part)
-		if _, ok := sets[key]; !ok {
-			sets[key] = map[string]struct{}{}
-		}
-		for _, partitionID := range partPartitionIDs(part) {
-			sets[key][partitionID] = struct{}{}
-		}
-	}
-	out := make(map[string][]string, len(sets))
-	for key, set := range sets {
-		partitionIDs := make([]string, 0, len(set))
-		for partitionID := range set {
-			partitionIDs = append(partitionIDs, partitionID)
-		}
-		sort.Strings(partitionIDs)
-		out[key] = partitionIDs
-	}
-	return out
-}
-
-func matchesCompactClaimOptions(part Part, opts CompactClaimOptions) bool {
-	if _, excluded := opts.ExcludedJobIDs[part.JobID]; excluded {
-		return false
-	}
-	if opts.JobID != "" && part.JobID != opts.JobID {
-		return false
-	}
-	if opts.Bucket != "" && part.Bucket != opts.Bucket {
-		return false
-	}
-	if opts.DestinationDatabase != "" && part.DestinationDatabase != opts.DestinationDatabase {
-		return false
-	}
-	if opts.DestinationTable != "" && part.DestinationTable != opts.DestinationTable {
-		return false
-	}
-	if opts.DestinationSchema != "" && part.DestinationSchema != opts.DestinationSchema {
-		return false
-	}
-	if len(opts.RequiredPartitionIDs) > 0 && !partOverlapsRequiredPartitions(part, opts.RequiredPartitionIDs) {
-		return false
-	}
-	return true
-}
-
-func compactHeartbeatTime(part Part) (time.Time, error) {
-	for _, value := range []string{part.UpdatedAt, part.CompactingAt} {
-		if strings.TrimSpace(value) == "" {
-			continue
-		}
-		t, err := time.Parse(timeFormat, value)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("parse compact heartbeat time for part %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		return t, nil
-	}
-	return time.Time{}, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
-}
-
-func compactStaleTime(part Part) (time.Time, error) {
-	var staleAt time.Time
-	for _, value := range []string{part.UpdatedAt, part.CompactingAt} {
-		if strings.TrimSpace(value) == "" {
-			continue
-		}
-		t, err := time.Parse(timeFormat, value)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("parse compact stale time for part %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		if staleAt.IsZero() || t.Before(staleAt) {
-			staleAt = t
-		}
-	}
-	if staleAt.IsZero() {
-		return time.Time{}, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
-	}
-	return staleAt, nil
-}
-
 func compactReadyAtForRelease(part Part, now time.Time) string {
 	for _, value := range []string{part.CompactReadyAt, part.ProgressUpdatedAt, part.UpdatedAt, part.CompactingAt} {
 		if strings.TrimSpace(value) != "" {
@@ -1124,154 +987,6 @@ func compactReadyAtForRelease(part Part, now time.Time) string {
 		}
 	}
 	return formatTime(now)
-}
-
-func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Part {
-	partitions := orderedCandidatePartitions(group.parts, opts.RequiredPartitionIDs)
-	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
-	if part, ok := selectFragmentedCompactPart(group.parts, preferredPartitions); ok {
-		return []Part{part}
-	}
-	fallbackPartitions := partitionsWithout(partitions, preferredPartitions)
-	if part, ok := selectFragmentedCompactPart(group.parts, fallbackPartitions); ok {
-		return []Part{part}
-	}
-	return nil
-}
-
-func selectFragmentedCompactPart(parts []Part, partitions []string) (Part, bool) {
-	var selected Part
-	found := false
-	for _, part := range parts {
-		eligible := false
-		for _, partitionID := range partitions {
-			if part.DestinationActivePartitionCounts[partitionID] > 0 {
-				eligible = true
-				break
-			}
-		}
-		if !eligible {
-			continue
-		}
-		fragmented := false
-		for _, count := range part.DestinationActivePartitionCounts {
-			fragmented = fragmented || count > 1
-		}
-		if fragmented && (!found || part.DestinationActivePartBytes > selected.DestinationActivePartBytes) {
-			selected = part
-			found = true
-		}
-	}
-	return selected, found
-}
-
-func partitionsWithout(partitions, excluded []string) []string {
-	excludedSet := partitionSet(excluded)
-	if len(excludedSet) == 0 {
-		return append([]string(nil), partitions...)
-	}
-	out := make([]string, 0, len(partitions))
-	for _, partitionID := range partitions {
-		if _, ok := excludedSet[partitionID]; ok {
-			continue
-		}
-		out = append(out, partitionID)
-	}
-	return out
-}
-
-func orderedCandidatePartitions(parts []Part, required []string) []string {
-	requiredSet := partitionSet(required)
-	seen := map[string]struct{}{}
-	var partitions []string
-	for _, part := range parts {
-		ids := partPartitionIDs(part)
-		for _, partitionID := range ids {
-			if len(requiredSet) > 0 {
-				if _, ok := requiredSet[partitionID]; !ok {
-					continue
-				}
-			}
-			if _, ok := seen[partitionID]; ok {
-				continue
-			}
-			seen[partitionID] = struct{}{}
-			partitions = append(partitions, partitionID)
-		}
-	}
-	return partitions
-}
-
-func partitionSet(partitionIDs []string) map[string]struct{} {
-	out := map[string]struct{}{}
-	for _, partitionID := range partitionIDs {
-		if strings.TrimSpace(partitionID) == "" {
-			continue
-		}
-		out[partitionID] = struct{}{}
-	}
-	return out
-}
-
-func partOverlapsRequiredPartitions(part Part, required []string) bool {
-	for partitionID := range partitionSet(required) {
-		if part.DestinationActivePartitionCounts[partitionID] > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func partPartitionIDs(part Part) []string {
-	ids := make([]string, 0, len(part.DestinationActivePartitionCounts))
-	for partitionID, count := range part.DestinationActivePartitionCounts {
-		if strings.TrimSpace(partitionID) == "" || count == 0 {
-			continue
-		}
-		ids = append(ids, partitionID)
-	}
-	sort.Strings(ids)
-	return ids
-}
-
-func (s *Store) claimCompactParts(ctx context.Context, parts []Part, workerID string, now time.Time) ([]Part, error) {
-	if err := validateCompactBatchParts(parts); err != nil {
-		return nil, err
-	}
-	for _, part := range parts {
-		if part.Status != StatusCompactReady {
-			return nil, fmt.Errorf("compact batch part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusCompactReady)
-		}
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	claimed := make([]Part, 0, len(parts))
-	for _, part := range parts {
-		claimedPart, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
-		if err != nil {
-			return nil, fmt.Errorf("claim compact-ready part %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		if claimedPart.Status != StatusCompactReady {
-			return nil, fmt.Errorf("claim compact-ready part %s/%s: %w", part.JobID, part.PartID, &conditionalCheckFailedError{})
-		}
-		setStatus(&claimedPart, StatusCompacting, now)
-		claimedPart.CompactingAt = formatTime(now)
-		claimedPart.WorkerID = workerID
-		claimedPart.Error = ""
-		claimedPart.CompactCooldownUntil = ""
-		if err := s.savePartTx(ctx, tx, claimedPart); err != nil {
-			return nil, fmt.Errorf("claim compact-ready part %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		claimed = append(claimed, claimedPart)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return claimed, nil
 }
 
 func compactBatchFromParts(parts []Part) (*CompactBatch, error) {
@@ -1421,40 +1136,59 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("worker id is required")
 	}
-	_, err := s.updatePart(ctx, jobID, partID, func(current Part) bool {
-		return current.Status == StatusInProgress && current.WorkerID == workerID
-	}, func(current *Part) error {
-		current.UpdatedAt = formatTime(now)
-		current.ProgressUpdatedAt = formatTime(now)
-		if progress.QueryProgress != nil {
-			current.ReadRows = progress.QueryProgress.ReadRows
-			current.ReadBytes = progress.QueryProgress.ReadBytes
-			current.TotalRowsApprox = progress.QueryProgress.TotalRowsApprox
-			current.WrittenRows = progress.QueryProgress.WrittenRows
-			current.WrittenBytes = progress.QueryProgress.WrittenBytes
-		}
-		if progress.SourceActivePartStats != nil {
-			current.SourceActivePartCount = progress.SourceActivePartStats.Count
-			current.SourceActivePartRows = progress.SourceActivePartStats.Rows
-			current.SourceActivePartBytes = progress.SourceActivePartStats.Bytes
-		}
-		if progress.DestinationActivePartStats != nil {
-			current.DestinationActivePartCount = progress.DestinationActivePartStats.Count
-			current.DestinationActivePartRows = progress.DestinationActivePartStats.Rows
-			current.DestinationActivePartBytes = progress.DestinationActivePartStats.Bytes
-		}
-		if progress.DestinationFailedMerges != nil {
-			current.DestinationFailedMerges = *progress.DestinationFailedMerges
-		}
-		if progress.StageProgress != nil {
-			current.RewriteStage = progress.StageProgress.Stage
-			current.RewriteStageStartedAt = formatTime(progress.StageProgress.StageStartedAt)
-			current.RewriteStageElapsedMs = progress.StageProgress.StageElapsedMs
-			current.RewriteTotalElapsedMs = progress.StageProgress.TotalElapsedMs
-			current.RewriteStageDurationsMs = progress.StageProgress.CompletedStageDurationsMs
-		}
-		return nil
-	})
+	patch := map[string]any{}
+	patch["updated_at"] = formatTime(now)
+	patch["progress_updated_at"] = formatTime(now)
+	if progress.QueryProgress != nil {
+		patch["read_rows"] = progress.QueryProgress.ReadRows
+		patch["read_bytes"] = progress.QueryProgress.ReadBytes
+		patch["total_rows_approx"] = progress.QueryProgress.TotalRowsApprox
+		patch["written_rows"] = progress.QueryProgress.WrittenRows
+		patch["written_bytes"] = progress.QueryProgress.WrittenBytes
+	}
+	if progress.SourceActivePartStats != nil {
+		patch["source_active_part_count"] = progress.SourceActivePartStats.Count
+		patch["source_active_part_rows"] = progress.SourceActivePartStats.Rows
+		patch["source_active_part_bytes"] = progress.SourceActivePartStats.Bytes
+	}
+	if progress.DestinationActivePartStats != nil {
+		patch["destination_active_part_count"] = progress.DestinationActivePartStats.Count
+		patch["destination_active_part_rows"] = progress.DestinationActivePartStats.Rows
+		patch["destination_active_part_bytes"] = progress.DestinationActivePartStats.Bytes
+	}
+	if progress.DestinationFailedMerges != nil {
+		patch["destination_failed_merges"] = *progress.DestinationFailedMerges
+	}
+	if progress.StageProgress != nil {
+		patch["rewrite_stage"] = progress.StageProgress.Stage
+		patch["rewrite_stage_started_at"] = formatTime(progress.StageProgress.StageStartedAt)
+		patch["rewrite_stage_elapsed_ms"] = progress.StageProgress.StageElapsedMs
+		patch["rewrite_total_elapsed_ms"] = progress.StageProgress.TotalElapsedMs
+		patch["rewrite_stage_durations_ms"] = progress.StageProgress.CompletedStageDurationsMs
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	updates := `updated_at = $1, data = data || $2::jsonb`
+	args := []any{formatTime(now), data, jobID, partID, workerID}
+	if stats := progress.DestinationActivePartStats; stats != nil {
+		updates += `, compact_bytes = $6, compact_eligible = $7::boolean AND
+ COALESCE(btrim(data->>'destination_database'), '') <> '' AND
+ COALESCE(btrim(data->>'destination_table'), '') <> '' AND
+ COALESCE(btrim(data->>'destination_schema'), '') <> '' AND
+ EXISTS (SELECT FROM jsonb_each_text(COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb)) p WHERE btrim(p.key) <> '' AND p.value::numeric > 1),
+ compact_normalized = $8::boolean AND
+ (SELECT count(*) = 1 AND COALESCE(bool_and(p.value::numeric = 1), false)
+ FROM jsonb_each_text(COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb)) p WHERE btrim(p.key) <> '' AND p.value::numeric > 0)`
+		args = append(args, pgtype.Numeric{Int: new(big.Int).SetUint64(stats.Bytes), Valid: true}, stats.Count > 0, stats.Count == 1)
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE `+s.tableSQL+` SET `+updates+` WHERE job_id = $3 AND part_id = $4 AND status = 'IN_PROGRESS' AND worker_id = $5`, args...)
+
+	if err == nil && tag.RowsAffected() != 1 {
+		err = &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s did not match expected state", jobID, partID)}
+	}
+
 	if err != nil {
 		return fmt.Errorf("update rewrite progress for %s/%s: %w", jobID, partID, err)
 	}
@@ -1470,79 +1204,83 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 }
 
 func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]string, error) {
-	jobs, err := s.ListJobsByStatus(ctx, statuses...)
-	if err != nil {
-		return nil, err
-	}
-	jobIDs := make([]string, 0, len(jobs))
-	for _, job := range jobs {
-		jobIDs = append(jobIDs, job.JobID)
-	}
-	return jobIDs, nil
-}
-
-func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job, error) {
-	jobsByID := map[string]Job{}
-	jobPartitionsByID := map[string]map[string]struct{}{}
-	queried := map[Status]struct{}{}
+	values := make([]string, 0, len(statuses))
 	for _, status := range statuses {
 		if strings.TrimSpace(string(status)) == "" {
 			return nil, errors.New("status is required")
 		}
-		if _, ok := queried[status]; ok {
-			continue
-		}
-		queried[status] = struct{}{}
-		parts, err := s.listPartsByStatusIndex(ctx, status)
-		if err != nil {
-			return nil, fmt.Errorf("query job ids for status %s: %w", status, err)
-		}
-		for _, part := range parts {
-			if part.JobID == "" {
-				continue
-			}
-			existing := jobsByID[part.JobID]
-			if existing.JobID == "" {
-				existing = Job{JobID: part.JobID, Name: part.JobName, Counts: map[Status]int{}}
-			}
-			if existing.Name == "" && part.JobName != "" {
-				existing.Name = part.JobName
-			}
-			if existing.Name != "" && part.JobName != "" && existing.Name != part.JobName {
-				return nil, fmt.Errorf("job %s has conflicting job_name values %q and %q", part.JobID, existing.Name, part.JobName)
-			}
-			existing.Total++
-			existing.Counts[status]++
-			if status != StatusSuperseded {
-				existing.DestinationActivePartCount += part.DestinationActivePartCount
-				if jobPartitionsByID[part.JobID] == nil {
-					jobPartitionsByID[part.JobID] = map[string]struct{}{}
-				}
-				for partitionID, count := range part.DestinationActivePartitionCounts {
-					if strings.TrimSpace(partitionID) != "" && count > 0 {
-						jobPartitionsByID[part.JobID][partitionID] = struct{}{}
-					}
-				}
-				existing.DestinationPartitionCount = len(jobPartitionsByID[part.JobID])
-			}
-			if part.CreatedAt != "" && (existing.SubmittedAt == "" || part.CreatedAt < existing.SubmittedAt) {
-				existing.SubmittedAt = part.CreatedAt
-			}
-			if part.UpdatedAt != "" && part.UpdatedAt > existing.UpdatedAt {
-				existing.UpdatedAt = part.UpdatedAt
-			}
-			jobsByID[part.JobID] = existing
-		}
+		values = append(values, string(status))
 	}
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT job_id FROM `+s.tableSQL+` WHERE status = ANY($1::text[]) ORDER BY job_id`, values)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
 
-	jobs := make([]Job, 0, len(jobsByID))
-	for _, job := range jobsByID {
-		jobs = append(jobs, job)
+func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job, error) {
+	values := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		if strings.TrimSpace(string(status)) == "" {
+			return nil, errors.New("status is required")
+		}
+		values = append(values, string(status))
 	}
-	sort.Slice(jobs, func(i, j int) bool {
-		return jobs[i].JobID < jobs[j].JobID
-	})
-	return jobs, nil
+	rows, err := s.pool.Query(ctx, `WITH selected AS MATERIALIZED (
+ SELECT job_id, status, created_at, updated_at, COALESCE(data->>'job_name', '') AS name,
+ COALESCE((data->>'destination_active_part_count')::numeric, 0) AS part_count,
+ COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb) AS partitions
+ FROM `+s.tableSQL+` WHERE status = ANY($1::text[])
+ ), partition_counts AS (
+ SELECT job_id, count(DISTINCT p.key) AS count FROM selected,
+ LATERAL jsonb_each_text(partitions) p
+ WHERE status <> 'SUPERSEDED' AND btrim(p.key) <> '' AND p.value::numeric > 0 GROUP BY job_id
+ ) SELECT s.job_id, s.status, count(*), COALESCE(min(NULLIF(s.name, '')), ''), max(s.name),
+ min(s.created_at), max(s.updated_at), sum(CASE WHEN s.status <> 'SUPERSEDED' THEN part_count ELSE 0 END)::text,
+ COALESCE(max(p.count), 0)
+ FROM selected s LEFT JOIN partition_counts p USING (job_id)
+ GROUP BY s.job_id, s.status ORDER BY s.job_id, s.status`, values)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []Job
+	for rows.Next() {
+		var jobID, minName, maxName, createdAt, updatedAt, activeCount string
+		var status Status
+		var count, partitions int
+		if err := rows.Scan(&jobID, &status, &count, &minName, &maxName, &createdAt, &updatedAt, &activeCount, &partitions); err != nil {
+			return nil, err
+		}
+		if minName != maxName {
+			return nil, fmt.Errorf("job %s has conflicting job_name values %q and %q", jobID, minName, maxName)
+		}
+		if len(jobs) == 0 || jobs[len(jobs)-1].JobID != jobID {
+			jobs = append(jobs, Job{JobID: jobID, Counts: map[Status]int{}, SubmittedAt: createdAt})
+		}
+		job := &jobs[len(jobs)-1]
+		if job.Name != "" && minName != "" && job.Name != minName {
+			return nil, fmt.Errorf("job %s has conflicting job_name values %q and %q", jobID, job.Name, minName)
+		}
+		if minName != "" {
+			job.Name = minName
+		}
+		n, err := strconv.ParseUint(activeCount, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		job.Total += count
+		job.Counts[status] = count
+		job.DestinationActivePartCount += n
+		job.DestinationPartitionCount = partitions
+		if createdAt < job.SubmittedAt {
+			job.SubmittedAt = createdAt
+		}
+		if updatedAt > job.UpdatedAt {
+			job.UpdatedAt = updatedAt
+		}
+	}
+	return jobs, rows.Err()
 }
 
 func (s *Store) ListJobParts(ctx context.Context, jobID string) ([]Part, error) {
@@ -1569,9 +1307,6 @@ func (s *Store) ListJobParts(ctx context.Context, jobID string) ([]Part, error) 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Slice(parts, func(i, j int) bool {
-		return parts[i].PartID < parts[j].PartID
-	})
 	return parts, nil
 }
 
@@ -1944,19 +1679,6 @@ func validateOriginalResetPart(part Part) error {
 		return fmt.Errorf("part %s/%s is missing updated_at", part.JobID, part.PartID)
 	}
 	return nil
-}
-
-func (s *Store) claimPart(ctx context.Context, part Part, workerID string, now time.Time) (*Part, error) {
-	claimed, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusReady
-	}, func(current *Part) error {
-		claimPartInMemory(current, workerID, now)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("claim state item for %s/%s: %w", part.JobID, part.PartID, err)
-	}
-	return &claimed, nil
 }
 
 func claimPartInMemory(part *Part, workerID string, now time.Time) {

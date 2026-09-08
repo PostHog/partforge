@@ -16,6 +16,15 @@ go test ./...
 
 The e2e script stands up LocalStack, Postgres, and a ClickHouse container, builds the worker image, and runs the full pipeline against `e2e/sql/`, diffing the result against `e2e/expected.tsv`. It builds the image each run; set `PARTFORGE_E2E_SKIP_BUILD=1` to reuse an existing `partforge-worker:latest`.
 
+PostgreSQL integration checks exercise fresh and hand-created schemas, migration rollback and concurrent migration runs, concurrent work claims, ownership, maintenance, and 20,000-row query plans. With local compose Postgres running:
+
+```sh
+PARTFORGE_TEST_POSTGRES_URL='postgres://partforge:partforge@localhost:15432/partforge?sslmode=disable' \
+  go test ./internal/state -run Postgres -count=1
+```
+
+These tests create and remove isolated schemas. They skip when the connection variable is unset. The e2e script also runs `migrate` twice before uploading, checking both initial setup and a no-op rerun.
+
 ## Build
 
 ```sh

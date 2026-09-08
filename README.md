@@ -33,7 +33,15 @@ on source node         parts to S3;          local ClickHouse;         destinati
 
 ## Getting started
 
-Two SQL files define your migration; everything else is mechanical. Write them, then run four commands.
+Initialize or upgrade the Postgres state schema before running uploads or workers:
+
+```sh
+partforge migrate -postgres-url="$POSTGRES_URL"
+```
+
+For an existing deployment, stop workers while migrating. See [Postgres migrations](docs/postgres.md#migrate-before-starting-workers).
+
+Two SQL files define your ClickHouse rewrite. Write them, then run the pipeline commands below.
 
 ### 1. Destination schema — `dest.sql`
 
