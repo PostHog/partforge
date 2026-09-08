@@ -67,7 +67,6 @@ var stageOrder = []string{
 	stageDownloadSource,
 	stageReadManifest,
 	stagePrepareWorkerTables,
-	stageConfigureCompression,
 	stageAttachSourcePart,
 	stageInsertSelect,
 	stageConfigureMergeSettings,
@@ -533,13 +532,6 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return rewriteResult{}, fmt.Errorf("create destination table: %w", err)
 	}
 	slog.Info("created worker tables", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
-
-	if err := p.reportStageProgress(ctx, m, stageTracker, stageConfigureCompression); err != nil {
-		return rewriteResult{}, err
-	}
-	if err := p.configureDestinationCompressionCodec(ctx, m); err != nil {
-		return rewriteResult{}, err
-	}
 
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {

@@ -340,6 +340,10 @@ for i in $(seq 1 "$part_count"); do
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  if grep -F 'configured destination compression codec' "$worker_log" >/dev/null; then
+    echo "inserter overrode the destination compression codec" >&2
+    exit 1
+  fi
   if (( i == 1 )) && ! grep -F 'completed source chunk' "$worker_log" | grep -F 'chunk=3 chunks=3 completed_source_rows=3 source_rows=3' >/dev/null; then
     echo "largest source part did not complete all three insert chunks" >&2
     exit 1

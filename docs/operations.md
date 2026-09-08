@@ -10,7 +10,7 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 - **`-poll-interval`** (default `10s`) — how long to wait before re-checking for work when idle.
 - **`-compact-window`** (default `24h`) — the job-wide compaction period after the last original source artifact finishes rewriting; also the hard deadline for claimed compact merge waits. `0` finalizes as soon as no useful compaction remains.
 - **`-insert-chunk-min-rows`** (default `10000000`) — minimum source rows per local insert chunk, up to 20 chunks per part. Parts below 20 million rows stay unsplit. `0` disables chunking for SQL requiring the whole source part. Completed chunks survive handled insert memory errors, but not worker/node loss. See [chunk semantics and recovery limits](rewrite-flow.md#local-insert-checkpoints).
-- **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the worker destination table before the insert-select.
+- **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the destination table during compaction only. Rewrites use the destination schema's compression settings without an override.
 - **`-clickhouse-binary`**, **`-clickhouse-config-file`**, **`-clickhouse-url`** — locate the local ClickHouse the worker starts.
 
 The worker auto-tunes ClickHouse insert and merge settings from detected CPU/memory (memory-capped inserts and a ~150 GiB local merge target), while compactor workers run one merge at a time. The derivation and the merge-wait state machine are documented in [rewrite-flow.md](rewrite-flow.md).
@@ -43,7 +43,7 @@ Three metric families measure the insert-select retry loop:
 | Metric | Meaning |
 | --- | --- |
 | `partforge_insert_attempt_duration_seconds` | Histogram per attempt, labeled `result="completed"` or `"failed"`. Its `_count` counts attempts; `_sum` measures their wall time, including progress reporting. Excludes time between attempts. |
-| `partforge_insert_duration_seconds` | Histogram per part's insert loop, including all attempts, table resets, codec setup, and backoff. Labels: `result` and `retried="true"` or `"false"` (whether a second attempt actually started). |
+| `partforge_insert_duration_seconds` | Histogram per part's insert loop, including all attempts, table resets, and backoff. Labels: `result` and `retried="true"` or `"false"` (whether a second attempt actually started). |
 | `partforge_insert_wasted_seconds_total` | Time outside the successful attempt for retried inserts. First-attempt success adds zero. A terminal failure or cancellation adds the entire loop duration, including interrupted recovery. Same labels as insert duration. |
 
 All three include `job_id`, `source_table`, and `destination_table`; scraped `pod` and `environment` labels allow per-worker breakdowns. Attempts update when each attempt ends. Whole-loop duration and wasted time update together when the loop exits, even on error. Running attempts and abrupt worker deaths are not included until/unless their observation executes. These are cumulative PartForge process metrics and survive local ClickHouse restarts; worker restarts reset them. Use `increase` before summing across workers. Very short-lived processes or events before the first scrape can be missed.

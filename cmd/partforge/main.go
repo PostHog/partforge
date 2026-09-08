@@ -1546,7 +1546,7 @@ func runWorker(ctx context.Context, args []string) error {
 		workerID                 = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
 		workDir                  = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
 		insertChunkMinRows       = fs.Uint64("insert-chunk-min-rows", rewrite.DefaultInsertChunkMinRows, "minimum source rows per insert chunk (up to 20 chunks); 0 disables chunking for SQL requiring the whole source part")
-		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
+		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied during compaction only")
 		mergeMaxRuntime          = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
 		role                     = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
 		compact                  = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
@@ -1889,7 +1889,6 @@ func runWorker(ctx context.Context, args []string) error {
 					MergeMaxBlockSize:        mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
 					MergeSelectingSleepMS:    mergeTreeSettings.MergeSelectingSleepMS,
-					DefaultCompressionCodec:  *defaultCompressionCodec,
 					PoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 				},
 			}
