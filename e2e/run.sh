@@ -203,6 +203,7 @@ for i in $(seq 1 "$incremental_part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -role=inserter \
+    -insert-chunk-min-rows=1 \
     -merge-max-runtime=1ns \
     -s3-endpoint=http://localstack:4566 \
     -postgres-url="$POSTGRES_URL" \
@@ -333,11 +334,16 @@ for i in $(seq 1 "$part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -role=inserter \
+    -insert-chunk-min-rows=1 \
     -merge-max-runtime=1ns \
     -s3-endpoint=http://localstack:4566 \
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  if (( i == 1 )) && ! grep -F 'completed source chunk' "$worker_log" | grep -F 'chunk=3 chunks=3 completed_source_rows=3 source_rows=3' >/dev/null; then
+    echo "largest source part did not complete all three insert chunks" >&2
+    exit 1
+  fi
   if (( i == 1 )) && ! grep -F "claimed ready part" "$worker_log" | grep -F "part_id=$largest_source_part_id" >/dev/null; then
     echo "first worker did not claim largest source part $largest_source_part_id" >&2
     exit 1
@@ -355,7 +361,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
 
 for i in $(seq 1 "$part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker worker \
-    -role=inserter -merge-max-runtime=1ns -once \
+    -role=inserter -insert-chunk-min-rows=1 -merge-max-runtime=1ns -once \
     -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 done
 empty_finished_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \

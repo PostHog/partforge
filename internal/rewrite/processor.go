@@ -94,6 +94,7 @@ type Processor struct {
 	MergeMaxTimeout     time.Duration
 	Metrics             metrics.Recorder
 	InsertSettings      chhttp.QuerySettings
+	InsertChunkMinRows  uint64
 	ProgressInterval    time.Duration
 	ReportProgress      ProgressReporter
 	MergeTreeSettings   MergeTreeSettings
@@ -523,6 +524,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.configureSourceMergePoolSettings(ctx, m); err != nil {
 		return rewriteResult{}, err
 	}
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+chhttp.TableSQL(m.Source.Database, m.Source.Table)); err != nil {
+		return rewriteResult{}, fmt.Errorf("stop source merges: %w", err)
+	}
 	slog.Info("creating worker destination table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
 		return rewriteResult{}, fmt.Errorf("create destination table: %w", err)
@@ -569,7 +573,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
 	insertStartedAt := time.Now()
-	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
+	if err := p.runInsertSelectWithRetries(ctx, m, sourceStats.Rows); err != nil {
 		return rewriteResult{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
@@ -656,30 +660,53 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	return result, nil
 }
 
-func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) (retErr error) {
+func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, sourceRows uint64) (retErr error) {
+	chunks := insertChunkCount(sourceRows, p.InsertChunkMinRows)
+	if chunks > 1 {
+		if err := p.prepareInsertChunks(ctx, m); err != nil {
+			return err
+		}
+	}
 	recorder := p.recorder()
 	recorder.InsertSelectStarted(m)
 	settings := cloneQuerySettings(p.InsertSettings)
 	startedAt := time.Now()
 	attempt := 0
+	retries := 0
+	var chunk, start uint64
+	var promotionElapsed time.Duration
 	var successfulAttemptElapsed time.Duration
 	defer func() {
 		elapsed := time.Since(startedAt)
 		result := "completed"
-		wasted := elapsed - successfulAttemptElapsed
+		wasted := elapsed - successfulAttemptElapsed - promotionElapsed
 		if retErr != nil {
 			result = "failed"
-		} else if attempt == 1 {
+			wasted = elapsed
+		} else if retries == 0 {
 			wasted = 0
 		}
-		recorder.ObserveInsertSelect(m, result, attempt, elapsed, wasted)
+		// Successful chunks are not retries of the forge.
+		recorder.ObserveInsertSelect(m, result, retries+1, elapsed, wasted)
 		slog.Info("insert-select summary", "job_id", m.JobID, "part_id", m.PartID,
-			"result", result, "attempts", attempt, "elapsed", elapsed,
+			"result", result, "attempts", attempt, "chunks", chunks, "completed_chunks", chunk, "elapsed", elapsed,
 			"wasted_elapsed", wasted, "successful_attempt_elapsed", successfulAttemptElapsed,
 			"max_threads", settings["max_threads"], "max_insert_threads", settings["max_insert_threads"],
 			"max_block_size", settings["max_block_size"])
 	}()
-	for {
+	for chunk < chunks {
+		end := start + sourceRows/chunks
+		if chunk < sourceRows%chunks {
+			end++
+		}
+		if chunks > 1 {
+			if settings == nil {
+				settings = make(chhttp.QuerySettings)
+			}
+			settings["additional_table_filters"] = insertChunkFilter(m.Source, start, end)
+			slog.Info("inserting source chunk", "job_id", m.JobID, "part_id", m.PartID,
+				"chunk", chunk+1, "chunks", chunks, "start_offset", start, "end_offset", end, "source_rows", sourceRows)
+		}
 		attempt++
 		attemptStartedAt := time.Now()
 		err := p.runInsertSelect(ctx, m, attempt, settings)
@@ -706,7 +733,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			if !reduced {
 				return fmt.Errorf("attempt %d exhausted resource reductions (max_threads=%s, max_insert_threads=%s, max_block_size=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], settings["max_block_size"], err)
 			}
-			backoff := insertSelectRetryBackoff(attempt)
+			backoff := insertSelectRetryBackoff(retries + 1)
 			slog.Warn(
 				"insert-select failed with retryable resource error; retrying with lower thread and block settings",
 				"job_id", m.JobID,
@@ -720,22 +747,40 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 				"max_block_size", nextSettings["max_block_size"],
 				"error", err,
 			)
-			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m, destDDL); resetErr != nil {
+			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m); resetErr != nil {
 				return fmt.Errorf("insert-select failed with retryable resource error (%w), but reset destination table failed: %v", err, resetErr)
-			}
-			if settingsErr := p.configureDestinationCompressionCodec(ctx, m); settingsErr != nil {
-				return fmt.Errorf("insert-select failed with retryable resource error (%w), but configure destination compression codec after reset failed: %v", err, settingsErr)
 			}
 			if err := sleepOrDone(ctx, backoff); err != nil {
 				return err
 			}
 			settings = nextSettings
+			retries++
 			continue
 		}
-		successfulAttemptElapsed = attemptElapsed
+		successfulAttemptElapsed += attemptElapsed
 		recorder.ObserveInsertAttempt(m, "completed", attemptElapsed)
-		return nil
+		if chunks > 1 {
+			promotionStartedAt := time.Now()
+			if err := p.promoteInsertChunk(ctx, m); err != nil {
+				return err
+			}
+			promotionElapsed += time.Since(promotionStartedAt)
+			slog.Info("completed source chunk", "job_id", m.JobID, "part_id", m.PartID,
+				"chunk", chunk+1, "chunks", chunks, "completed_source_rows", end, "source_rows", sourceRows)
+		}
+		start = end
+		chunk++
 	}
+	if chunks > 1 {
+		// Restore the original destination name for the existing merge/freeze/upload flow.
+		if err := p.ClickHouse.Exec(ctx, "EXCHANGE TABLES "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" AND "+completedInsertTable(m)); err != nil {
+			return fmt.Errorf("exchange completed insert table: %w", err)
+		}
+		if err := p.ClickHouse.Exec(ctx, "DROP TABLE "+completedInsertTable(m)+" SYNC"); err != nil {
+			return fmt.Errorf("drop empty insert staging table: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p Processor) configureSourceMergePoolSettings(ctx context.Context, m manifest.Manifest) error {
@@ -1137,18 +1182,15 @@ func shouldReportProgress(interval time.Duration, last time.Time, now time.Time)
 	return last.IsZero() || !now.Before(last.Add(interval))
 }
 
-func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest, destDDL string) error {
+func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest) error {
 	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
-	if err := ch.ExecWithOptions(ctx, "DROP TABLE IF EXISTS "+table+" SYNC", chhttp.QueryOptions{
+	if err := ch.ExecWithOptions(ctx, "TRUNCATE TABLE "+table+" SYNC", chhttp.QueryOptions{
 		Settings: chhttp.QuerySettings{
 			"max_table_size_to_drop":     "0",
 			"max_partition_size_to_drop": "0",
 		},
 	}); err != nil {
-		return fmt.Errorf("drop destination table before retry: %w", err)
-	}
-	if err := ch.Exec(ctx, destDDL); err != nil {
-		return fmt.Errorf("recreate destination table before retry: %w", err)
+		return fmt.Errorf("truncate insert staging table before retry: %w", err)
 	}
 	return nil
 }

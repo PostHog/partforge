@@ -144,7 +144,7 @@ func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 		JobID:  "job-1",
 		PartID: "part-1",
 		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO dst SELECT * FROM src"},
-	}, "unused destination DDL")
+	}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestRetryableInsertSelectError(t *testing.T) {
 	}
 }
 
-func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
+func TestResetDestinationTableAllowsLargeTruncate(t *testing.T) {
 	var requests []struct {
 		query string
 		body  string
@@ -197,17 +197,16 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	}))
 	defer server.Close()
 
-	destDDL := "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY tuple()"
 	err := resetDestinationTable(context.Background(), chhttp.Client{URL: server.URL}, manifest.Manifest{
 		Dest: manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	}, destDDL)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 2 {
-		t.Fatalf("requests = %d, want 2", len(requests))
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(requests))
 	}
-	if requests[0].body != "DROP TABLE IF EXISTS `db`.`query_log_archive_temp` SYNC" {
+	if requests[0].body != "TRUNCATE TABLE `db`.`query_log_archive_temp` SYNC" {
 		t.Fatalf("drop query = %q", requests[0].body)
 	}
 	dropSettings := requests[0].query
@@ -217,12 +216,7 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	if !strings.Contains(dropSettings, "max_partition_size_to_drop=0") {
 		t.Fatalf("drop settings = %q, want max_partition_size_to_drop=0", dropSettings)
 	}
-	if requests[1].body != destDDL {
-		t.Fatalf("recreate query = %q", requests[1].body)
-	}
-	if strings.Contains(requests[1].query, "max_table_size_to_drop") || strings.Contains(requests[1].query, "max_partition_size_to_drop") {
-		t.Fatalf("recreate settings = %q, want no drop-size settings", requests[1].query)
-	}
+
 }
 
 func TestConfigureDestinationMergeSettings(t *testing.T) {
@@ -367,11 +361,10 @@ func TestInsertRetryTiming(t *testing.T) {
 					if tc.failFirst && inserts == 1 {
 						http.Error(w, tc.insertError, http.StatusInternalServerError)
 					}
-				case strings.HasPrefix(query, "DROP TABLE "):
+				case strings.HasPrefix(query, "TRUNCATE TABLE "):
 					if tc.failReset {
 						http.Error(w, "reset failed", http.StatusInternalServerError)
 					}
-				case strings.HasPrefix(query, "ALTER TABLE "):
 					if tc.cancelRecovery {
 						cancel()
 					}
@@ -389,7 +382,7 @@ func TestInsertRetryTiming(t *testing.T) {
 			}).runInsertSelectWithRetries(ctx, manifest.Manifest{
 				JobID: "job-1", PartID: "part-1", Dest: manifest.TableRef{Database: "db", Table: "dst"},
 				SQL: manifest.SQLBundle{InsertSelect: "INSERT INTO db.dst SELECT 1"},
-			}, "CREATE TABLE db.dst (x UInt64) ENGINE = MergeTree ORDER BY x")
+			}, 0)
 			if (err != nil) != (tc.wantResult == "failed") {
 				t.Fatalf("unexpected result: %v", err)
 			}
@@ -467,7 +460,7 @@ func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 		PartID: "part-1",
 		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
 		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO db.query_log_archive_temp SELECT 1"},
-	}, "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY x")
+	}, 0)
 	if err == nil {
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
@@ -486,7 +479,7 @@ func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	}
 	var resets int
 	for _, query := range queries {
-		if strings.HasPrefix(query, "DROP TABLE ") {
+		if strings.HasPrefix(query, "TRUNCATE TABLE ") {
 			resets++
 		}
 	}
@@ -496,9 +489,8 @@ func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	if containsQueryWith(queries, "merge_max_block_size") {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
-	wantCompression := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING default_compression_codec = 'ZSTD(5)'"
-	if !containsString(queries, wantCompression) {
-		t.Fatalf("queries = %#v, want compression settings after destination reset", queries)
+	if containsQueryWith(queries, "default_compression_codec") {
+		t.Fatalf("truncate should preserve compression settings, got queries: %#v", queries)
 	}
 }
 
