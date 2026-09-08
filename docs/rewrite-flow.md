@@ -53,14 +53,16 @@ graph TD
     L --> P[Measure active destination parts]
     P --> Q{Any active destination parts?}
     Q -- No --> R[No frozen output parts]
-    R --> W[Finished artifact upload fails]
+    R --> W[Mark empty output FINISHED]
     Q -- Yes --> S[ALTER TABLE destination FREEZE]
     S --> T[Build finished part tarballs]
     T --> U[Upload finished artifact prefix]
     U --> V[Mark part COMPACT_READY]
 ```
 
-`upload-freeze` records each source artifact's on-disk byte size, and rewrite workers claim the largest `READY` artifact first. The insert-select step has its own resource retry loop. The worker caps query memory at 70% of detected memory and initially sets `max_threads` and `max_insert_threads` to half the detected CPU count. ClickHouse's native insert block-size settings remain in effect. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
+`upload-freeze` records each source artifact's on-disk byte size, and rewrite workers claim the largest `READY` artifact first. The insert-select step has its own resource retry loop. The worker caps query memory at 70% of detected memory and initially sets `max_threads` and `max_insert_threads` to half the detected CPU count. The first attempt keeps ClickHouse's default block size. JSON String buffer growth is capped at 64 MiB per step (`input_format_json_max_string_column_growth_step = 67108864`), limiting excess allocation rather than total memory. If ClickHouse returns a retryable resource error such as memory pressure, too many threads, or a UDF pipe read timeout, the worker halves each configured thread limit (`max_insert_threads` and `max_threads`) independently down to one and halves `max_block_size` down to an 8,192-row floor; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds. Retry delays are 1, 2, 4, 8, then 10 seconds. The worker reads ClickHouse's current default block size only after the first resource failure. Block reductions continue even when threads are already at one; an error at both floors stops retries and records the final attempt, thread limits, and block size. Explicit block sizes below the floor are preserved. SQL-level `SETTINGS` can override the worker limits; do not override the thread settings in the insert-select.
+
+A rewrite producing zero destination parts skips artifact upload and transitions directly to `FINISHED`, with `empty_output` recorded in state. Importing it marks it imported without downloading or attaching parts. Nonempty artifacts still require matching frozen part directories.
 
 ## Destination Merge Settings
 

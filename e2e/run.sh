@@ -344,6 +344,41 @@ for i in $(seq 1 "$part_count"); do
   fi
 done
 
+# Empty rewrites finish immediately and remain importable without S3 artifacts.
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
+  --workdir /work -v "$ROOT:/work:ro" worker upload-freeze \
+  -copy-parts-from-job="$JOB_ID" \
+  -destination-schema-file=e2e/sql/destination.sql \
+  -insert-select-file=e2e/sql/empty-insert.sql \
+  -bucket=partforge -prefix=e2e -job-id=e2e-empty-job \
+  -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+
+for i in $(seq 1 "$part_count"); do
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker worker \
+    -role=inserter -merge-max-runtime=1ns -once \
+    -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+done
+empty_finished_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = 'e2e-empty-job' AND status = 'FINISHED' AND data->>'empty_output' = 'true'")"
+if [[ "$empty_finished_count" != "$part_count" ]]; then
+  echo "empty finished parts=$empty_finished_count, expected $part_count" >&2
+  exit 1
+fi
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
+  -v "$DATA_DIR:/var/lib/clickhouse" worker import-finished \
+  -database=dst -table=events_new -job-id=e2e-empty-job \
+  -clickhouse-url="$CH_HTTP_DOCKER" \
+  -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+empty_imported_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = 'e2e-empty-job' AND status = 'IMPORTED'")"
+if [[ "$empty_imported_count" != "$part_count" ]]; then
+  echo "empty imported parts=$empty_imported_count, expected $part_count" >&2
+  exit 1
+fi
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker delete-job \
+  -job-id=e2e-empty-job -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+
 normalized_finalize_log="$ROOT/.e2e/compact-normalized-finalize.log"
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   worker \

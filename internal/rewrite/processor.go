@@ -34,6 +34,7 @@ const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 const maxCompactMergeFailures uint64 = 3
+const minRetryMaxBlockSize = 8192
 const minAdaptiveMergeMaxBlockSizeBytes uint64 = 1024 * 1024
 
 const (
@@ -660,18 +661,28 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 	for attempt := 1; ; attempt++ {
 		if err := p.runInsertSelect(ctx, m, attempt, settings); err != nil {
 			if !retryableInsertSelectError(err) {
-				return err
+				return fmt.Errorf("attempt %d (max_threads=%s, max_insert_threads=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], err)
 			}
-			nextSettings, reduced, reduceErr := reduceInsertSelectThreadSettings(settings)
+			if _, ok := settings["max_block_size"]; !ok {
+				blockSize, readErr := p.ClickHouse.QueryString(ctx, "SELECT getSetting('max_block_size') FORMAT TSV")
+				if readErr != nil {
+					return fmt.Errorf("insert-select failed (%w), but read max_block_size for retry failed: %v", err, readErr)
+				}
+				if settings == nil {
+					settings = make(chhttp.QuerySettings)
+				}
+				settings["max_block_size"] = strings.TrimSpace(blockSize)
+			}
+			nextSettings, reduced, reduceErr := reduceInsertSelectSettings(settings)
 			if reduceErr != nil {
 				return reduceErr
 			}
 			if !reduced {
-				return err
+				return fmt.Errorf("attempt %d exhausted resource reductions (max_threads=%s, max_insert_threads=%s, max_block_size=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], settings["max_block_size"], err)
 			}
 			backoff := insertSelectRetryBackoff(attempt)
 			slog.Warn(
-				"insert-select failed with retryable resource error; retrying with lower thread settings",
+				"insert-select failed with retryable resource error; retrying with lower thread and block settings",
 				"job_id", m.JobID,
 				"part_id", m.PartID,
 				"attempt", attempt,
@@ -679,6 +690,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 				"backoff", backoff.String(),
 				"max_threads", nextSettings["max_threads"],
 				"max_insert_threads", nextSettings["max_insert_threads"],
+				"max_block_size", nextSettings["max_block_size"],
 				"error", err,
 			)
 			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m, destDDL); resetErr != nil {
@@ -1206,23 +1218,28 @@ func cloneQuerySettings(settings chhttp.QuerySettings) chhttp.QuerySettings {
 	return out
 }
 
-func reduceInsertSelectThreadSettings(settings chhttp.QuerySettings) (chhttp.QuerySettings, bool, error) {
-	currentInsertThreads, ok, err := positiveIntSetting(settings, "max_insert_threads")
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	if currentInsertThreads <= 1 {
-		return nil, false, nil
-	}
-
+func reduceInsertSelectSettings(settings chhttp.QuerySettings) (chhttp.QuerySettings, bool, error) {
 	next := cloneQuerySettings(settings)
-	next["max_insert_threads"] = strconv.Itoa(halvedAtLeastOne(currentInsertThreads))
-	if currentMaxThreads, ok, err := positiveIntSetting(settings, "max_threads"); err != nil {
-		return nil, false, err
-	} else if ok && currentMaxThreads > 1 {
-		next["max_threads"] = strconv.Itoa(halvedAtLeastOne(currentMaxThreads))
+	reduced := false
+	for _, name := range []string{"max_threads", "max_insert_threads"} {
+		current, ok, err := positiveIntSetting(settings, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok && current > 1 {
+			next[name] = strconv.Itoa(halvedAtLeastOne(current))
+			reduced = true
+		}
 	}
-	return next, true, nil
+	blockSize, ok, err := positiveIntSetting(settings, "max_block_size")
+	if err != nil {
+		return nil, false, err
+	}
+	if ok && blockSize > minRetryMaxBlockSize {
+		next["max_block_size"] = strconv.Itoa(max(blockSize/2, minRetryMaxBlockSize))
+		reduced = true
+	}
+	return next, reduced, nil
 }
 
 func positiveIntSetting(settings chhttp.QuerySettings, name string) (int, bool, error) {
@@ -1264,6 +1281,7 @@ func retryableInsertSelectError(err error) bool {
 		"not enough memory",
 		"std::bad_alloc",
 		"too many threads",
+		"pipe read timeout exceeded",
 	} {
 		if strings.Contains(body, marker) {
 			return true
@@ -1961,7 +1979,7 @@ func (p Processor) uploadFinishedArtifact(ctx context.Context, m manifest.Manife
 	bucket := m.S3.Bucket
 	finishedKey := m.S3.FinishedKey
 	if len(frozenPartGlobs) == 0 {
-		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
+		return nil
 	}
 	partDirs, err := frozenPartDirs(frozenPartGlobs)
 	if err != nil {

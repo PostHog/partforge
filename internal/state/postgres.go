@@ -87,6 +87,7 @@ type Part struct {
 	Attempts       int    `json:"attempts"`
 	Error          string `json:"error,omitempty"`
 
+	EmptyOutput          bool     `json:"empty_output,omitempty"`
 	SourceArtifactBytes  uint64   `json:"source_artifact_bytes,omitempty"`
 	DestinationDatabase  string   `json:"destination_database,omitempty"`
 	DestinationTable     string   `json:"destination_table,omitempty"`
@@ -561,6 +562,12 @@ func (s *Store) MarkCompactReady(ctx context.Context, part Part, workerID, finis
 		setStatus(current, StatusCompactReady, now)
 		current.FinishedKey = finishedKey
 		current.CompactReadyAt = formatTime(now)
+		current.EmptyOutput = stats.Count == 0
+		if current.EmptyOutput {
+			setStatus(current, StatusFinished, now)
+			current.FinishedAt = formatTime(now)
+			current.CompactReadyAt = ""
+		}
 		current.DestinationDatabase = database
 		current.DestinationTable = table
 		current.DestinationSchema = destinationSchema

@@ -1660,6 +1660,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
 		"max_memory_usage_raw", insertSettings["max_memory_usage"],
+		"input_format_json_max_string_column_growth_step", insertSettings["input_format_json_max_string_column_growth_step"],
 		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", compactMergeBackgroundPoolSize,
 		"merge_concurrency_ratio", compactMergeConcurrencyRatio,
@@ -1964,7 +1965,7 @@ func runWorker(ctx context.Context, args []string) error {
 			cleanupPartNow()
 			return nil
 		}
-		slog.Info("marking part compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
+		slog.Info("recording completed rewrite", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 		stateCtx, cancel := workerStateUpdateContext()
 		err = stateStore.MarkCompactReady(stateCtx, *part, resolvedWorkerID, result.FinishedKey, result.DestinationDatabase, result.DestinationTable, result.DestinationSchema, state.PartStats{
 			Count: result.DestinationStats.Count,
@@ -1976,7 +1977,7 @@ func runWorker(ctx context.Context, args []string) error {
 			cleanupPartNow()
 			return err
 		}
-		slog.Info("part marked compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
+		slog.Info("recorded completed rewrite", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "empty_output", result.DestinationStats.Count == 0)
 		cleanupPartNow()
 		if err := ecsProtection.Set(ctx, false); err != nil {
 			return err
@@ -2813,9 +2814,10 @@ func runImportFinished(ctx context.Context, args []string) error {
 	partsByID := make(map[string]state.Part, len(finishedParts))
 	for _, part := range finishedParts {
 		artifacts = append(artifacts, parts.FinishedArtifact{
-			Bucket: part.Bucket,
-			Key:    part.FinishedKey,
-			PartID: part.PartID,
+			EmptyOutput: part.EmptyOutput,
+			Bucket:      part.Bucket,
+			Key:         part.FinishedKey,
+			PartID:      part.PartID,
 		})
 		partsByID[part.PartID] = part
 	}

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,11 +21,13 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
-func TestReduceInsertSelectThreadSettings(t *testing.T) {
-	next, reduced, err := reduceInsertSelectThreadSettings(chhttp.QuerySettings{
+func TestReduceInsertSelectSettings(t *testing.T) {
+	next, reduced, err := reduceInsertSelectSettings(chhttp.QuerySettings{
 		"max_threads":        "8",
 		"max_insert_threads": "6",
 		"max_memory_usage":   "12345",
+		"max_block_size":     "65409",
+		"input_format_json_max_string_column_growth_step": "67108864",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -37,6 +40,9 @@ func TestReduceInsertSelectThreadSettings(t *testing.T) {
 	}
 	if next["max_insert_threads"] != "3" {
 		t.Fatalf("max_insert_threads = %q", next["max_insert_threads"])
+	}
+	if next["max_block_size"] != "32704" || next["input_format_json_max_string_column_growth_step"] != "67108864" {
+		t.Fatalf("retry block settings = %v", next)
 	}
 	if next["max_memory_usage"] != "12345" {
 		t.Fatalf("max_memory_usage = %q", next["max_memory_usage"])
@@ -80,16 +86,25 @@ func TestWorkItemSourcePartUsesCopiedSourceRef(t *testing.T) {
 	}
 }
 
-func TestReduceInsertSelectThreadSettingsStopsAtOne(t *testing.T) {
-	_, reduced, err := reduceInsertSelectThreadSettings(chhttp.QuerySettings{
-		"max_threads":        "1",
-		"max_insert_threads": "1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reduced {
-		t.Fatal("expected no reduction once max_insert_threads is 1")
+func TestReduceInsertSelectSettingsBlockFloor(t *testing.T) {
+	for _, test := range []struct {
+		blockSize string
+		want      string
+		reduced   bool
+	}{
+		{"16352", "8192", true},
+		{"8192", "8192", false},
+		{"1", "1", false},
+	} {
+		next, reduced, err := reduceInsertSelectSettings(chhttp.QuerySettings{
+			"max_threads": "1", "max_insert_threads": "1", "max_block_size": test.blockSize,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next["max_block_size"] != test.want || reduced != test.reduced {
+			t.Fatalf("block size %s: next=%v, reduced=%t", test.blockSize, next, reduced)
+		}
 	}
 }
 
@@ -119,14 +134,16 @@ func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 		"max_threads":        "4",
 		"max_insert_threads": "4",
 		"max_memory_usage":   "34359738368",
+		"input_format_json_max_string_column_growth_step": "67108864",
 	}
 	err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-	}).runInsertSelect(context.Background(), manifest.Manifest{
+		ClickHouse:     chhttp.Client{URL: server.URL},
+		InsertSettings: settings,
+	}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
 		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO dst SELECT * FROM src"},
-	}, 1, settings)
+	}, "unused destination DDL")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,8 +308,10 @@ func TestMergePoolByteSettingsUseTargetPartSize(t *testing.T) {
 	}
 }
 
-func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) {
+func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	var queries []string
+	var attempts []string
+	var blockSizeReads int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -302,9 +321,19 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		}
 		query := string(body)
 		queries = append(queries, query)
+		if query == "SELECT getSetting('max_block_size') FORMAT TSV" {
+			blockSizeReads++
+			_, _ = io.WriteString(w, "32768\n")
+			return
+		}
 		if strings.HasPrefix(query, "INSERT ") {
+			attempts = append(attempts, r.URL.Query().Get("max_threads")+"/"+r.URL.Query().Get("max_insert_threads")+"/"+r.URL.Query().Get("max_block_size"))
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("MEMORY_LIMIT_EXCEEDED"))
+			if len(attempts) == 2 {
+				_, _ = io.WriteString(w, "Code: 754. UDF_EXECUTION_FAILED. Original error: Code: 159. Pipe read timeout exceeded 10000 milliseconds (TIMEOUT_EXCEEDED)")
+			} else {
+				_, _ = io.WriteString(w, "Code: 241. MEMORY_LIMIT_EXCEEDED")
+			}
 			return
 		}
 	}))
@@ -313,7 +342,7 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 	err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
 		InsertSettings: chhttp.QuerySettings{
-			"max_threads":        "2",
+			"max_threads":        "4",
 			"max_insert_threads": "2",
 		},
 		MergeTreeSettings: MergeTreeSettings{
@@ -332,6 +361,24 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
 
+	if want := []string{"4/2/", "2/1/16384", "1/1/8192"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("attempt settings = %v, want %v", attempts, want)
+	}
+	if !strings.Contains(err.Error(), "attempt 3 exhausted resource reductions (max_threads=1, max_insert_threads=1, max_block_size=8192)") || !clickHouseMemoryLimitError(err) {
+		t.Fatalf("terminal error lost attempt settings or ClickHouse cause: %v", err)
+	}
+	if blockSizeReads != 1 {
+		t.Fatalf("read default block size %d times, want once after failure", blockSizeReads)
+	}
+	var resets int
+	for _, query := range queries {
+		if strings.HasPrefix(query, "DROP TABLE ") {
+			resets++
+		}
+	}
+	if resets != 2 {
+		t.Fatalf("destination resets = %d, want 2", resets)
+	}
 	if containsQueryWith(queries, "merge_max_block_size") {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
@@ -1241,7 +1288,7 @@ func TestUploadFinishedArtifactReplacesStablePartPrefixWithTarballs(t *testing.T
 	}
 }
 
-func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
+func TestUploadFinishedArtifactAcceptsEmptyOutput(t *testing.T) {
 	err := (Processor{}).uploadFinishedArtifact(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
@@ -1250,11 +1297,8 @@ func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
 			FinishedKey: "partforge/jobs/job-1/finished/part-1",
 		},
 	}, filepath.Join(t.TempDir(), "finished-tars"), nil, nil)
-	if err == nil {
-		t.Fatal("expected missing frozen part globs error")
-	}
-	if !strings.Contains(err.Error(), "no frozen part globs") {
-		t.Fatalf("error = %q, want missing globs", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -68,6 +68,7 @@ func InsertSelectSettings(limits Limits) (chhttp.QuerySettings, error) {
 	threadCount := insertThreadCount(limits.CPUs)
 	threads := strconv.Itoa(threadCount)
 	return chhttp.QuerySettings{
+		"input_format_json_max_string_column_growth_step": "67108864",
 		"max_threads":        threads,
 		"max_insert_threads": threads,
 		"max_memory_usage":   strconv.FormatUint(maxMemoryUsage, 10),
