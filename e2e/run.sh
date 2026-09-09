@@ -340,6 +340,10 @@ for i in $(seq 1 "$part_count"); do
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  if grep -F 'stage=restart_clickhouse' "$worker_log" >/dev/null; then
+    echo "inserter unexpectedly restarted ClickHouse after inserting" >&2
+    exit 1
+  fi
   if grep -F 'configured destination compression codec' "$worker_log" >/dev/null; then
     echo "inserter overrode the destination compression codec" >&2
     exit 1

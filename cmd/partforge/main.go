@@ -1892,25 +1892,6 @@ func runWorker(ctx context.Context, args []string) error {
 					PoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 				},
 			}
-			processor.RestartClickHouse = func(ctx context.Context) error {
-				if server == nil {
-					return errors.New("local ClickHouse server is not running")
-				}
-				clearClickHouseMetrics()
-				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
-				if err := server.Stop(); err != nil {
-					return fmt.Errorf("stop clickhouse before restart: %w", err)
-				}
-				server = nil
-				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
-				restarted, err := startServer(ctx, chproc.Tuning{})
-				if err != nil {
-					return err
-				}
-				server = restarted
-				activateClickHouseMetrics()
-				return nil
-			}
 			if *stateProgressInterval > 0 {
 				processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
 					return stateStore.UpdateRewriteProgress(ctx, m.JobID, m.PartID, resolvedWorkerID, stateProgress(snapshot), time.Now().UTC())

@@ -51,7 +51,6 @@ const (
 	stageAttachSourcePart        = "attach_source_part"
 	stageInsertSelect            = "insert_select"
 	stageConfigureMergeSettings  = "configure_merge_settings"
-	stageRestartClickHouse       = "restart_clickhouse"
 	stageWaitMerges              = "wait_merges"
 	stageMeasureDestinationParts = "measure_destination_parts"
 	stageFreezeDestinationParts  = "freeze_destination_parts"
@@ -70,7 +69,6 @@ var stageOrder = []string{
 	stageAttachSourcePart,
 	stageInsertSelect,
 	stageConfigureMergeSettings,
-	stageRestartClickHouse,
 	stageWaitMerges,
 	stageMeasureDestinationParts,
 	stageFreezeDestinationParts,
@@ -591,19 +589,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.configureDestinationMergeSettings(ctx, m); err != nil {
 		return rewriteResult{}, err
 	}
-	if err := p.reportStageProgress(ctx, m, stageTracker, stageRestartClickHouse); err != nil {
-		return rewriteResult{}, err
-	}
-	if err := p.restartClickHouse(ctx, m); err != nil {
-		return rewriteResult{}, err
-	}
 	mergeTarget := mergeWaitTarget{
 		JobID:    m.JobID,
 		PartID:   m.PartID,
 		Database: m.Dest.Database,
 		Table:    m.Dest.Table,
 	}
-	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart", false); err != nil {
+	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_insert", false); err != nil {
 		return rewriteResult{}, err
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
