@@ -1,5 +1,5 @@
 repository: PostHog/posthog
-revision: 435c9fe878740a7f95c1b8cdd0e6a42b9bea8caa
+revision: 116875f722100d5a7f03e2cfde520a7fd90847b9
 manifest_path: docker/clickhouse/user_defined_function.xml
 binary_path: posthog/user_scripts
 udfs:
