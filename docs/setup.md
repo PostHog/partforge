@@ -14,6 +14,9 @@ Requirements, configuration, and how to run the four stages by hand. For the hig
 
 ```sh
 docker compose up -d localstack postgres
+docker compose build worker
+docker compose run --rm worker migrate \
+  -postgres-url='postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable'
 ```
 
 This creates the `partforge` S3 bucket in LocalStack and starts a local Postgres database. Point commands at them with:

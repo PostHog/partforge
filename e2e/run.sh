@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="$ROOT/.e2e/clickhouse-data"
-CH_HTTP_HOST="http://127.0.0.1:18123"
+CH_HTTP_HOST="${CH_HTTP_HOST:-http://127.0.0.1:18123}"
 CH_HTTP_DOCKER="http://clickhouse:8123"
 POSTGRES_URL="postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable"
 JOB_ID="e2e-job"
@@ -113,6 +113,9 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 docker compose exec -T postgres pg_isready -U partforge -d partforge >/dev/null
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker migrate -postgres-url="$POSTGRES_URL"
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker migrate -postgres-url="$POSTGRES_URL"
 
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 

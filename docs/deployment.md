@@ -4,6 +4,8 @@ The worker image is published on every push to `main` to `ghcr.io/<owner>/partfo
 
 The image is a single Ubuntu container with `clickhouse-server`, `clickhouse-client`, `s5cmd`, and the Go binary. Its entrypoint is the binary and the default command is `worker`. It **runs as root** (so it can write its work directory on root-owned host mounts) and starts a local `clickhouse server` child process for each claimed part.
 
+Before starting a new worker release, stop the existing workers and run `partforge migrate` once with that release's image and the same Postgres/state-table settings. The migration backfills and indexes the existing table under table locks; restart workers after it succeeds. See [the migration procedure](postgres.md#migrate-before-starting-workers).
+
 ## Recommended: workers on ECS with an IAM task role
 
 Run the workers as an ECS service and give the task an **IAM role** scoped to the S3 bucket and the RDS/Aurora PostgreSQL database user. This is the recommended setup:

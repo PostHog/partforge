@@ -84,6 +84,7 @@ func StageOrder() []string {
 }
 
 type Processor struct {
+	progressTracker     *rewriteStageTracker
 	S3Copy              s3copy.Copier
 	ClickHouse          chhttp.Client
 	WorkDir             string
@@ -208,6 +209,7 @@ type workerTableInfo struct {
 }
 
 type rewriteStageTracker struct {
+	queryProgress  ProgressSnapshot
 	mu             sync.Mutex
 	reportMu       sync.Mutex
 	startedAt      time.Time
@@ -306,6 +308,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 
 	progressManifest := manifest.Manifest{JobID: item.JobID, PartID: item.PartID}
 	stageTracker := newRewriteStageTracker(startedAt, stageProcessPart)
+	p.progressTracker = stageTracker
 	var sourceManifest *manifest.Manifest
 	defer func() {
 		if err == nil {
@@ -769,7 +772,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			if chunks > 1 {
 				snapshot := tracker.snapshot(metrics.QueryProgress{}, false)
 				recorder.ObserveProgress(m, *snapshot.QueryProgress, *snapshot.QueryProgress)
-				if err := p.reportProgress(ctx, m, snapshot); err != nil {
+				if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
 					return err
 				}
 			}
@@ -791,7 +794,7 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 			snapshot := tracker.snapshot(current, true)
 			completed = *snapshot.QueryProgress
 			recorder.ObserveProgress(m, completed, completed)
-			if err := p.reportProgress(ctx, m, snapshot); err != nil {
+			if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
 				return err
 			}
 			slog.Info("completed source chunk", "job_id", m.JobID, "part_id", m.PartID,
@@ -1034,7 +1037,7 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 
 	baseline := tracker.snapshot(metrics.QueryProgress{}, false)
 	p.recorder().ObserveProgress(m, *baseline.QueryProgress, *baseline.QueryProgress)
-	if err := p.reportProgress(ctx, m, baseline); err != nil {
+	if err := p.reportInsertProgress(ctx, m, baseline); err != nil {
 		return metrics.QueryProgress{}, err
 	}
 
@@ -1048,7 +1051,6 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 
 	recorder := p.recorder()
 	progress := metrics.QueryProgress{}
-	lastProgressReport := time.Time{}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1066,13 +1068,12 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 				snapshot := tracker.snapshot(finalProgress, false)
 				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
 				progress = finalProgress
-				if err := p.reportProgress(ctx, m, snapshot); err != nil {
+				if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
 					return progress, err
 				}
 			}
 			return progress, nil
 		case <-ticker.C:
-			now := time.Now()
 			current, found, err := p.queryProgress(ctx, queryID)
 			if err != nil {
 				cancel()
@@ -1083,14 +1084,7 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 				snapshot := tracker.snapshot(current, false)
 				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
 				progress = current
-				if shouldReportProgress(p.ProgressInterval, lastProgressReport, now) {
-					if err := p.reportProgress(ctx, m, snapshot); err != nil {
-						cancel()
-						<-errCh
-						return progress, err
-					}
-					lastProgressReport = now
-				}
+				p.recordQueryProgress(snapshot)
 			}
 		case <-ctx.Done():
 			cancel()
@@ -1098,6 +1092,32 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 			return progress, ctx.Err()
 		}
 	}
+}
+
+// Query polling records the latest counters; the existing stage heartbeat is
+// the only periodic writer. Stage changes and the final query result still flush.
+func (p Processor) recordQueryProgress(progress ProgressSnapshot) {
+	if p.progressTracker == nil {
+		return
+	}
+	p.progressTracker.mu.Lock()
+	defer p.progressTracker.mu.Unlock()
+	p.progressTracker.queryProgress = progress
+}
+
+func (t *rewriteStageTracker) currentQueryProgress() ProgressSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.queryProgress
+}
+
+func (p Processor) reportInsertProgress(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+	if p.progressTracker != nil {
+		p.progressTracker.reportMu.Lock()
+		defer p.progressTracker.reportMu.Unlock()
+	}
+	p.recordQueryProgress(snapshot)
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportProgress(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
@@ -1108,6 +1128,7 @@ func (p Processor) reportProgress(ctx context.Context, m manifest.Manifest, snap
 }
 
 type progressHeartbeat struct {
+	err    error
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -1122,7 +1143,8 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 	heartbeat.ctx, heartbeat.cancel = context.WithCancel(ctx)
 	heartbeat.done = make(chan struct{})
 	if err := p.reportStageSnapshot(heartbeat.ctx, m, tracker); err != nil {
-		slog.Warn("progress heartbeat update failed; continuing", "job_id", m.JobID, "part_id", m.PartID, "error", err)
+		heartbeat.cancel()
+		return nil, err
 	}
 
 	go func() {
@@ -1136,7 +1158,9 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 					if heartbeat.ctx.Err() != nil {
 						return
 					}
-					slog.Warn("progress heartbeat update failed; continuing", "job_id", m.JobID, "part_id", m.PartID, "error", err)
+					heartbeat.err = err
+					heartbeat.cancel()
+					return
 				}
 			case <-heartbeat.ctx.Done():
 				return
@@ -1161,7 +1185,9 @@ func (p Processor) reportStageProgress(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker, stage string) error {
@@ -1179,7 +1205,9 @@ func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker) error {
@@ -1196,7 +1224,9 @@ func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (h *progressHeartbeat) Context() context.Context {
@@ -1209,14 +1239,7 @@ func (h *progressHeartbeat) Stop() error {
 	}
 	h.cancel()
 	<-h.done
-	return nil
-}
-
-func shouldReportProgress(interval time.Duration, last time.Time, now time.Time) bool {
-	if interval <= 0 {
-		return false
-	}
-	return last.IsZero() || !now.Before(last.Add(interval))
+	return h.err
 }
 
 func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest) error {
