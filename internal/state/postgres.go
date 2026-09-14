@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -89,6 +90,7 @@ type Part struct {
 	Attempts       int    `json:"attempts"`
 	Error          string `json:"error,omitempty"`
 
+	EmptyOutput          bool     `json:"empty_output,omitempty"`
 	SourceArtifactBytes  uint64   `json:"source_artifact_bytes,omitempty"`
 	DestinationDatabase  string   `json:"destination_database,omitempty"`
 	DestinationTable     string   `json:"destination_table,omitempty"`
@@ -112,6 +114,7 @@ type Part struct {
 	CompactActiveMerges        uint64  `json:"compact_active_merges,omitempty"`
 	CompactMergeProgress       float64 `json:"compact_merge_progress,omitempty"`
 
+	InsertProgressPercent            *float64          `json:"insert_progress_percent,omitempty"`
 	ProgressUpdatedAt                string            `json:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `json:"read_rows,omitempty"`
 	ReadBytes                        uint64            `json:"read_bytes,omitempty"`
@@ -196,6 +199,7 @@ type CompactBatch struct {
 }
 
 type RewriteProgress struct {
+	InsertProgressPercent      *float64
 	QueryProgress              *QueryProgress
 	SourceActivePartStats      *PartStats
 	DestinationActivePartStats *PartStats
@@ -388,7 +392,7 @@ func partFromJSON(data []byte) (Part, error) {
 	return part, nil
 }
 
-const partColumns = "job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at"
+const partColumns = "job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at, source_job_id, source_part_id"
 
 // Full writes derive scheduling values once and persist them alongside the JSON.
 func partWriteValues(part Part) ([]any, error) {
@@ -435,7 +439,7 @@ func partWriteValues(part Part) ([]any, error) {
 	return []any{part.JobID, part.PartID, string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data,
 		pgtype.Numeric{Int: new(big.Int).SetUint64(part.SourceArtifactBytes), Valid: true},
 		pgtype.Numeric{Int: new(big.Int).SetUint64(part.DestinationActivePartBytes), Valid: true},
-		eligible, normalized, staleAt, originalReadyAt}, nil
+		eligible, normalized, staleAt, originalReadyAt, part.SourceJobID, part.SourcePartID}, nil
 }
 
 func (s *Store) insertPartTx(ctx context.Context, tx pgx.Tx, part Part) error {
@@ -443,7 +447,7 @@ func (s *Store) insertPartTx(ctx context.Context, tx pgx.Tx, part Part) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+s.tableSQL+` (`+partColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values...)
+	_, err = tx.Exec(ctx, `INSERT INTO `+s.tableSQL+` (`+partColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, values...)
 	return err
 }
 
@@ -454,7 +458,7 @@ func (s *Store) savePartTx(ctx context.Context, tx pgx.Tx, part Part) error {
 	}
 	tag, err := tx.Exec(ctx, `UPDATE `+s.tableSQL+` SET status=$3, worker_id=$4, created_at=$5, updated_at=$6, data=$7,
  source_artifact_bytes=$8, compact_bytes=$9, compact_eligible=$10, compact_normalized=$11,
- compact_stale_at=$12, original_compact_ready_at=$13 WHERE job_id=$1 AND part_id=$2`, values...)
+ compact_stale_at=$12, original_compact_ready_at=$13, source_job_id=$14, source_part_id=$15 WHERE job_id=$1 AND part_id=$2`, values...)
 	if err != nil {
 		return err
 	}
@@ -510,6 +514,7 @@ func setStatus(part *Part, status Status, now time.Time) {
 }
 
 func clearRewriteProgress(part *Part) {
+	part.InsertProgressPercent = nil
 	part.ProgressUpdatedAt = ""
 	part.ReadRows = 0
 	part.ReadBytes = 0
@@ -601,6 +606,12 @@ func (s *Store) MarkCompactReady(ctx context.Context, part Part, workerID, finis
 		setStatus(current, StatusCompactReady, now)
 		current.FinishedKey = finishedKey
 		current.CompactReadyAt = formatTime(now)
+		current.EmptyOutput = stats.Count == 0
+		if current.EmptyOutput {
+			setStatus(current, StatusFinished, now)
+			current.FinishedAt = formatTime(now)
+			current.CompactReadyAt = ""
+		}
 		current.DestinationDatabase = database
 		current.DestinationTable = table
 		current.DestinationSchema = destinationSchema
@@ -1139,6 +1150,9 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 	patch := map[string]any{}
 	patch["updated_at"] = formatTime(now)
 	patch["progress_updated_at"] = formatTime(now)
+	if progress.InsertProgressPercent != nil {
+		patch["insert_progress_percent"] = *progress.InsertProgressPercent
+	}
 	if progress.QueryProgress != nil {
 		patch["read_rows"] = progress.QueryProgress.ReadRows
 		patch["read_bytes"] = progress.QueryProgress.ReadBytes
@@ -1336,6 +1350,7 @@ func (s *Store) DeleteJobPartsAfterLock(ctx context.Context, parts []Part, after
 	if strings.TrimSpace(jobID) == "" {
 		return errors.New("job id is required")
 	}
+	partIDs := make([]string, 0, len(parts))
 	for _, part := range parts {
 		if err := validatePart(part); err != nil {
 			return err
@@ -1343,44 +1358,57 @@ func (s *Store) DeleteJobPartsAfterLock(ctx context.Context, parts []Part, after
 		if part.JobID != jobID {
 			return fmt.Errorf("delete job parts got mixed job ids %q and %q", jobID, part.JobID)
 		}
+		partIDs = append(partIDs, part.PartID)
+	}
+	sort.Strings(partIDs)
+	for i := 1; i < len(partIDs); i++ {
+		if partIDs[i] == partIDs[i-1] {
+			return fmt.Errorf("duplicate part %s/%s in delete selection", jobID, partIDs[i])
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	for _, part := range parts {
-		if _, err := s.readPartTx(ctx, tx, part.JobID, part.PartID); err != nil {
-			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		ref, ok, err := s.sourceDependentTx(ctx, tx, part.JobID, part.PartID)
-		if err != nil {
-			return fmt.Errorf("check source part dependents for %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		if ok {
-			return fmt.Errorf("cannot delete source part %s/%s; it is referenced by %s/%s", part.JobID, part.PartID, ref.JobID, ref.PartID)
-		}
+	// Lock in a stable order before checking references. CreatePart locks the
+	// source row too, so new references cannot appear before deletion commits.
+	rows, err := tx.Query(ctx, `SELECT part_id FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = ANY($2::text[]) ORDER BY part_id FOR UPDATE`, jobID, partIDs)
+	if err != nil {
+		return fmt.Errorf("lock delete selection for %s: %w", jobID, err)
+	}
+	locked, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	if len(locked) != len(partIDs) {
+		return &conditionalCheckFailedError{message: fmt.Sprintf("delete selection for %s has missing parts: locked %d of %d", jobID, len(locked), len(partIDs))}
+	}
+	ref, ok, err := s.sourceDependentTx(ctx, tx, jobID, partIDs)
+	if err != nil {
+		return fmt.Errorf("check source part dependents for %s: %w", jobID, err)
+	}
+	if ok {
+		return fmt.Errorf("cannot delete source part %s/%s; it is referenced by %s/%s", ref.SourceJobID, ref.SourcePartID, ref.JobID, ref.PartID)
 	}
 	if afterLock != nil {
 		if err := afterLock(); err != nil {
 			return err
 		}
 	}
-	for _, part := range parts {
-		tag, err := tx.Exec(ctx, `DELETE FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = $2`, part.JobID, part.PartID)
-		if err != nil {
-			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, err)
-		}
-		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, &conditionalCheckFailedError{})
-		}
+	tag, err := tx.Exec(ctx, `DELETE FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = ANY($2::text[])`, jobID, partIDs)
+	if err != nil {
+		return fmt.Errorf("delete state items for %s: %w", jobID, err)
+	}
+	if tag.RowsAffected() != int64(len(partIDs)) {
+		return &conditionalCheckFailedError{message: fmt.Sprintf("delete state items for %s: deleted %d of %d", jobID, tag.RowsAffected(), len(partIDs))}
 	}
 	return tx.Commit(ctx)
 }
 
-func (s *Store) sourceDependentTx(ctx context.Context, tx pgx.Tx, jobID, partID string) (Part, bool, error) {
+func (s *Store) sourceDependentTx(ctx context.Context, tx pgx.Tx, jobID string, partIDs []string) (Part, bool, error) {
 	var data []byte
-	err := tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE data->>'source_job_id' = $1 AND data->>'source_part_id' = $2 ORDER BY job_id, part_id LIMIT 1`, jobID, partID).Scan(&data)
+	err := tx.QueryRow(ctx, `SELECT data FROM `+s.tableSQL+` WHERE source_job_id <> '' AND source_job_id = $1 AND source_part_id = ANY($2::text[]) LIMIT 1`, jobID, partIDs).Scan(&data)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Part{}, false, nil
 	}

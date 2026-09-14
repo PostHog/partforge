@@ -18,6 +18,37 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
+func TestImportJobEmptyOutput(t *testing.T) {
+	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "system.tables") {
+			t.Errorf("unexpected query for empty output: %s", body)
+		}
+		fmt.Fprintln(w, root)
+	}))
+	defer server.Close()
+	var transitions []string
+	err := (Importer{ClickHouse: chhttp.Client{URL: server.URL}, WorkDir: t.TempDir()}).ImportJob(context.Background(), ImportJob{
+		JobID: "job-1", Database: "db", Table: "dst",
+		Artifacts: []FinishedArtifact{{Bucket: "bucket", Key: "finished/part-1", PartID: "part-1", EmptyOutput: true}},
+		MarkImporting: func(context.Context, FinishedArtifact) error {
+			transitions = append(transitions, "importing")
+			return nil
+		},
+		MarkImported: func(context.Context, FinishedArtifact) error {
+			transitions = append(transitions, "imported")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(transitions, ","); got != "importing,imported" {
+		t.Fatalf("transitions = %s", got)
+	}
+}
+
 func TestImportArtifactDownloadsFinishedTarballs(t *testing.T) {
 	root := t.TempDir()
 	partRoot := filepath.Join(root, "source", "all_1_1_0")

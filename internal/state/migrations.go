@@ -52,6 +52,12 @@ func (s *Store) migrations() []string {
  CREATE TABLE %[5]s (id boolean PRIMARY KEY CHECK (id), next_run_at timestamptz NOT NULL);
  INSERT INTO %[5]s VALUES (true, '-infinity');`,
 			s.tableSQL, s.indexSQL("compact_priority_idx"), s.indexSQL("compact_stale_idx"), s.indexSQL("compact_deadline_idx"), s.relatedSQL("maintenance")),
+		fmt.Sprintf(`ALTER TABLE %[1]s
+ ADD COLUMN source_job_id text NOT NULL DEFAULT '',
+ ADD COLUMN source_part_id text NOT NULL DEFAULT '';
+ UPDATE %[1]s SET source_job_id = COALESCE(data->>'source_job_id', ''), source_part_id = COALESCE(data->>'source_part_id', '');
+ CREATE INDEX %[2]s ON %[1]s (source_job_id, source_part_id) WHERE source_job_id <> '';`,
+			s.tableSQL, s.indexSQL("source_ref_idx")),
 	}
 }
 

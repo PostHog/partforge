@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func postgresTestConfig(t testing.TB) Config {
@@ -142,6 +144,7 @@ func TestPostgresLegacyMigrationIsAtomic(t *testing.T) {
 	}
 	part := NewPart("legacy", "part", "bucket", "source", "finished", time.Now())
 	part.SourceArtifactBytes = 12345
+	part.SourceJobID, part.SourcePartID = "source-job", "source-part"
 	legacyData, err := partJSON(part)
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +257,8 @@ func TestPostgresClaimsAndProgress(t *testing.T) {
 	if err := s.UpdateRewriteProgress(ctx, first.JobID, first.PartID, "wrong", RewriteProgress{}, now); !IsConditionalCheckFailed(err) {
 		t.Fatalf("ownership error = %v", err)
 	}
-	if err := s.UpdateRewriteProgress(ctx, first.JobID, first.PartID, "first", RewriteProgress{QueryProgress: &QueryProgress{ReadRows: 42}, SourceActivePartStats: &PartStats{Count: 3}}, now); err != nil {
+	percent := 50.0
+	if err := s.UpdateRewriteProgress(ctx, first.JobID, first.PartID, "first", RewriteProgress{QueryProgress: &QueryProgress{ReadRows: 42}, SourceActivePartStats: &PartStats{Count: 3}, InsertProgressPercent: &percent}, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpdateRewriteProgress(ctx, first.JobID, first.PartID, "first", RewriteProgress{QueryProgress: &QueryProgress{}}, now); err != nil {
@@ -265,7 +269,7 @@ func TestPostgresClaimsAndProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range current {
-		if p.PartID == first.PartID && (p.ReadRows != 0 || p.SourceActivePartCount != 3 || p.SourceArtifactBytes != 63) {
+		if p.PartID == first.PartID && (p.ReadRows != 0 || p.SourceActivePartCount != 3 || p.SourceArtifactBytes != 63 || p.InsertProgressPercent == nil || *p.InsertProgressPercent != percent) {
 			t.Fatalf("progress patch lost fields: %+v", p)
 		}
 	}
@@ -507,6 +511,8 @@ func assertSchedulingColumns(t testing.TB, s *Store) {
 	t.Helper()
 	var mismatches int
 	err := s.pool.QueryRow(context.Background(), `SELECT count(*) FROM `+s.tableSQL+` WHERE
+ source_job_id IS DISTINCT FROM COALESCE(data->>'source_job_id', '') OR
+ source_part_id IS DISTINCT FROM COALESCE(data->>'source_part_id', '') OR
  source_artifact_bytes IS DISTINCT FROM COALESCE((data->>'source_artifact_bytes')::numeric, 0) OR
  compact_bytes IS DISTINCT FROM COALESCE((data->>'destination_active_part_bytes')::numeric, 0) OR
  compact_eligible IS DISTINCT FROM (
@@ -649,4 +655,124 @@ func TestPostgresSchedulingBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)
+}
+
+// Count actual statements so deletion cannot quietly regress to per-part queries.
+type deleteQueryTrace struct {
+	queries []pgx.TraceQueryStartData
+}
+
+func (t *deleteQueryTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	t.queries = append(t.queries, data)
+	return ctx
+}
+
+func (*deleteQueryTrace) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func TestPostgresBulkDelete(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	parts := make([]Part, 2000)
+	others := make([]Part, len(parts))
+	for i := range parts {
+		parts[i] = NewPart("delete", fmt.Sprintf("part-%04d", i), "bucket", "source", "finished", time.Now())
+		others[i] = NewPart("keep", parts[i].PartID, "bucket", "source", "finished", time.Now())
+	}
+	seedPostgresParts(t, s, append(append([]Part{}, parts...), others...))
+	reference := NewPart("copy", "reference", "bucket", "source", "finished", time.Now())
+	reference.SourceJobID, reference.SourcePartID = parts[1999].JobID, parts[1999].PartID
+	if err := s.CreatePart(ctx, reference); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	callback := func() error { called = true; return nil }
+	if err := s.DeleteJobPartsAfterLock(ctx, parts, callback); err == nil || !strings.Contains(err.Error(), "referenced by copy/reference") || called {
+		t.Fatalf("reference protection: err=%v callback=%t", err, called)
+	}
+	if err := s.DeleteJobParts(ctx, []Part{reference}); err != nil {
+		t.Fatal(err)
+	}
+	missing := NewPart("delete", "missing", "bucket", "source", "finished", time.Now())
+	if err := s.DeleteJobPartsAfterLock(ctx, []Part{parts[0], missing}, callback); !IsConditionalCheckFailed(err) || called {
+		t.Fatalf("missing selection: err=%v callback=%t", err, called)
+	}
+	if err := s.DeleteJobPartsAfterLock(ctx, []Part{parts[0], parts[0]}, callback); err == nil || called {
+		t.Fatalf("duplicate selection: err=%v callback=%t", err, called)
+	}
+	failure := errors.New("artifact deletion failed")
+	if err := s.DeleteJobPartsAfterLock(ctx, parts, func() error { return failure }); !errors.Is(err, failure) {
+		t.Fatalf("callback failure = %v", err)
+	}
+	remaining, err := s.ListJobParts(ctx, "delete")
+	if err != nil || len(remaining) != len(parts) {
+		t.Fatalf("failed deletion changed rows: count=%d err=%v", len(remaining), err)
+	}
+	// All selected source locks must remain held while S3 cleanup runs.
+	if err := s.DeleteJobPartsAfterLock(ctx, parts[:2], func() error {
+		for _, source := range parts[:2] {
+			copy := reference
+			copy.SourcePartID = source.PartID
+			timed, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			err := s.CreatePart(timed, copy)
+			blocked := timed.Err() == context.DeadlineExceeded
+			cancel()
+			if err == nil || !blocked {
+				return fmt.Errorf("source reference was not blocked for %s: %v", source.PartID, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err = s.ListJobParts(ctx, "delete")
+	if err != nil || len(remaining) != len(parts)-2 {
+		t.Fatalf("subset delete: count=%d err=%v", len(remaining), err)
+	}
+	if _, err := s.pool.Exec(ctx, "ANALYZE "+s.tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	// A separate pool limits tracing to the bulk operation under test.
+	trace := &deleteQueryTrace{}
+	cfg := s.pool.Config()
+	cfg.ConnConfig.Tracer = trace
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	deleting := *s
+	deleting.pool = pool
+	started := time.Now()
+	if err := deleting.DeleteJobParts(ctx, remaining); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("deleted %d parts in %s", len(remaining), time.Since(started))
+	var statements []pgx.TraceQueryStartData
+	for _, query := range trace.queries {
+		if strings.Contains(query.SQL, s.tableSQL) {
+			statements = append(statements, query)
+		}
+	}
+	if len(statements) != 3 {
+		t.Fatalf("bulk deletion used %d table queries, want 3", len(statements))
+	}
+	rows, err := s.pool.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS) "+statements[1].SQL, statements[1].Args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := strings.Join(plan, "\n"); !strings.Contains(text, "source_ref_idx") {
+		t.Fatalf("reference check lost its index:\n%s", text)
+	}
+	remaining, err = s.ListJobParts(ctx, "delete")
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("bulk delete: count=%d err=%v", len(remaining), err)
+	}
+	remaining, err = s.ListJobParts(ctx, "keep")
+	if err != nil || len(remaining) != len(others) {
+		t.Fatalf("bulk delete changed another job: count=%d err=%v", len(remaining), err)
+	}
 }

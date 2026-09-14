@@ -34,6 +34,7 @@ const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 const maxCompactMergeFailures uint64 = 3
+const minRetryMaxBlockSize = 8192
 const minAdaptiveMergeMaxBlockSizeBytes uint64 = 1024 * 1024
 
 const (
@@ -50,7 +51,6 @@ const (
 	stageAttachSourcePart        = "attach_source_part"
 	stageInsertSelect            = "insert_select"
 	stageConfigureMergeSettings  = "configure_merge_settings"
-	stageRestartClickHouse       = "restart_clickhouse"
 	stageWaitMerges              = "wait_merges"
 	stageMeasureDestinationParts = "measure_destination_parts"
 	stageFreezeDestinationParts  = "freeze_destination_parts"
@@ -66,11 +66,9 @@ var stageOrder = []string{
 	stageDownloadSource,
 	stageReadManifest,
 	stagePrepareWorkerTables,
-	stageConfigureCompression,
 	stageAttachSourcePart,
 	stageInsertSelect,
 	stageConfigureMergeSettings,
-	stageRestartClickHouse,
 	stageWaitMerges,
 	stageMeasureDestinationParts,
 	stageFreezeDestinationParts,
@@ -94,6 +92,7 @@ type Processor struct {
 	MergeMaxTimeout     time.Duration
 	Metrics             metrics.Recorder
 	InsertSettings      chhttp.QuerySettings
+	InsertChunkMinRows  uint64
 	ProgressInterval    time.Duration
 	ReportProgress      ProgressReporter
 	MergeTreeSettings   MergeTreeSettings
@@ -115,6 +114,7 @@ type MergeTreeSettings struct {
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
 
 type ProgressSnapshot struct {
+	InsertProgressPercent      *float64
 	QueryProgress              *metrics.QueryProgress
 	SourceActivePartStats      *metrics.PartStats
 	DestinationActivePartStats *metrics.PartStats
@@ -209,7 +209,7 @@ type workerTableInfo struct {
 }
 
 type rewriteStageTracker struct {
-	queryProgress  *metrics.QueryProgress
+	queryProgress  ProgressSnapshot
 	mu             sync.Mutex
 	reportMu       sync.Mutex
 	startedAt      time.Time
@@ -309,6 +309,20 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	progressManifest := manifest.Manifest{JobID: item.JobID, PartID: item.PartID}
 	stageTracker := newRewriteStageTracker(startedAt, stageProcessPart)
 	p.progressTracker = stageTracker
+	var sourceManifest *manifest.Manifest
+	defer func() {
+		if err == nil {
+			return
+		}
+		details := fmt.Sprintf("stage=%s part_attempt=%d source_manifest=%q",
+			stageTracker.Snapshot(time.Now()).Stage, item.Attempt,
+			"s3://"+item.Bucket+"/"+strings.TrimRight(item.SourceKey, "/")+"/"+artifact.ManifestName)
+		if sourceManifest != nil {
+			details += fmt.Sprintf(" source_table=%s source_part=%q",
+				chhttp.TableSQL(sourceManifest.Source.Database, sourceManifest.Source.Table), sourceManifest.Part.Name)
+		}
+		err = fmt.Errorf("%s: %w", details, err)
+	}()
 	defer p.recorder().ClearStageProgress(progressManifest)
 	heartbeat, err := p.startProgressHeartbeat(ctx, progressManifest, stageTracker)
 	if err != nil {
@@ -350,6 +364,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
 	}
+	sourceManifest = &m
 	slog.Info(
 		"read source manifest",
 		"stage", "read_manifest",
@@ -525,18 +540,14 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.configureSourceMergePoolSettings(ctx, m); err != nil {
 		return rewriteResult{}, err
 	}
+	if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+chhttp.TableSQL(m.Source.Database, m.Source.Table)); err != nil {
+		return rewriteResult{}, fmt.Errorf("stop source merges: %w", err)
+	}
 	slog.Info("creating worker destination table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
 		return rewriteResult{}, fmt.Errorf("create destination table: %w", err)
 	}
 	slog.Info("created worker tables", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
-
-	if err := p.reportStageProgress(ctx, m, stageTracker, stageConfigureCompression); err != nil {
-		return rewriteResult{}, err
-	}
-	if err := p.configureDestinationCompressionCodec(ctx, m); err != nil {
-		return rewriteResult{}, err
-	}
 
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
@@ -571,7 +582,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
 	insertStartedAt := time.Now()
-	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
+	if err := p.runInsertSelectWithRetries(ctx, m, sourceStats.Rows); err != nil {
 		return rewriteResult{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
@@ -581,19 +592,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.configureDestinationMergeSettings(ctx, m); err != nil {
 		return rewriteResult{}, err
 	}
-	if err := p.reportStageProgress(ctx, m, stageTracker, stageRestartClickHouse); err != nil {
-		return rewriteResult{}, err
-	}
-	if err := p.restartClickHouse(ctx, m); err != nil {
-		return rewriteResult{}, err
-	}
 	mergeTarget := mergeWaitTarget{
 		JobID:    m.JobID,
 		PartID:   m.PartID,
 		Database: m.Dest.Database,
 		Table:    m.Dest.Table,
 	}
-	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart", false); err != nil {
+	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_insert", false); err != nil {
 		return rewriteResult{}, err
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
@@ -658,46 +663,156 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	return result, nil
 }
 
-func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) error {
+func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, sourceRows uint64) (retErr error) {
+	chunks := insertChunkCount(sourceRows, p.InsertChunkMinRows)
+	if chunks > 1 {
+		if err := p.prepareInsertChunks(ctx, m); err != nil {
+			return fmt.Errorf("prepare insert chunks (chunks=%d source_rows=%d): %w", chunks, sourceRows, err)
+		}
+	}
+	recorder := p.recorder()
+	recorder.InsertSelectStarted(m)
+	defer recorder.ClearCurrentProgress(m)
 	settings := cloneQuerySettings(p.InsertSettings)
-	for attempt := 1; ; attempt++ {
-		if err := p.runInsertSelect(ctx, m, attempt, settings); err != nil {
-			if !retryableInsertSelectError(err) {
-				return err
+	startedAt := time.Now()
+	attempt := 0
+	retries := 0
+	var completed metrics.QueryProgress
+	if chunks > 1 {
+		completed.TotalRowsApprox = sourceRows
+	}
+	var chunk, start, end uint64
+	var promotionElapsed time.Duration
+	var successfulAttemptElapsed time.Duration
+	defer func() {
+		elapsed := time.Since(startedAt)
+		result := "completed"
+		wasted := elapsed - successfulAttemptElapsed - promotionElapsed
+		if retErr != nil {
+			result = "failed"
+			wasted = elapsed
+			if chunk < chunks {
+				retErr = fmt.Errorf("chunk=%d/%d _part_offset=[%d,%d) completed_chunks=%d insert_attempts=%d source_rows=%d: %w",
+					chunk+1, chunks, start, end, chunk, attempt, sourceRows, retErr)
+			} else {
+				retErr = fmt.Errorf("insert finalization (chunks=%d completed_chunks=%d insert_attempts=%d source_rows=%d): %w",
+					chunks, chunk, attempt, sourceRows, retErr)
 			}
-			nextSettings, reduced, reduceErr := reduceInsertSelectThreadSettings(settings)
+		} else if retries == 0 {
+			wasted = 0
+		}
+		// Successful chunks are not retries of the forge.
+		recorder.ObserveInsertSelect(m, result, retries+1, elapsed, wasted)
+		slog.Info("insert-select summary", "job_id", m.JobID, "part_id", m.PartID,
+			"result", result, "attempts", attempt, "chunks", chunks, "completed_chunks", chunk, "elapsed", elapsed,
+			"wasted_elapsed", wasted, "successful_attempt_elapsed", successfulAttemptElapsed,
+			"max_threads", settings["max_threads"], "max_insert_threads", settings["max_insert_threads"],
+			"max_block_size", settings["max_block_size"])
+	}()
+	for chunk < chunks {
+		end = start + sourceRows/chunks
+		if chunk < sourceRows%chunks {
+			end++
+		}
+		if chunks > 1 {
+			if settings == nil {
+				settings = make(chhttp.QuerySettings)
+			}
+			settings["additional_table_filters"] = insertChunkFilter(m.Source, start, end)
+			slog.Info("inserting source chunk", "job_id", m.JobID, "part_id", m.PartID,
+				"chunk", chunk+1, "chunks", chunks, "start_offset", start, "end_offset", end, "source_rows", sourceRows)
+		}
+		tracker := insertProgress{}
+		if chunks > 1 {
+			tracker = insertProgress{start: start, end: end, total: sourceRows, completed: completed}
+		}
+		attempt++
+		attemptStartedAt := time.Now()
+		current, err := p.runInsertSelect(ctx, m, attempt, settings, tracker)
+		attemptElapsed := time.Since(attemptStartedAt)
+		if err != nil {
+			recorder.ObserveInsertAttempt(m, "failed", attemptElapsed)
+			if !retryableInsertSelectError(err) {
+				return fmt.Errorf("attempt %d (max_threads=%s, max_insert_threads=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], err)
+			}
+			if _, ok := settings["max_block_size"]; !ok {
+				blockSize, readErr := p.ClickHouse.QueryString(ctx, "SELECT getSetting('max_block_size') FORMAT TSV")
+				if readErr != nil {
+					return fmt.Errorf("insert-select failed (%w), but read max_block_size for retry failed: %v", err, readErr)
+				}
+				if settings == nil {
+					settings = make(chhttp.QuerySettings)
+				}
+				settings["max_block_size"] = strings.TrimSpace(blockSize)
+			}
+			nextSettings, reduced, reduceErr := reduceInsertSelectSettings(settings)
 			if reduceErr != nil {
 				return reduceErr
 			}
 			if !reduced {
-				return err
+				return fmt.Errorf("attempt %d exhausted resource reductions (max_threads=%s, max_insert_threads=%s, max_block_size=%s): %w", attempt, settings["max_threads"], settings["max_insert_threads"], settings["max_block_size"], err)
 			}
-			backoff := insertSelectRetryBackoff(attempt)
+			backoff := insertSelectRetryBackoff(retries + 1)
 			slog.Warn(
-				"insert-select failed with retryable resource error; retrying with lower thread settings",
+				"insert-select failed with retryable resource error; retrying with lower thread and block settings",
 				"job_id", m.JobID,
 				"part_id", m.PartID,
 				"attempt", attempt,
+				"attempt_elapsed", attemptElapsed,
 				"next_attempt", attempt+1,
 				"backoff", backoff.String(),
 				"max_threads", nextSettings["max_threads"],
 				"max_insert_threads", nextSettings["max_insert_threads"],
+				"max_block_size", nextSettings["max_block_size"],
 				"error", err,
 			)
-			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m, destDDL); resetErr != nil {
+			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m); resetErr != nil {
 				return fmt.Errorf("insert-select failed with retryable resource error (%w), but reset destination table failed: %v", err, resetErr)
 			}
-			if settingsErr := p.configureDestinationCompressionCodec(ctx, m); settingsErr != nil {
-				return fmt.Errorf("insert-select failed with retryable resource error (%w), but configure destination compression codec after reset failed: %v", err, settingsErr)
+			if chunks > 1 {
+				snapshot := tracker.snapshot(metrics.QueryProgress{}, false)
+				recorder.ObserveProgress(m, *snapshot.QueryProgress, *snapshot.QueryProgress)
+				if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
+					return err
+				}
 			}
 			if err := sleepOrDone(ctx, backoff); err != nil {
 				return err
 			}
 			settings = nextSettings
+			retries++
 			continue
 		}
-		return nil
+		successfulAttemptElapsed += attemptElapsed
+		recorder.ObserveInsertAttempt(m, "completed", attemptElapsed)
+		if chunks > 1 {
+			promotionStartedAt := time.Now()
+			if err := p.promoteInsertChunk(ctx, m); err != nil {
+				return err
+			}
+			promotionElapsed += time.Since(promotionStartedAt)
+			snapshot := tracker.snapshot(current, true)
+			completed = *snapshot.QueryProgress
+			recorder.ObserveProgress(m, completed, completed)
+			if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
+				return err
+			}
+			slog.Info("completed source chunk", "job_id", m.JobID, "part_id", m.PartID,
+				"chunk", chunk+1, "chunks", chunks, "completed_source_rows", end, "source_rows", sourceRows)
+		}
+		start = end
+		chunk++
 	}
+	if chunks > 1 {
+		// Restore the original destination name for the existing merge/freeze/upload flow.
+		if err := p.ClickHouse.Exec(ctx, "EXCHANGE TABLES "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" AND "+completedInsertTable(m)); err != nil {
+			return fmt.Errorf("exchange completed insert table: %w", err)
+		}
+		if err := p.ClickHouse.Exec(ctx, "DROP TABLE "+completedInsertTable(m)+" SYNC"); err != nil {
+			return fmt.Errorf("drop empty insert staging table: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p Processor) configureSourceMergePoolSettings(ctx context.Context, m manifest.Manifest) error {
@@ -915,10 +1030,16 @@ func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Mani
 	return false, nil
 }
 
-func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {
+func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings, tracker insertProgress) (metrics.QueryProgress, error) {
 	queryID := fmt.Sprintf("partforge-%s-%s-attempt-%d", m.JobID, m.PartID, attempt)
 	queryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	baseline := tracker.snapshot(metrics.QueryProgress{}, false)
+	p.recorder().ObserveProgress(m, *baseline.QueryProgress, *baseline.QueryProgress)
+	if err := p.reportInsertProgress(ctx, m, baseline); err != nil {
+		return metrics.QueryProgress{}, err
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -930,8 +1051,6 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 
 	recorder := p.recorder()
 	progress := metrics.QueryProgress{}
-	defer recorder.ClearCurrentProgress(m)
-	p.recordQueryProgress(metrics.QueryProgress{})
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -939,67 +1058,66 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 		select {
 		case err := <-errCh:
 			if err != nil {
-				return err
+				return progress, err
 			}
 			finalProgress, found, err := p.queryLogProgress(ctx, queryID)
 			if err != nil {
-				return fmt.Errorf("read final query progress: %w", err)
+				return progress, fmt.Errorf("read final query progress: %w", err)
 			}
 			if found {
-				recorder.ObserveProgress(m, progress, finalProgress)
-				if err := p.reportFinalQueryProgress(ctx, m, finalProgress); err != nil {
-					return err
+				snapshot := tracker.snapshot(finalProgress, false)
+				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
+				progress = finalProgress
+				if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
+					return progress, err
 				}
 			}
-			return nil
+			return progress, nil
 		case <-ticker.C:
 			current, found, err := p.queryProgress(ctx, queryID)
 			if err != nil {
 				cancel()
 				<-errCh
-				return fmt.Errorf("read live query progress: %w", err)
+				return progress, fmt.Errorf("read live query progress: %w", err)
 			}
 			if found {
-				recorder.ObserveProgress(m, progress, current)
+				snapshot := tracker.snapshot(current, false)
+				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
 				progress = current
-				p.recordQueryProgress(current)
+				p.recordQueryProgress(snapshot)
 			}
 		case <-ctx.Done():
 			cancel()
 			<-errCh
-			return ctx.Err()
+			return progress, ctx.Err()
 		}
 	}
 }
 
 // Query polling records the latest counters; the existing stage heartbeat is
 // the only periodic writer. Stage changes and the final query result still flush.
-func (p Processor) recordQueryProgress(progress metrics.QueryProgress) {
+func (p Processor) recordQueryProgress(progress ProgressSnapshot) {
 	if p.progressTracker == nil {
 		return
 	}
 	p.progressTracker.mu.Lock()
 	defer p.progressTracker.mu.Unlock()
-	p.progressTracker.queryProgress = &progress
+	p.progressTracker.queryProgress = progress
 }
 
-func (t *rewriteStageTracker) currentQueryProgress() *metrics.QueryProgress {
+func (t *rewriteStageTracker) currentQueryProgress() ProgressSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.queryProgress == nil {
-		return nil
-	}
-	copy := *t.queryProgress
-	return &copy
+	return t.queryProgress
 }
 
-func (p Processor) reportFinalQueryProgress(ctx context.Context, m manifest.Manifest, progress metrics.QueryProgress) error {
+func (p Processor) reportInsertProgress(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
 	if p.progressTracker != nil {
 		p.progressTracker.reportMu.Lock()
 		defer p.progressTracker.reportMu.Unlock()
 	}
-	p.recordQueryProgress(progress)
-	return p.reportProgress(ctx, m, ProgressSnapshot{QueryProgress: &progress})
+	p.recordQueryProgress(snapshot)
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportProgress(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
@@ -1067,7 +1185,9 @@ func (p Processor) reportStageProgress(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress, QueryProgress: tracker.currentQueryProgress()})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker, stage string) error {
@@ -1085,7 +1205,9 @@ func (p Processor) reportStageComplete(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress, QueryProgress: tracker.currentQueryProgress()})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker) error {
@@ -1102,7 +1224,9 @@ func (p Processor) reportStageSnapshot(ctx context.Context, m manifest.Manifest,
 		TotalElapsed:            progress.TotalElapsed,
 		CompletedStageDurations: progress.CompletedStageDurations,
 	})
-	return p.reportProgress(ctx, m, ProgressSnapshot{StageProgress: &progress, QueryProgress: tracker.currentQueryProgress()})
+	snapshot := tracker.currentQueryProgress()
+	snapshot.StageProgress = &progress
+	return p.reportProgress(ctx, m, snapshot)
 }
 
 func (h *progressHeartbeat) Context() context.Context {
@@ -1118,18 +1242,15 @@ func (h *progressHeartbeat) Stop() error {
 	return h.err
 }
 
-func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest, destDDL string) error {
+func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest) error {
 	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
-	if err := ch.ExecWithOptions(ctx, "DROP TABLE IF EXISTS "+table+" SYNC", chhttp.QueryOptions{
+	if err := ch.ExecWithOptions(ctx, "TRUNCATE TABLE "+table+" SYNC", chhttp.QueryOptions{
 		Settings: chhttp.QuerySettings{
 			"max_table_size_to_drop":     "0",
 			"max_partition_size_to_drop": "0",
 		},
 	}); err != nil {
-		return fmt.Errorf("drop destination table before retry: %w", err)
-	}
-	if err := ch.Exec(ctx, destDDL); err != nil {
-		return fmt.Errorf("recreate destination table before retry: %w", err)
+		return fmt.Errorf("truncate insert staging table before retry: %w", err)
 	}
 	return nil
 }
@@ -1228,23 +1349,28 @@ func cloneQuerySettings(settings chhttp.QuerySettings) chhttp.QuerySettings {
 	return out
 }
 
-func reduceInsertSelectThreadSettings(settings chhttp.QuerySettings) (chhttp.QuerySettings, bool, error) {
-	currentInsertThreads, ok, err := positiveIntSetting(settings, "max_insert_threads")
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	if currentInsertThreads <= 1 {
-		return nil, false, nil
-	}
-
+func reduceInsertSelectSettings(settings chhttp.QuerySettings) (chhttp.QuerySettings, bool, error) {
 	next := cloneQuerySettings(settings)
-	next["max_insert_threads"] = strconv.Itoa(halvedAtLeastOne(currentInsertThreads))
-	if currentMaxThreads, ok, err := positiveIntSetting(settings, "max_threads"); err != nil {
-		return nil, false, err
-	} else if ok && currentMaxThreads > 1 {
-		next["max_threads"] = strconv.Itoa(halvedAtLeastOne(currentMaxThreads))
+	reduced := false
+	for _, name := range []string{"max_threads", "max_insert_threads"} {
+		current, ok, err := positiveIntSetting(settings, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok && current > 1 {
+			next[name] = strconv.Itoa(halvedAtLeastOne(current))
+			reduced = true
+		}
 	}
-	return next, true, nil
+	blockSize, ok, err := positiveIntSetting(settings, "max_block_size")
+	if err != nil {
+		return nil, false, err
+	}
+	if ok && blockSize > minRetryMaxBlockSize {
+		next["max_block_size"] = strconv.Itoa(max(blockSize/2, minRetryMaxBlockSize))
+		reduced = true
+	}
+	return next, reduced, nil
 }
 
 func positiveIntSetting(settings chhttp.QuerySettings, name string) (int, bool, error) {
@@ -1286,6 +1412,7 @@ func retryableInsertSelectError(err error) bool {
 		"not enough memory",
 		"std::bad_alloc",
 		"too many threads",
+		"pipe read timeout exceeded",
 	} {
 		if strings.Contains(body, marker) {
 			return true
@@ -1983,7 +2110,7 @@ func (p Processor) uploadFinishedArtifact(ctx context.Context, m manifest.Manife
 	bucket := m.S3.Bucket
 	finishedKey := m.S3.FinishedKey
 	if len(frozenPartGlobs) == 0 {
-		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
+		return nil
 	}
 	partDirs, err := frozenPartDirs(frozenPartGlobs)
 	if err != nil {

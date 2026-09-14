@@ -63,6 +63,9 @@ type Recorder interface {
 	ForgeStarted(manifest.Manifest)
 	ForgeCompleted(manifest.Manifest)
 	ForgeFailed(manifest.Manifest)
+	InsertSelectStarted(manifest.Manifest)
+	ObserveInsertAttempt(manifest.Manifest, string, time.Duration)
+	ObserveInsertSelect(manifest.Manifest, string, int, time.Duration, time.Duration)
 	ObserveProgress(manifest.Manifest, QueryProgress, QueryProgress)
 	ClearCurrentProgress(manifest.Manifest)
 	SetActivePartStats(string, manifest.Manifest, PartStats)
@@ -80,19 +83,22 @@ type Recorder interface {
 
 type Noop struct{}
 
-func (Noop) ForgeStarted(manifest.Manifest)                                  {}
-func (Noop) ForgeCompleted(manifest.Manifest)                                {}
-func (Noop) ForgeFailed(manifest.Manifest)                                   {}
-func (Noop) ObserveProgress(manifest.Manifest, QueryProgress, QueryProgress) {}
-func (Noop) ClearCurrentProgress(manifest.Manifest)                          {}
-func (Noop) SetActivePartStats(string, manifest.Manifest, PartStats)         {}
-func (Noop) ObserveStageProgress(manifest.Manifest, StageProgress)           {}
-func (Noop) ClearStageProgress(manifest.Manifest)                            {}
-func (Noop) CompactionStarted(string, string, uint64, PartStats)             {}
-func (Noop) CompactionCompleted(string, string, PartStats, PartStats)        {}
-func (Noop) CompactionFailed(string, string)                                 {}
-func (Noop) CompactionNoReduction(string, string, PartStats, PartStats)      {}
-func (Noop) SetCompactPartStats(string, string, string, PartStats)           {}
+func (Noop) ForgeStarted(manifest.Manifest)                                                   {}
+func (Noop) ForgeCompleted(manifest.Manifest)                                                 {}
+func (Noop) ForgeFailed(manifest.Manifest)                                                    {}
+func (Noop) InsertSelectStarted(manifest.Manifest)                                            {}
+func (Noop) ObserveInsertAttempt(manifest.Manifest, string, time.Duration)                    {}
+func (Noop) ObserveInsertSelect(manifest.Manifest, string, int, time.Duration, time.Duration) {}
+func (Noop) ObserveProgress(manifest.Manifest, QueryProgress, QueryProgress)                  {}
+func (Noop) ClearCurrentProgress(manifest.Manifest)                                           {}
+func (Noop) SetActivePartStats(string, manifest.Manifest, PartStats)                          {}
+func (Noop) ObserveStageProgress(manifest.Manifest, StageProgress)                            {}
+func (Noop) ClearStageProgress(manifest.Manifest)                                             {}
+func (Noop) CompactionStarted(string, string, uint64, PartStats)                              {}
+func (Noop) CompactionCompleted(string, string, PartStats, PartStats)                         {}
+func (Noop) CompactionFailed(string, string)                                                  {}
+func (Noop) CompactionNoReduction(string, string, PartStats, PartStats)                       {}
+func (Noop) SetCompactPartStats(string, string, string, PartStats)                            {}
 func (Noop) SetCompactPartitionStats(string, string, string, []CompactPartitionStats) {
 }
 func (Noop) ObserveCompactProgress(string, string, string, PartStats, []CompactPartitionStats, []CompactMerge) {
@@ -110,10 +116,13 @@ type Prometheus struct {
 	forgeStartedAt          map[string]time.Time
 	compactionStartedAt     map[string]time.Time
 
-	forgesStarted   *prometheus.CounterVec
-	forgesCompleted *prometheus.CounterVec
-	forgesFailed    *prometheus.CounterVec
-	forgeDuration   *prometheus.HistogramVec
+	forgesStarted         *prometheus.CounterVec
+	forgesCompleted       *prometheus.CounterVec
+	forgesFailed          *prometheus.CounterVec
+	forgeDuration         *prometheus.HistogramVec
+	insertAttemptDuration *prometheus.HistogramVec
+	insertDuration        *prometheus.HistogramVec
+	insertWastedSeconds   *prometheus.CounterVec
 
 	rowsReadTotal     *prometheus.CounterVec
 	bytesReadTotal    *prometheus.CounterVec
@@ -191,6 +200,20 @@ func NewPrometheus() *Prometheus {
 			Help:    "Wall clock duration of source part forge attempts.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
 		}, []string{"job_id", "source_table", "destination_table", "result"}),
+		insertAttemptDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "partforge_insert_attempt_duration_seconds",
+			Help:    "Wall clock duration of each INSERT SELECT attempt, including progress reporting; excludes retry recovery and backoff.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
+		}, []string{"job_id", "source_table", "destination_table", "result"}),
+		insertDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "partforge_insert_duration_seconds",
+			Help:    "Wall clock duration of a source part INSERT SELECT, including all attempts, retry recovery and backoff. Observed when the retry loop exits.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
+		}, []string{"job_id", "source_table", "destination_table", "result", "retried"}),
+		insertWastedSeconds: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "partforge_insert_wasted_seconds_total",
+			Help: "INSERT SELECT wall clock seconds outside the successful attempt, including failed attempts, retry recovery and backoff. Terminal failures count their entire duration. Updated when the retry loop exits.",
+		}, []string{"job_id", "source_table", "destination_table", "result", "retried"}),
 		rowsReadTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "partforge_rows_read_total",
 			Help: "Total rows read by ClickHouse INSERT SELECT rewrite queries, updated live from system.processes.",
@@ -369,6 +392,9 @@ func NewPrometheus() *Prometheus {
 		p.forgesCompleted,
 		p.forgesFailed,
 		p.forgeDuration,
+		p.insertAttemptDuration,
+		p.insertDuration,
+		p.insertWastedSeconds,
 		p.rowsReadTotal,
 		p.bytesReadTotal,
 		p.rowsWrittenTotal,
@@ -579,6 +605,33 @@ func (p *Prometheus) ForgeCompleted(m manifest.Manifest) {
 func (p *Prometheus) ForgeFailed(m manifest.Manifest) {
 	p.forgesFailed.With(labels(m)).Inc()
 	p.observeForgeDuration(m, "failed")
+}
+
+func (p *Prometheus) InsertSelectStarted(m manifest.Manifest) {
+	// Create zero-valued series before the first attempt so scrapes can see its increment.
+	for _, result := range []string{"completed", "failed"} {
+		l := labelsWithResult(m, result)
+		p.insertAttemptDuration.With(l)
+		for _, retried := range []string{"false", "true"} {
+			l["retried"] = retried
+			p.insertDuration.With(l)
+			p.insertWastedSeconds.With(l)
+		}
+	}
+}
+
+func (p *Prometheus) ObserveInsertAttempt(m manifest.Manifest, result string, elapsed time.Duration) {
+	p.insertAttemptDuration.With(labelsWithResult(m, result)).Observe(elapsed.Seconds())
+}
+
+func (p *Prometheus) ObserveInsertSelect(m manifest.Manifest, result string, attempts int, elapsed, wasted time.Duration) {
+	l := labelsWithResult(m, result)
+	l["retried"] = "false"
+	if attempts > 1 {
+		l["retried"] = "true"
+	}
+	p.insertDuration.With(l).Observe(elapsed.Seconds())
+	p.insertWastedSeconds.With(l).Add(wasted.Seconds())
 }
 
 func (p *Prometheus) ObserveProgress(m manifest.Manifest, prev QueryProgress, current QueryProgress) {

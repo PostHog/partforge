@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="$ROOT/.e2e/clickhouse-data"
-CH_HTTP_HOST="http://127.0.0.1:18123"
+CH_HTTP_HOST="${CH_HTTP_HOST:-http://127.0.0.1:18123}"
 CH_HTTP_DOCKER="http://clickhouse:8123"
 POSTGRES_URL="postgres://partforge:partforge@postgres:5432/partforge?sslmode=disable"
 JOB_ID="e2e-job"
@@ -206,6 +206,7 @@ for i in $(seq 1 "$incremental_part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -role=inserter \
+    -insert-chunk-min-rows=1 \
     -merge-max-runtime=1ns \
     -s3-endpoint=http://localstack:4566 \
     -postgres-url="$POSTGRES_URL" \
@@ -336,16 +337,72 @@ for i in $(seq 1 "$part_count"); do
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
     -role=inserter \
+    -insert-chunk-min-rows=1 \
     -merge-max-runtime=1ns \
     -s3-endpoint=http://localstack:4566 \
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  if grep -F 'stage=restart_clickhouse' "$worker_log" >/dev/null; then
+    echo "inserter unexpectedly restarted ClickHouse after inserting" >&2
+    exit 1
+  fi
+  if grep -F 'configured destination compression codec' "$worker_log" >/dev/null; then
+    echo "inserter overrode the destination compression codec" >&2
+    exit 1
+  fi
+  if (( i == 1 )) && ! grep -F 'completed source chunk' "$worker_log" | grep -F 'chunk=3 chunks=3 completed_source_rows=3 source_rows=3' >/dev/null; then
+    echo "largest source part did not complete all three insert chunks" >&2
+    exit 1
+  fi
   if (( i == 1 )) && ! grep -F "claimed ready part" "$worker_log" | grep -F "part_id=$largest_source_part_id" >/dev/null; then
     echo "first worker did not claim largest source part $largest_source_part_id" >&2
     exit 1
   fi
 done
+
+# Whole-part progress and write totals must survive every chunk boundary.
+chunk_progress="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT data->>'insert_progress_percent', data->>'written_rows' FROM partforge_state WHERE job_id = '$JOB_ID' AND part_id = '$largest_source_part_id'")"
+if [[ "$chunk_progress" != "100|3" ]]; then
+  echo "chunked rewrite progress=$chunk_progress, expected 100|3" >&2
+  exit 1
+fi
+
+# Empty rewrites finish immediately and remain importable without S3 artifacts.
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
+  --workdir /work -v "$ROOT:/work:ro" worker upload-freeze \
+  -copy-parts-from-job="$JOB_ID" \
+  -destination-schema-file=e2e/sql/destination.sql \
+  -insert-select-file=e2e/sql/empty-insert.sql \
+  -bucket=partforge -prefix=e2e -job-id=e2e-empty-job \
+  -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+
+for i in $(seq 1 "$part_count"); do
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker worker \
+    -role=inserter -insert-chunk-min-rows=1 -merge-max-runtime=1ns -once \
+    -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+done
+empty_finished_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = 'e2e-empty-job' AND status = 'FINISHED' AND data->>'empty_output' = 'true'")"
+if [[ "$empty_finished_count" != "$part_count" ]]; then
+  echo "empty finished parts=$empty_finished_count, expected $part_count" >&2
+  exit 1
+fi
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
+  -v "$DATA_DIR:/var/lib/clickhouse" worker import-finished \
+  -database=dst -table=events_new -job-id=e2e-empty-job \
+  -clickhouse-url="$CH_HTTP_DOCKER" \
+  -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
+empty_imported_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = 'e2e-empty-job' AND status = 'IMPORTED'")"
+if [[ "$empty_imported_count" != "$part_count" ]]; then
+  echo "empty imported parts=$empty_imported_count, expected $part_count" >&2
+  exit 1
+fi
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker delete-job \
+  -job-id=e2e-empty-job -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 
 normalized_finalize_log="$ROOT/.e2e/compact-normalized-finalize.log"
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \

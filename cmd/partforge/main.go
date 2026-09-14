@@ -1548,7 +1548,8 @@ func runWorker(ctx context.Context, args []string) error {
 		pollInterval             = fs.Duration("poll-interval", 10*time.Second, "how long an idle worker sleeps before checking for work again")
 		workerID                 = fs.String("worker-id", "", "worker identity recorded on claimed parts; empty uses the hostname and process id")
 		workDir                  = fs.String("work-dir", "/tmp/partforge", "scratch directory for downloaded parts, local ClickHouse data, and temporary artifacts")
-		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
+		insertChunkMinRows       = fs.Uint64("insert-chunk-min-rows", rewrite.DefaultInsertChunkMinRows, "minimum source rows per insert chunk (up to 20 chunks); 0 disables chunking for SQL requiring the whole source part")
+		defaultCompressionCodec  = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied during compaction only")
 		mergeMaxRuntime          = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
 		role                     = fs.String("role", string(workerRoleAll), "work type to run: all, inserter, or compactor")
 		compact                  = fs.Bool("compact", true, "enable opportunistic compaction for role=all workers")
@@ -1663,6 +1664,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
 		"max_memory_usage_raw", insertSettings["max_memory_usage"],
+		"input_format_json_max_string_column_growth_step", insertSettings["input_format_json_max_string_column_growth_step"],
 		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", compactMergeBackgroundPoolSize,
 		"merge_concurrency_ratio", compactMergeConcurrencyRatio,
@@ -1878,40 +1880,21 @@ func runWorker(ctx context.Context, args []string) error {
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:       ch,
-				WorkDir:          runDirs.Scratch,
-				MergeTimeout:     sourceMergeMaxRuntime,
-				MergeMaxTimeout:  sourceMergeMaxRuntime,
-				Metrics:          recorder,
-				InsertSettings:   insertSettings,
-				ProgressInterval: *stateProgressInterval,
+				S3Copy:             s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:         ch,
+				WorkDir:            runDirs.Scratch,
+				MergeTimeout:       sourceMergeMaxRuntime,
+				MergeMaxTimeout:    sourceMergeMaxRuntime,
+				Metrics:            recorder,
+				InsertSettings:     insertSettings,
+				InsertChunkMinRows: *insertChunkMinRows,
+				ProgressInterval:   *stateProgressInterval,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:        mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
 					MergeSelectingSleepMS:    mergeTreeSettings.MergeSelectingSleepMS,
-					DefaultCompressionCodec:  *defaultCompressionCodec,
 					PoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 				},
-			}
-			processor.RestartClickHouse = func(ctx context.Context) error {
-				if server == nil {
-					return errors.New("local ClickHouse server is not running")
-				}
-				clearClickHouseMetrics()
-				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
-				if err := server.Stop(); err != nil {
-					return fmt.Errorf("stop clickhouse before restart: %w", err)
-				}
-				server = nil
-				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
-				restarted, err := startServer(ctx, chproc.Tuning{})
-				if err != nil {
-					return err
-				}
-				server = restarted
-				activateClickHouseMetrics()
-				return nil
 			}
 			if *stateProgressInterval > 0 {
 				processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
@@ -1968,7 +1951,7 @@ func runWorker(ctx context.Context, args []string) error {
 			cleanupPartNow()
 			return nil
 		}
-		slog.Info("marking part compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
+		slog.Info("recording completed rewrite", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 		stateCtx, cancel := workerStateUpdateContext()
 		err = stateStore.MarkCompactReady(stateCtx, *part, resolvedWorkerID, result.FinishedKey, result.DestinationDatabase, result.DestinationTable, result.DestinationSchema, state.PartStats{
 			Count: result.DestinationStats.Count,
@@ -1980,7 +1963,7 @@ func runWorker(ctx context.Context, args []string) error {
 			cleanupPartNow()
 			return err
 		}
-		slog.Info("part marked compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
+		slog.Info("recorded completed rewrite", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "empty_output", result.DestinationStats.Count == 0)
 		cleanupPartNow()
 		if err := ecsProtection.Set(ctx, false); err != nil {
 			return err
@@ -2732,9 +2715,10 @@ func runImportFinished(ctx context.Context, args []string) error {
 	partsByID := make(map[string]state.Part, len(finishedParts))
 	for _, part := range finishedParts {
 		artifacts = append(artifacts, parts.FinishedArtifact{
-			Bucket: part.Bucket,
-			Key:    part.FinishedKey,
-			PartID: part.PartID,
+			EmptyOutput: part.EmptyOutput,
+			Bucket:      part.Bucket,
+			Key:         part.FinishedKey,
+			PartID:      part.PartID,
 		})
 		partsByID[part.PartID] = part
 	}
@@ -4083,7 +4067,7 @@ func waitCompactHeartbeat(errCh <-chan error) error {
 }
 
 func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
-	var progress state.RewriteProgress
+	progress := state.RewriteProgress{InsertProgressPercent: snapshot.InsertProgressPercent}
 	if snapshot.QueryProgress != nil {
 		progress.QueryProgress = &state.QueryProgress{
 			ReadRows:        snapshot.QueryProgress.ReadRows,
@@ -4431,7 +4415,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 				Elapsed:           formatDurationMs(part.RewriteTotalElapsedMs),
 				ReadRows:          part.ReadRows,
 				TotalRowsApprox:   part.TotalRowsApprox,
-				ProgressPercent:   rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox),
+				ProgressPercent:   partRewriteProgressPercent(part),
 				ProgressUpdatedAt: part.ProgressUpdatedAt,
 			})
 		}
@@ -4483,6 +4467,14 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		FailedMerges:                 failedMerges,
 		FailedParts:                  failed,
 	}
+}
+
+func partRewriteProgressPercent(part state.Part) *float64 {
+	if part.InsertProgressPercent != nil {
+		return part.InsertProgressPercent
+	}
+	// Jobs reported by older workers have only query counters.
+	return rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox)
 }
 
 func rewriteProgressPercent(readRows, totalRowsApprox uint64) *float64 {
@@ -4865,7 +4857,7 @@ func printPartRowsWithLookup(out *os.File, parts []state.Part, lookupParts []sta
 	for _, part := range parts {
 		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
 		progress := "-"
-		if progressPercent := rewriteProgressPercent(part.ReadRows, part.TotalRowsApprox); progressPercent != nil {
+		if progressPercent := partRewriteProgressPercent(part); progressPercent != nil {
 			progress = fmt.Sprintf("%.1f%%", *progressPercent)
 		}
 		fmt.Fprintf(

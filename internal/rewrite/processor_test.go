@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,11 +22,62 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
-func TestReduceInsertSelectThreadSettings(t *testing.T) {
-	next, reduced, err := reduceInsertSelectThreadSettings(chhttp.QuerySettings{
+func TestProcessPartFailureIncludesSourceLocation(t *testing.T) {
+	m := manifest.Manifest{
+		Version: manifest.Version, JobID: "original-job", PartID: "original-part",
+		Source: manifest.TableRef{Database: "db", Table: "src"},
+		Dest:   manifest.TableRef{Database: "db", Table: "dst"},
+		Part:   manifest.SourcePart{Disk: "default", Name: "202601_1_1_0", RelativePath: "store/202601_1_1_0"},
+		SQL:    manifest.SQLBundle{SourceSchema: "source DDL", DestinationSchema: "destination DDL", InsertSelect: "INSERT SELECT"},
+		S3:     manifest.S3Refs{Bucket: "backup-bucket", SourceKey: "jobs/original/source/part", FinishedKey: "finished"},
+	}
+	fixture := t.TempDir()
+	if err := artifact.WriteManifest(fixture, m); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PARTFORGE_TEST_MANIFEST", filepath.Join(fixture, artifact.ManifestName))
+	binary := filepath.Join(t.TempDir(), "s5cmd")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nset -eu\nfor dest do :; done\nmkdir -p \"$dest\"\ncp \"$PARTFORGE_TEST_MANIFEST\" \"$dest/manifest.json\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{stageDownloadSource, stagePrepareWorkerTables} {
+		t.Run(stage, func(t *testing.T) {
+			cause := errors.New("test failure")
+			_, err := (Processor{
+				WorkDir: t.TempDir(), S3Copy: s3copy.Copier{Binary: binary},
+				ReportProgress: func(_ context.Context, _ manifest.Manifest, snapshot ProgressSnapshot) error {
+					if snapshot.StageProgress != nil && snapshot.StageProgress.Stage == stage {
+						return cause
+					}
+					return nil
+				},
+			}).ProcessPart(context.Background(), WorkItem{
+				JobID: "copied-job", PartID: "copied-part", SourceJobID: m.JobID, SourcePartID: m.PartID,
+				Bucket: m.S3.Bucket, SourceKey: m.S3.SourceKey, FinishedKey: "copy-finished", Attempt: 2,
+				DestinationDatabase: "db", DestinationTable: "dst", DestinationSchema: m.SQL.DestinationSchema, InsertSelect: m.SQL.InsertSelect,
+			})
+			if !errors.Is(err, cause) {
+				t.Fatalf("lost failure cause: %v", err)
+			}
+			for _, detail := range []string{"stage=" + stage, "part_attempt=2", `source_manifest="s3://backup-bucket/jobs/original/source/part/manifest.json"`} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Errorf("failure %q is missing %q", err, detail)
+				}
+			}
+			if stage == stagePrepareWorkerTables && !strings.Contains(err.Error(), "source_table=`db`.`src` source_part=\"202601_1_1_0\"") {
+				t.Errorf("missing source part identity: %v", err)
+			}
+		})
+	}
+}
+
+func TestReduceInsertSelectSettings(t *testing.T) {
+	next, reduced, err := reduceInsertSelectSettings(chhttp.QuerySettings{
 		"max_threads":        "8",
 		"max_insert_threads": "6",
 		"max_memory_usage":   "12345",
+		"max_block_size":     "65409",
+		"input_format_json_max_string_column_growth_step": "67108864",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +90,9 @@ func TestReduceInsertSelectThreadSettings(t *testing.T) {
 	}
 	if next["max_insert_threads"] != "3" {
 		t.Fatalf("max_insert_threads = %q", next["max_insert_threads"])
+	}
+	if next["max_block_size"] != "32704" || next["input_format_json_max_string_column_growth_step"] != "67108864" {
+		t.Fatalf("retry block settings = %v", next)
 	}
 	if next["max_memory_usage"] != "12345" {
 		t.Fatalf("max_memory_usage = %q", next["max_memory_usage"])
@@ -81,16 +136,25 @@ func TestWorkItemSourcePartUsesCopiedSourceRef(t *testing.T) {
 	}
 }
 
-func TestReduceInsertSelectThreadSettingsStopsAtOne(t *testing.T) {
-	_, reduced, err := reduceInsertSelectThreadSettings(chhttp.QuerySettings{
-		"max_threads":        "1",
-		"max_insert_threads": "1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reduced {
-		t.Fatal("expected no reduction once max_insert_threads is 1")
+func TestReduceInsertSelectSettingsBlockFloor(t *testing.T) {
+	for _, test := range []struct {
+		blockSize string
+		want      string
+		reduced   bool
+	}{
+		{"16352", "8192", true},
+		{"8192", "8192", false},
+		{"1", "1", false},
+	} {
+		next, reduced, err := reduceInsertSelectSettings(chhttp.QuerySettings{
+			"max_threads": "1", "max_insert_threads": "1", "max_block_size": test.blockSize,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next["max_block_size"] != test.want || reduced != test.reduced {
+			t.Fatalf("block size %s: next=%v, reduced=%t", test.blockSize, next, reduced)
+		}
 	}
 }
 
@@ -120,14 +184,16 @@ func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 		"max_threads":        "4",
 		"max_insert_threads": "4",
 		"max_memory_usage":   "34359738368",
+		"input_format_json_max_string_column_growth_step": "67108864",
 	}
 	err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-	}).runInsertSelect(context.Background(), manifest.Manifest{
+		ClickHouse:     chhttp.Client{URL: server.URL},
+		InsertSettings: settings,
+	}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
 		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO dst SELECT * FROM src"},
-	}, 1, settings)
+	}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +224,7 @@ func TestRetryableInsertSelectError(t *testing.T) {
 	}
 }
 
-func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
+func TestResetDestinationTableAllowsLargeTruncate(t *testing.T) {
 	var requests []struct {
 		query string
 		body  string
@@ -180,17 +246,16 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	}))
 	defer server.Close()
 
-	destDDL := "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY tuple()"
 	err := resetDestinationTable(context.Background(), chhttp.Client{URL: server.URL}, manifest.Manifest{
 		Dest: manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	}, destDDL)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 2 {
-		t.Fatalf("requests = %d, want 2", len(requests))
+	if len(requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(requests))
 	}
-	if requests[0].body != "DROP TABLE IF EXISTS `db`.`query_log_archive_temp` SYNC" {
+	if requests[0].body != "TRUNCATE TABLE `db`.`query_log_archive_temp` SYNC" {
 		t.Fatalf("drop query = %q", requests[0].body)
 	}
 	dropSettings := requests[0].query
@@ -200,12 +265,7 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	if !strings.Contains(dropSettings, "max_partition_size_to_drop=0") {
 		t.Fatalf("drop settings = %q, want max_partition_size_to_drop=0", dropSettings)
 	}
-	if requests[1].body != destDDL {
-		t.Fatalf("recreate query = %q", requests[1].body)
-	}
-	if strings.Contains(requests[1].query, "max_table_size_to_drop") || strings.Contains(requests[1].query, "max_partition_size_to_drop") {
-		t.Fatalf("recreate settings = %q, want no drop-size settings", requests[1].query)
-	}
+
 }
 
 func TestConfigureDestinationMergeSettings(t *testing.T) {
@@ -292,8 +352,117 @@ func TestMergePoolByteSettingsUseTargetPartSize(t *testing.T) {
 	}
 }
 
-func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) {
+type insertMetricsRecorder struct {
+	metrics.Noop
+	started, attempts, failedAttempts, summaries int
+	result                                       string
+	elapsed, wasted, successfulAttemptElapsed    time.Duration
+}
+
+func (r *insertMetricsRecorder) InsertSelectStarted(manifest.Manifest) { r.started++ }
+
+func (r *insertMetricsRecorder) ObserveInsertAttempt(_ manifest.Manifest, result string, elapsed time.Duration) {
+	r.attempts++
+	if result == "failed" {
+		r.failedAttempts++
+	} else {
+		r.successfulAttemptElapsed = elapsed
+	}
+}
+
+func (r *insertMetricsRecorder) ObserveInsertSelect(_ manifest.Manifest, result string, attempts int, elapsed, wasted time.Duration) {
+	r.summaries++
+	r.result, r.elapsed, r.wasted = result, elapsed, wasted
+	if attempts != r.attempts {
+		panic("insert summary attempt count does not match recorded attempts")
+	}
+}
+
+func TestInsertRetryTiming(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		failFirst, failReset   bool
+		cancelRecovery         bool
+		insertError            string
+		wantAttempts, wantFail int
+		wantResult             string
+	}{
+		{name: "first attempt succeeds", wantAttempts: 1, wantResult: "completed"},
+		{name: "retry succeeds", failFirst: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 2, wantFail: 1, wantResult: "completed"},
+		{name: "non retryable failure", failFirst: true, insertError: "Syntax error", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+		{name: "reset fails", failFirst: true, failReset: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+		{name: "recovery canceled", failFirst: true, cancelRecovery: true, insertError: "MEMORY_LIMIT_EXCEEDED", wantAttempts: 1, wantFail: 1, wantResult: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			inserts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				query := string(body)
+				switch {
+				case strings.HasPrefix(query, "INSERT "):
+					inserts++
+					if tc.failFirst && inserts == 1 {
+						http.Error(w, tc.insertError, http.StatusInternalServerError)
+					}
+				case strings.HasPrefix(query, "TRUNCATE TABLE "):
+					if tc.failReset {
+						http.Error(w, "reset failed", http.StatusInternalServerError)
+					}
+					if tc.cancelRecovery {
+						cancel()
+					}
+				case strings.HasPrefix(query, "CREATE TABLE "), query == "SYSTEM FLUSH LOGS", strings.Contains(query, "system.query_log"):
+				default:
+					t.Errorf("unexpected query: %s", query)
+				}
+			}))
+			defer server.Close()
+			recorder := &insertMetricsRecorder{}
+			err := (Processor{
+				ClickHouse: chhttp.Client{URL: server.URL}, Metrics: recorder,
+				InsertSettings:    chhttp.QuerySettings{"max_threads": "2", "max_block_size": "8192"},
+				MergeTreeSettings: MergeTreeSettings{DefaultCompressionCodec: "ZSTD(5)"},
+			}).runInsertSelectWithRetries(ctx, manifest.Manifest{
+				JobID: "job-1", PartID: "part-1", Dest: manifest.TableRef{Database: "db", Table: "dst"},
+				SQL: manifest.SQLBundle{InsertSelect: "INSERT INTO db.dst SELECT 1"},
+			}, 0)
+			if (err != nil) != (tc.wantResult == "failed") {
+				t.Fatalf("unexpected result: %v", err)
+			}
+			if recorder.started != 1 || recorder.summaries != 1 || recorder.attempts != tc.wantAttempts || recorder.failedAttempts != tc.wantFail || recorder.result != tc.wantResult {
+				t.Fatalf("unexpected metrics: %+v", recorder)
+			}
+			if recorder.elapsed <= 0 {
+				t.Fatalf("expected positive elapsed time: %+v", recorder)
+			}
+			switch {
+			case tc.wantResult == "failed":
+				if recorder.wasted != recorder.elapsed {
+					t.Fatalf("terminal failure must account for all elapsed time: %+v", recorder)
+				}
+			case tc.wantAttempts == 1:
+				if recorder.wasted != 0 {
+					t.Fatalf("first-attempt success wasted time: %+v", recorder)
+				}
+			default:
+				if recorder.wasted < time.Second || recorder.wasted != recorder.elapsed-recorder.successfulAttemptElapsed {
+					t.Fatalf("waste must include backoff and exclude successful attempt: %+v", recorder)
+				}
+			}
+		})
+	}
+}
+
+func TestRunInsertSelectRetriesThroughOneThread(t *testing.T) {
 	var queries []string
+	var attempts []string
+	var blockSizeReads int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -303,18 +472,30 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		}
 		query := string(body)
 		queries = append(queries, query)
+		if query == "SELECT getSetting('max_block_size') FORMAT TSV" {
+			blockSizeReads++
+			_, _ = io.WriteString(w, "32768\n")
+			return
+		}
 		if strings.HasPrefix(query, "INSERT ") {
+			attempts = append(attempts, r.URL.Query().Get("max_threads")+"/"+r.URL.Query().Get("max_insert_threads")+"/"+r.URL.Query().Get("max_block_size"))
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("MEMORY_LIMIT_EXCEEDED"))
+			if len(attempts) == 2 {
+				_, _ = io.WriteString(w, "Code: 754. UDF_EXECUTION_FAILED. Original error: Code: 159. Pipe read timeout exceeded 10000 milliseconds (TIMEOUT_EXCEEDED)")
+			} else {
+				_, _ = io.WriteString(w, "Code: 241. MEMORY_LIMIT_EXCEEDED")
+			}
 			return
 		}
 	}))
 	defer server.Close()
 
+	recorder := &insertMetricsRecorder{}
 	err := (Processor{
+		Metrics:    recorder,
 		ClickHouse: chhttp.Client{URL: server.URL},
 		InsertSettings: chhttp.QuerySettings{
-			"max_threads":        "2",
+			"max_threads":        "4",
 			"max_insert_threads": "2",
 		},
 		MergeTreeSettings: MergeTreeSettings{
@@ -328,17 +509,37 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 		PartID: "part-1",
 		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
 		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO db.query_log_archive_temp SELECT 1"},
-	}, "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY x")
+	}, 0)
 	if err == nil {
 		t.Fatal("expected retryable insert error after reduced retry")
 	}
+	if recorder.result != "failed" || recorder.attempts != 3 || recorder.failedAttempts != 3 || recorder.wasted != recorder.elapsed || recorder.wasted < 3*time.Second {
+		t.Fatalf("exhausted retries must include every attempt and backoff: %+v", recorder)
+	}
 
+	if want := []string{"4/2/", "2/1/16384", "1/1/8192"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("attempt settings = %v, want %v", attempts, want)
+	}
+	if !strings.Contains(err.Error(), "attempt 3 exhausted resource reductions (max_threads=1, max_insert_threads=1, max_block_size=8192)") || !clickHouseMemoryLimitError(err) {
+		t.Fatalf("terminal error lost attempt settings or ClickHouse cause: %v", err)
+	}
+	if blockSizeReads != 1 {
+		t.Fatalf("read default block size %d times, want once after failure", blockSizeReads)
+	}
+	var resets int
+	for _, query := range queries {
+		if strings.HasPrefix(query, "TRUNCATE TABLE ") {
+			resets++
+		}
+	}
+	if resets != 2 {
+		t.Fatalf("destination resets = %d, want 2", resets)
+	}
 	if containsQueryWith(queries, "merge_max_block_size") {
 		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
 	}
-	wantCompression := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING default_compression_codec = 'ZSTD(5)'"
-	if !containsString(queries, wantCompression) {
-		t.Fatalf("queries = %#v, want compression settings after destination reset", queries)
+	if containsQueryWith(queries, "default_compression_codec") {
+		t.Fatalf("truncate should preserve compression settings, got queries: %#v", queries)
 	}
 }
 
@@ -975,8 +1176,9 @@ func TestQueryProgressSharesStageHeartbeat(t *testing.T) {
 		snapshots = append(snapshots, snapshot)
 		return nil
 	}}
-	p.recordQueryProgress(metrics.QueryProgress{ReadRows: 10})
-	p.recordQueryProgress(metrics.QueryProgress{ReadRows: 20})
+	p.recordQueryProgress(ProgressSnapshot{QueryProgress: &metrics.QueryProgress{ReadRows: 10}})
+	percent := 40.0
+	p.recordQueryProgress(ProgressSnapshot{QueryProgress: &metrics.QueryProgress{ReadRows: 20}, InsertProgressPercent: &percent})
 	if len(snapshots) != 0 {
 		t.Fatal("query polling wrote progress")
 	}
@@ -984,10 +1186,10 @@ func TestQueryProgressSharesStageHeartbeat(t *testing.T) {
 	if err := p.reportStageSnapshot(context.Background(), m, tracker); err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshots) != 1 || snapshots[0].QueryProgress.ReadRows != 20 || snapshots[0].StageProgress.Stage != stageInsertSelect {
+	if len(snapshots) != 1 || snapshots[0].QueryProgress.ReadRows != 20 || snapshots[0].StageProgress.Stage != stageInsertSelect || snapshots[0].InsertProgressPercent == nil || *snapshots[0].InsertProgressPercent != 40 {
 		t.Fatalf("combined snapshots: %+v", snapshots)
 	}
-	if err := p.reportFinalQueryProgress(context.Background(), m, metrics.QueryProgress{ReadRows: 30}); err != nil {
+	if err := p.reportInsertProgress(context.Background(), m, ProgressSnapshot{QueryProgress: &metrics.QueryProgress{ReadRows: 30}, InsertProgressPercent: &percent}); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.reportStageSnapshot(context.Background(), m, tracker); err != nil {
@@ -1245,7 +1447,7 @@ func TestUploadFinishedArtifactReplacesStablePartPrefixWithTarballs(t *testing.T
 	}
 }
 
-func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
+func TestUploadFinishedArtifactAcceptsEmptyOutput(t *testing.T) {
 	err := (Processor{}).uploadFinishedArtifact(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
 		PartID: "part-1",
@@ -1254,11 +1456,8 @@ func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
 			FinishedKey: "partforge/jobs/job-1/finished/part-1",
 		},
 	}, filepath.Join(t.TempDir(), "finished-tars"), nil, nil)
-	if err == nil {
-		t.Fatal("expected missing frozen part globs error")
-	}
-	if !strings.Contains(err.Error(), "no frozen part globs") {
-		t.Fatalf("error = %q, want missing globs", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

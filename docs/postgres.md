@@ -60,6 +60,8 @@ A single `<state-table>_maintenance` record reserves compaction maintenance once
 
 Rewrite progress combines live query counters and stage timing in one periodic heartbeat. Rewrite and compact progress updates use conditional SQL patches that check worker ownership. A failed rewrite heartbeat cancels processing and surfaces the error.
 
+Deletion locks all selected parts in part-ID order, checks source references once, then deletes the selection in one statement. Migration 4 backfills scalar `source_job_id` and `source_part_id` columns and adds a partial index for that check; application writes maintain them alongside the JSON. Missing parts and referenced sources fail before S3 cleanup; cleanup failure rolls back the state deletion. Row locks remain held through optional S3 cleanup to prevent new source references.
+
 Connection pool configuration is unchanged.
 
 ## IAM Auth

@@ -34,9 +34,10 @@ func TestMarkCompactPartFailed(t *testing.T) {
 }
 
 func TestClearRewriteProgressClearsTotalRowsApprox(t *testing.T) {
-	part := Part{ReadRows: 25, TotalRowsApprox: 100}
+	percent := 25.0
+	part := Part{ReadRows: 25, TotalRowsApprox: 100, InsertProgressPercent: &percent}
 	clearRewriteProgress(&part)
-	if part.ReadRows != 0 || part.TotalRowsApprox != 0 {
+	if part.ReadRows != 0 || part.TotalRowsApprox != 0 || part.InsertProgressPercent != nil {
 		t.Fatalf("part retained rewrite progress: %+v", part)
 	}
 }

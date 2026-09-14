@@ -25,9 +25,10 @@ type Importer struct {
 }
 
 type FinishedArtifact struct {
-	Bucket string
-	Key    string
-	PartID string
+	EmptyOutput bool
+	Bucket      string
+	Key         string
+	PartID      string
 }
 
 type ImportJob struct {
@@ -169,6 +170,9 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, workDir string, owner pathOwner) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
+	}
+	if artifact.EmptyOutput {
+		return nil
 	}
 	downloadRoot := filepath.Join(workDir, "data")
 	extractRoot := filepath.Join(workDir, "extracted")
