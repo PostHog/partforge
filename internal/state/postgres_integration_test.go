@@ -275,6 +275,41 @@ func TestPostgresClaimsAndProgress(t *testing.T) {
 	}
 }
 
+func TestPostgresListJobsAggregatesCompletedSourceBytes(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC()
+	parts := []Part{
+		NewPart("job", "small", "bucket", "source/small", "finished/small", now),
+		NewPart("job", "large", "bucket", "source/large", "finished/large", now),
+	}
+	parts[0].SourceArtifactBytes = 100
+	parts[1].SourceArtifactBytes = 300
+	seedPostgresParts(t, s, parts)
+
+	completed, err := s.ClaimNextReady(ctx, "worker", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed == nil || completed.PartID != "large" {
+		t.Fatalf("claimed part = %+v", completed)
+	}
+	if err := s.MarkCompactReady(ctx, *completed, "worker", "finished/large", "db", "table", "schema", PartStats{}, nil, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimNextReady(ctx, "worker", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := s.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].SourceBytesTotal != 400 || jobs[0].SourceBytesCompleted != 300 || jobs[0].RewriteStartedAt != now.Format(timeFormat) {
+		t.Fatalf("job data progress = %+v", jobs)
+	}
+}
+
 func TestPostgresCompactScheduling(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)

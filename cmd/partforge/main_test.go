@@ -1660,6 +1660,8 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 				Name:                       "Backfill A",
 				Total:                      3,
 				Counts:                     map[state.Status]int{state.StatusReady: 2, state.StatusFinished: 1},
+				SourceBytesTotal:           4096,
+				SourceBytesCompleted:       4096,
 				DestinationActivePartCount: 17,
 				DestinationPartitionCount:  4,
 				SubmittedAt:                "2026-06-24T00:00:00.000000000Z",
@@ -1673,11 +1675,9 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 		"JOB_ID",
 		"STATUS",
 		"ARTIFACTS",
-		"CH_PARTS",
-		"PARTITIONS",
-		"job-a   READY   3          17        4",
-		"SUBMITTED_AT",
-		"UPDATED_AT",
+		"DATA",
+		"ETA",
+		"job-a   READY   3          4 KB/4 KB 100.0%  0s",
 		"COUNTS",
 		"job-a",
 		"Backfill A",
@@ -1689,6 +1689,30 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("printJobs output missing %q:\n%s", want, got)
 		}
+	}
+	for _, unwanted := range []string{"CH_PARTS", "PARTITIONS", "REWRITE", "IMPORT", "SUBMITTED_AT", "UPDATED_AT"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("printJobs output contains removed column %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestListJobDataProgressAndETAUseBytes(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	detail := buildListJobDetailAt(state.Job{
+		SourceBytesTotal:     100 << 30,
+		SourceBytesCompleted: 25 << 30,
+		RewriteStartedAt:     now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+	}, now)
+
+	if detail.DataPercent != 25 || detail.ETASeconds == nil || *detail.ETASeconds != int64((6*time.Hour)/time.Second) {
+		t.Fatalf("data progress = %.1f%%, eta = %v", detail.DataPercent, detail.ETASeconds)
+	}
+	if got := formatListJobData(detail.SourceBytesCompleted, detail.SourceBytesTotal); got != "25 GB/100 GB 25.0%" {
+		t.Fatalf("data progress = %q", got)
+	}
+	if got := formatListJobETA(detail.ETASeconds); got != "6h0m0s" {
+		t.Fatalf("eta = %q", got)
 	}
 }
 

@@ -141,6 +141,9 @@ type Job struct {
 	Name                       string         `json:"name,omitempty"`
 	Total                      int            `json:"total"`
 	Counts                     map[Status]int `json:"counts,omitempty"`
+	SourceBytesTotal           uint64         `json:"source_bytes_total,omitempty"`
+	SourceBytesCompleted       uint64         `json:"source_bytes_completed,omitempty"`
+	RewriteStartedAt           string         `json:"rewrite_started_at,omitempty"`
 	DestinationActivePartCount uint64         `json:"destination_active_part_count,omitempty"`
 	DestinationPartitionCount  int            `json:"destination_partition_count,omitempty"`
 	SubmittedAt                string         `json:"submitted_at,omitempty"`
@@ -1243,6 +1246,9 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 	rows, err := s.pool.Query(ctx, `WITH selected AS MATERIALIZED (
  SELECT job_id, status, created_at, updated_at, COALESCE(data->>'job_name', '') AS name,
  COALESCE((data->>'destination_active_part_count')::numeric, 0) AS part_count,
+	source_artifact_bytes, COALESCE(data->>'started_at', '') AS rewrite_started_at,
+	COALESCE(data->>'compact_ready_at', '') <> '' OR
+	 (COALESCE((data->>'empty_output')::boolean, false) AND COALESCE(data->>'finished_at', '') <> '') AS rewrite_completed,
  COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb) AS partitions
  FROM `+s.tableSQL+` WHERE status = ANY($1::text[])
  ), partition_counts AS (
@@ -1251,7 +1257,9 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
  WHERE status <> 'SUPERSEDED' AND btrim(p.key) <> '' AND p.value::numeric > 0 GROUP BY job_id
  ) SELECT s.job_id, s.status, count(*), COALESCE(min(NULLIF(s.name, '')), ''), max(s.name),
  min(s.created_at), max(s.updated_at), sum(CASE WHEN s.status <> 'SUPERSEDED' THEN part_count ELSE 0 END)::text,
- COALESCE(max(p.count), 0)
+	COALESCE(max(p.count), 0), sum(s.source_artifact_bytes)::text,
+	sum(CASE WHEN s.rewrite_completed THEN s.source_artifact_bytes ELSE 0 END)::text,
+	COALESCE(min(NULLIF(s.rewrite_started_at, '')) FILTER (WHERE s.source_artifact_bytes > 0), '')
  FROM selected s LEFT JOIN partition_counts p USING (job_id)
  GROUP BY s.job_id, s.status ORDER BY s.job_id, s.status`, values)
 	if err != nil {
@@ -1260,10 +1268,10 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 	defer rows.Close()
 	var jobs []Job
 	for rows.Next() {
-		var jobID, minName, maxName, createdAt, updatedAt, activeCount string
+		var jobID, minName, maxName, createdAt, updatedAt, activeCount, sourceBytes, completedBytes, rewriteStartedAt string
 		var status Status
 		var count, partitions int
-		if err := rows.Scan(&jobID, &status, &count, &minName, &maxName, &createdAt, &updatedAt, &activeCount, &partitions); err != nil {
+		if err := rows.Scan(&jobID, &status, &count, &minName, &maxName, &createdAt, &updatedAt, &activeCount, &partitions, &sourceBytes, &completedBytes, &rewriteStartedAt); err != nil {
 			return nil, err
 		}
 		if minName != maxName {
@@ -1283,8 +1291,21 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 		if err != nil {
 			return nil, err
 		}
+		totalBytes, err := strconv.ParseUint(sourceBytes, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		doneBytes, err := strconv.ParseUint(completedBytes, 10, 64)
+		if err != nil {
+			return nil, err
+		}
 		job.Total += count
 		job.Counts[status] = count
+		job.SourceBytesTotal += totalBytes
+		job.SourceBytesCompleted += doneBytes
+		if rewriteStartedAt != "" && (job.RewriteStartedAt == "" || rewriteStartedAt < job.RewriteStartedAt) {
+			job.RewriteStartedAt = rewriteStartedAt
+		}
 		job.DestinationActivePartCount += n
 		job.DestinationPartitionCount = partitions
 		if createdAt < job.SubmittedAt {

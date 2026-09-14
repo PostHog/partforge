@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -2843,21 +2844,17 @@ func buildListJobsOutput(jobs []state.Job) listJobsOutput {
 
 func printJobs(out *os.File, jobs []state.Job) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tARTIFACTS\tCH_PARTS\tPARTITIONS\tREWRITE\tIMPORT\tSUBMITTED_AT\tUPDATED_AT\tNAME\tCOUNTS")
+	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tARTIFACTS\tDATA\tETA\tNAME\tCOUNTS")
 	for _, job := range jobs {
 		detail := buildListJobDetail(job)
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
 			detail.JobID,
 			detail.Status,
 			detail.PartsTotal,
-			detail.ClickHouseParts,
-			detail.Partitions,
-			formatListJobProgress(detail.RewriteCompleted, detail.PartsTotal),
-			formatListJobProgress(detail.ImportCompleted, detail.PartsTotal),
-			detail.SubmittedAt,
-			detail.UpdatedAt,
+			formatListJobData(detail.SourceBytesCompleted, detail.SourceBytesTotal),
+			formatListJobETA(detail.ETASeconds),
 			detail.Name,
 			formatStatusCounts(detail.StatusCounts),
 		)
@@ -2866,6 +2863,10 @@ func printJobs(out *os.File, jobs []state.Job) {
 }
 
 func buildListJobDetail(job state.Job) listJobDetail {
+	return buildListJobDetailAt(job, time.Now())
+}
+
+func buildListJobDetailAt(job state.Job, now time.Time) listJobDetail {
 	currentTotal := job.Total - job.Counts[state.StatusSuperseded]
 	currentCounts := make(map[state.Status]int, len(job.Counts))
 	for status, count := range job.Counts {
@@ -2876,19 +2877,23 @@ func buildListJobDetail(job state.Job) listJobDetail {
 	rewriteCompleted := currentCounts[state.StatusCompactReady] + currentCounts[state.StatusCompacting] + currentCounts[state.StatusFinished] + currentCounts[state.StatusImporting] + currentCounts[state.StatusImported]
 	importCompleted := currentCounts[state.StatusImported]
 	return listJobDetail{
-		JobID:            job.JobID,
-		Name:             job.Name,
-		Status:           overallStatus(currentTotal, currentCounts),
-		PartsTotal:       currentTotal,
-		ClickHouseParts:  job.DestinationActivePartCount,
-		Partitions:       job.DestinationPartitionCount,
-		RewriteCompleted: rewriteCompleted,
-		RewritePercent:   percent(rewriteCompleted, currentTotal),
-		ImportCompleted:  importCompleted,
-		ImportPercent:    percent(importCompleted, currentTotal),
-		SubmittedAt:      job.SubmittedAt,
-		UpdatedAt:        job.UpdatedAt,
-		StatusCounts:     listJobStatusCounts(job.Counts),
+		JobID:                job.JobID,
+		Name:                 job.Name,
+		Status:               overallStatus(currentTotal, currentCounts),
+		PartsTotal:           currentTotal,
+		ClickHouseParts:      job.DestinationActivePartCount,
+		Partitions:           job.DestinationPartitionCount,
+		RewriteCompleted:     rewriteCompleted,
+		RewritePercent:       percent(rewriteCompleted, currentTotal),
+		ImportCompleted:      importCompleted,
+		ImportPercent:        percent(importCompleted, currentTotal),
+		SourceBytesTotal:     job.SourceBytesTotal,
+		SourceBytesCompleted: job.SourceBytesCompleted,
+		DataPercent:          bytePercent(job.SourceBytesCompleted, job.SourceBytesTotal),
+		ETASeconds:           listJobETA(job, now),
+		SubmittedAt:          job.SubmittedAt,
+		UpdatedAt:            job.UpdatedAt,
+		StatusCounts:         listJobStatusCounts(job.Counts),
 	}
 }
 
@@ -2903,8 +2908,44 @@ func listJobStatusCounts(counts map[state.Status]int) []statusCount {
 	return out
 }
 
-func formatListJobProgress(done, total int) string {
-	return fmt.Sprintf("%d/%d %.1f%%", done, total, percent(done, total))
+func formatListJobData(done, total uint64) string {
+	if total == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%s/%s %.1f%%", formatBytes(done), formatBytes(total), bytePercent(done, total))
+}
+
+func bytePercent(done, total uint64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(done) / float64(total) * 100
+}
+
+func listJobETA(job state.Job, now time.Time) *int64 {
+	if job.SourceBytesTotal == 0 {
+		return nil
+	}
+	if job.SourceBytesCompleted >= job.SourceBytesTotal {
+		zero := int64(0)
+		return &zero
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, job.RewriteStartedAt)
+	if err != nil || job.SourceBytesCompleted == 0 || !now.After(startedAt) {
+		return nil
+	}
+	seconds := int64(math.Ceil(now.Sub(startedAt).Seconds() * float64(job.SourceBytesTotal-job.SourceBytesCompleted) / float64(job.SourceBytesCompleted)))
+	return &seconds
+}
+
+func formatListJobETA(seconds *int64) string {
+	if seconds == nil {
+		return "-"
+	}
+	if *seconds > 0 && *seconds < 60 {
+		return "<1m"
+	}
+	return (time.Duration(*seconds) * time.Second).Round(time.Minute).String()
 }
 
 func runJobStatus(ctx context.Context, args []string) error {
@@ -4215,19 +4256,23 @@ type listJobsOutput struct {
 }
 
 type listJobDetail struct {
-	JobID            string        `json:"job_id"`
-	Name             string        `json:"name,omitempty"`
-	Status           string        `json:"status"`
-	PartsTotal       int           `json:"parts_total"`
-	ClickHouseParts  uint64        `json:"clickhouse_parts"`
-	Partitions       int           `json:"partitions"`
-	RewriteCompleted int           `json:"rewrite_completed"`
-	RewritePercent   float64       `json:"rewrite_percent"`
-	ImportCompleted  int           `json:"import_completed"`
-	ImportPercent    float64       `json:"import_percent"`
-	SubmittedAt      string        `json:"submitted_at,omitempty"`
-	UpdatedAt        string        `json:"updated_at,omitempty"`
-	StatusCounts     []statusCount `json:"status_counts,omitempty"`
+	JobID                string        `json:"job_id"`
+	Name                 string        `json:"name,omitempty"`
+	Status               string        `json:"status"`
+	PartsTotal           int           `json:"parts_total"`
+	ClickHouseParts      uint64        `json:"clickhouse_parts"`
+	Partitions           int           `json:"partitions"`
+	RewriteCompleted     int           `json:"rewrite_completed"`
+	RewritePercent       float64       `json:"rewrite_percent"`
+	ImportCompleted      int           `json:"import_completed"`
+	ImportPercent        float64       `json:"import_percent"`
+	SourceBytesTotal     uint64        `json:"source_bytes_total"`
+	SourceBytesCompleted uint64        `json:"source_bytes_completed"`
+	DataPercent          float64       `json:"data_percent"`
+	ETASeconds           *int64        `json:"eta_seconds,omitempty"`
+	SubmittedAt          string        `json:"submitted_at,omitempty"`
+	UpdatedAt            string        `json:"updated_at,omitempty"`
+	StatusCounts         []statusCount `json:"status_counts,omitempty"`
 }
 
 type retryFailedOutput struct {
