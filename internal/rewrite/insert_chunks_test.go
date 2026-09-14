@@ -77,15 +77,21 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 					}
 				case strings.HasPrefix(query, "SELECT partition_id,"):
 					if len(staged) > 0 {
-						fmt.Fprintf(w, "p0\t1\t%d\t10\np1\t1\t0\t10\n", len(staged))
+						fmt.Fprintf(w, "p0\t1001\t%d\t10\np1\t1\t0\t10\n", len(staged))
 					}
 				case strings.HasPrefix(query, "SELECT count(),") && strings.Contains(query, "system.parts"):
 					fmt.Fprint(w, "1\t7\t100\n")
 				case query == "ALTER TABLE `db`.`dst` MOVE PARTITION ID 'p0' TO TABLE `db`.`dst__partforge_completed`":
+					if got := r.URL.Query().Get("max_parts_to_move"); got != "1001" {
+						t.Errorf("max_parts_to_move = %q, want 1001", got)
+					}
 					moves++
 					completed = append(completed, staged...)
 					staged = nil
 				case query == "ALTER TABLE `db`.`dst` MOVE PARTITION ID 'p1' TO TABLE `db`.`dst__partforge_completed`":
+					if got := r.URL.Query().Get("max_parts_to_move"); got != "1" {
+						t.Errorf("max_parts_to_move = %q, want 1", got)
+					}
 					if failMove {
 						// Even a resource error during promotion must not retry INSERT.
 						http.Error(w, "Code: 241. MEMORY_LIMIT_EXCEEDED", 500)

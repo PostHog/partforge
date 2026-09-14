@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/PostHog/partforge/internal/chhttp"
@@ -92,7 +93,9 @@ func (p Processor) promoteInsertChunk(ctx context.Context, m manifest.Manifest) 
 	for _, partition := range partitions {
 		query := "ALTER TABLE " + chhttp.TableSQL(m.Dest.Database, m.Dest.Table) +
 			" MOVE PARTITION ID " + chhttp.StringLiteral(partition.PartitionID) + " TO TABLE " + completedInsertTable(m)
-		if err := p.ClickHouse.Exec(ctx, query); err != nil {
+		if err := p.ClickHouse.ExecWithOptions(ctx, query, chhttp.QueryOptions{Settings: chhttp.QuerySettings{
+			"max_parts_to_move": strconv.FormatUint(partition.Parts, 10),
+		}}); err != nil {
 			// Some partitions may already have moved. Never rerun the insert here.
 			return fmt.Errorf("promote insert partition %s: %w", partition.PartitionID, err)
 		}
