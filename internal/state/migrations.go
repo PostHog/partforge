@@ -58,6 +58,11 @@ func (s *Store) migrations() []string {
  UPDATE %[1]s SET source_job_id = COALESCE(data->>'source_job_id', ''), source_part_id = COALESCE(data->>'source_part_id', '');
  CREATE INDEX %[2]s ON %[1]s (source_job_id, source_part_id) WHERE source_job_id <> '';`,
 			s.tableSQL, s.indexSQL("source_ref_idx")),
+		fmt.Sprintf(`ALTER TABLE %[1]s ADD COLUMN compact_parts numeric(20,0) NOT NULL DEFAULT 0;
+ UPDATE %[1]s SET compact_parts = COALESCE((data->>'destination_active_part_count')::numeric, 0);
+ DROP INDEX IF EXISTS %[2]s;
+ CREATE INDEX %[3]s ON %[1]s (compact_parts DESC, created_at, job_id, part_id) WHERE status = 'COMPACT_READY' AND compact_eligible;`,
+			s.tableSQL, indexSQLInTableSchema(s.tableName, "compact_priority_idx"), s.indexSQL("compact_priority_idx")),
 	}
 }
 

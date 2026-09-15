@@ -398,7 +398,7 @@ func TestPostgresCompactScheduling(t *testing.T) {
 		p.DestinationDatabase = "db"
 		p.DestinationTable = "table"
 		p.DestinationSchema = "schema"
-		p.DestinationActivePartCount = 2
+		p.DestinationActivePartCount = uint64(i + 2)
 		p.DestinationActivePartBytes = uint64(i + 1)
 		p.DestinationActivePartitionCounts = map[string]uint64{"p": 2}
 		parts[i] = p
@@ -479,6 +479,36 @@ func TestPostgresCompactScheduling(t *testing.T) {
 	}
 }
 
+func TestPostgresCompactSchedulingPrioritizesPartCount(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC()
+	makePart := func(id string, parts, bytes uint64) Part {
+		p := NewPart("job", id, "bucket", "source/"+id, "finished/"+id, now)
+		p.Status = StatusCompactReady
+		p.CompactReadyAt = formatTime(now)
+		p.DestinationDatabase = "db"
+		p.DestinationTable = "table"
+		p.DestinationSchema = "CREATE TABLE db.table (x UInt64) ENGINE=MergeTree ORDER BY x"
+		p.DestinationActivePartCount = parts
+		p.DestinationActivePartBytes = bytes
+		p.DestinationActivePartitionCounts = map[string]uint64{"p": parts}
+		return p
+	}
+	seedPostgresParts(t, s, []Part{
+		makePart("large-bytes", 2, 1000),
+		makePart("large-parts", 5, 1),
+	})
+
+	batch, err := s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil || batch.Parts[0].PartID != "large-parts" {
+		t.Fatalf("compact claim = %+v, want large-parts", batch)
+	}
+}
+
 func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
@@ -492,6 +522,9 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 		p.DestinationTable = "table"
 		p.DestinationSchema = "schema"
 		p.DestinationActivePartCount = 2
+		if id == "large" {
+			p.DestinationActivePartCount = 3
+		}
 		p.DestinationActivePartBytes = size
 		p.DestinationActivePartitionCounts = map[string]uint64{partition: 2}
 		if status == StatusCompacting {
@@ -556,7 +589,7 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(jobs) != 2 || jobs[0].Total != 3 || jobs[0].Counts[StatusCompactReady] != 2 || jobs[0].Name != "name" || jobs[0].DestinationPartitionCount != 2 || jobs[0].DestinationActivePartCount != 6 {
+	if len(jobs) != 2 || jobs[0].Total != 3 || jobs[0].Counts[StatusCompactReady] != 2 || jobs[0].Name != "name" || jobs[0].DestinationPartitionCount != 2 || jobs[0].DestinationActivePartCount != 7 {
 		t.Fatalf("job summaries = %+v", jobs)
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE `+s.tableSQL+` SET data=data || '{"job_name":"conflict"}'::jsonb WHERE part_id='large'`); err != nil {
@@ -626,6 +659,7 @@ func assertSchedulingColumns(t testing.TB, s *Store) {
  source_part_id IS DISTINCT FROM COALESCE(data->>'source_part_id', '') OR
  source_artifact_bytes IS DISTINCT FROM COALESCE((data->>'source_artifact_bytes')::numeric, 0) OR
  compact_bytes IS DISTINCT FROM COALESCE((data->>'destination_active_part_bytes')::numeric, 0) OR
+ compact_parts IS DISTINCT FROM COALESCE((data->>'destination_active_part_count')::numeric, 0) OR
  compact_eligible IS DISTINCT FROM (
  COALESCE(btrim(data->>'destination_database'), '') <> '' AND
  COALESCE(btrim(data->>'destination_table'), '') <> '' AND

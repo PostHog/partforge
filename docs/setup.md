@@ -171,7 +171,7 @@ Add `-include-partitions=202401,202402` to include only those exact partition ID
 
 ### 4. worker
 
-The worker claims the largest `READY` source artifact first, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact the largest eligible finished artifact first before promoting artifacts to `FINISHED`.
+The worker claims the largest `READY` source artifact first, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact the eligible finished artifact with the most physical parts first before promoting artifacts to `FINISHED`.
 
 **Run it via Docker.** Because the worker starts its own `clickhouse-server` and shells out to `s5cmd`, it needs both alongside the binary — the published image (`ghcr.io/<owner>/partforge`) bundles ClickHouse, `s5cmd`, and the binary, so it's the recommended way to run it. Running the bare binary is only practical if `clickhouse-server` and `s5cmd` are already on the host `PATH`.
 

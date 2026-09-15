@@ -343,6 +343,10 @@ func quoteTableName(name string) (string, error) {
 }
 
 func quoteIndexName(table, suffix string) string {
+	return pgx.Identifier{indexName(table, suffix)}.Sanitize()
+}
+
+func indexName(table, suffix string) string {
 	base := strings.NewReplacer(".", "_", "-", "_").Replace(strings.TrimSpace(table))
 	base = strings.Trim(base, "_")
 	if base == "" {
@@ -355,7 +359,16 @@ func quoteIndexName(table, suffix string) string {
 	if len(base) > maxBaseLen {
 		base = base[:maxBaseLen]
 	}
-	return pgx.Identifier{base + "_" + suffix}.Sanitize()
+	return base + "_" + suffix
+}
+
+func indexSQLInTableSchema(table, suffix string) string {
+	parts := strings.Split(strings.TrimSpace(table), ".")
+	name := indexName(table, suffix)
+	if len(parts) < 2 {
+		return pgx.Identifier{name}.Sanitize()
+	}
+	return pgx.Identifier{parts[len(parts)-2], name}.Sanitize()
 }
 
 func NewPart(jobID, partID, bucket, sourceKey, finishedKey string, now time.Time) Part {
@@ -425,7 +438,7 @@ func partFromJSON(data []byte) (Part, error) {
 	return part, nil
 }
 
-const partColumns = "job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at, source_job_id, source_part_id"
+const partColumns = "job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_parts, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at, source_job_id, source_part_id"
 
 // Full writes derive scheduling values once and persist them alongside the JSON.
 func partWriteValues(part Part) ([]any, error) {
@@ -472,6 +485,7 @@ func partWriteValues(part Part) ([]any, error) {
 	return []any{part.JobID, part.PartID, string(part.Status), part.WorkerID, part.CreatedAt, part.UpdatedAt, data,
 		pgtype.Numeric{Int: new(big.Int).SetUint64(part.SourceArtifactBytes), Valid: true},
 		pgtype.Numeric{Int: new(big.Int).SetUint64(part.DestinationActivePartBytes), Valid: true},
+		pgtype.Numeric{Int: new(big.Int).SetUint64(part.DestinationActivePartCount), Valid: true},
 		eligible, normalized, staleAt, originalReadyAt, part.SourceJobID, part.SourcePartID}, nil
 }
 
@@ -480,7 +494,7 @@ func (s *Store) insertPartTx(ctx context.Context, tx pgx.Tx, part Part) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+s.tableSQL+` (`+partColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, values...)
+	_, err = tx.Exec(ctx, `INSERT INTO `+s.tableSQL+` (`+partColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, values...)
 	return err
 }
 
@@ -490,8 +504,8 @@ func (s *Store) savePartTx(ctx context.Context, tx pgx.Tx, part Part) error {
 		return err
 	}
 	tag, err := tx.Exec(ctx, `UPDATE `+s.tableSQL+` SET status=$3, worker_id=$4, created_at=$5, updated_at=$6, data=$7,
- source_artifact_bytes=$8, compact_bytes=$9, compact_eligible=$10, compact_normalized=$11,
- compact_stale_at=$12, original_compact_ready_at=$13, source_job_id=$14, source_part_id=$15 WHERE job_id=$1 AND part_id=$2`, values...)
+	 source_artifact_bytes=$8, compact_bytes=$9, compact_parts=$10, compact_eligible=$11, compact_normalized=$12,
+	 compact_stale_at=$13, original_compact_ready_at=$14, source_job_id=$15, source_part_id=$16 WHERE job_id=$1 AND part_id=$2`, values...)
 	if err != nil {
 		return err
 	}
@@ -740,7 +754,7 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 	return batch, nil
 }
 
-// Claim the largest eligible unlocked artifact using the compact queue index.
+// Claim the most fragmented eligible unlocked artifact using the compact queue index.
 func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time) (string, []any) {
 	args := []any{}
 	bind := func(v any) string { args = append(args, v); return fmt.Sprintf("$%d", len(args)) }
@@ -774,7 +788,7 @@ func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time) (stri
 		from += " LEFT JOIN LATERAL (SELECT original_compact_ready_at FROM " + s.tableSQL + " original WHERE original.job_id = p.job_id AND original_compact_ready_at IS NOT NULL ORDER BY original_compact_ready_at DESC LIMIT 1) deadline ON true"
 		filters = append(filters, "COALESCE(deadline.original_compact_ready_at > "+cutoff+", true)")
 	}
-	return "SELECT p.data FROM " + from + " WHERE " + strings.Join(filters, " AND ") + " ORDER BY p.compact_bytes DESC, p.created_at, p.job_id, p.part_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED", args
+	return "SELECT p.data FROM " + from + " WHERE " + strings.Join(filters, " AND ") + " ORDER BY p.compact_parts DESC, p.created_at, p.job_id, p.part_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED", args
 }
 
 func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
@@ -1220,15 +1234,15 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 	updates := `updated_at = $1, data = data || $2::jsonb`
 	args := []any{formatTime(now), data, jobID, partID, workerID}
 	if stats := progress.DestinationActivePartStats; stats != nil {
-		updates += `, compact_bytes = $6, compact_eligible = $7::boolean AND
+		updates += `, compact_bytes = $6, compact_parts = $7, compact_eligible = $8::boolean AND
  COALESCE(btrim(data->>'destination_database'), '') <> '' AND
  COALESCE(btrim(data->>'destination_table'), '') <> '' AND
  COALESCE(btrim(data->>'destination_schema'), '') <> '' AND
  EXISTS (SELECT FROM jsonb_each_text(COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb)) p WHERE btrim(p.key) <> '' AND p.value::numeric > 1),
- compact_normalized = $8::boolean AND
+ compact_normalized = $9::boolean AND
  (SELECT count(*) = 1 AND COALESCE(bool_and(p.value::numeric = 1), false)
  FROM jsonb_each_text(COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb)) p WHERE btrim(p.key) <> '' AND p.value::numeric > 0)`
-		args = append(args, pgtype.Numeric{Int: new(big.Int).SetUint64(stats.Bytes), Valid: true}, stats.Count > 0, stats.Count == 1)
+		args = append(args, pgtype.Numeric{Int: new(big.Int).SetUint64(stats.Bytes), Valid: true}, pgtype.Numeric{Int: new(big.Int).SetUint64(stats.Count), Valid: true}, stats.Count > 0, stats.Count == 1)
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE `+s.tableSQL+` SET `+updates+` WHERE job_id = $3 AND part_id = $4 AND status = 'IN_PROGRESS' AND worker_id = $5`, args...)
 

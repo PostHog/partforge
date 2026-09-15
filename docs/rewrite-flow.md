@@ -121,7 +121,7 @@ Compaction remains more patient: fragmented inputs reset a five-minute quiet tim
 
 ## Worker Compaction
 
-When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then looks for a `COMPACT_READY` artifact containing multiple physical parts in one destination partition. It preserves the partition-collision rules, then claims the eligible artifact with the largest persisted destination byte size and normalizes it. Artifacts that already contain one physical ClickHouse part are promoted directly to `FINISHED`; PartForge does not combine multiple artifacts into one compact job.
+When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then looks for a `COMPACT_READY` artifact containing multiple physical parts in one destination partition. It preserves the partition-collision rules, then claims the eligible artifact with the most persisted physical parts and normalizes it. Artifacts that already contain one physical ClickHouse part are promoted directly to `FINISHED`; PartForge does not combine multiple artifacts into one compact job.
 
 The compactor downloads and attaches the claimed artifact before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. The worker stops background merges before attach and starts them afterward, then relies entirely on ClickHouse's background merge selector. A fully normalized artifact proceeds immediately. After five minutes without an active merge or part-count change, a reduced artifact is uploaded as a new compact checkpoint for another pass; an unchanged artifact fails.
 
