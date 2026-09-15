@@ -449,6 +449,20 @@ if ! grep -E '^compact-[^[:space:]]+[[:space:]]+COMPACT_READY' <<<"$compact_stat
   exit 1
 fi
 
+overview="$(
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    overview \
+    -job-id="$JOB_ID" \
+    -postgres-url="$POSTGRES_URL"
+)"
+for metric in input_artifacts initial_ch_parts current_artifacts current_ch_parts part_reduction; do
+  if ! grep -F "$metric:" <<<"$overview" >/dev/null; then
+    echo "overview did not contain $metric; output:" >&2
+    echo "$overview" >&2
+    exit 1
+  fi
+done
+
 finalize_log="$ROOT/.e2e/compact-finalize.log"
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   worker \

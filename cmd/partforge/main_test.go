@@ -1730,6 +1730,88 @@ func TestListJobDataProgressAndETAUseBytes(t *testing.T) {
 	}
 }
 
+func TestBuildOverviewReportsPhysicalPartReduction(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	overview := buildOverview([]state.Job{
+		{
+			JobID:                        "shard-a",
+			Total:                        3,
+			Counts:                       map[state.Status]int{state.StatusCompactReady: 2, state.StatusCompacting: 1},
+			SourceBytesTotal:             1000,
+			SourceBytesCompleted:         800,
+			RewriteStartedAt:             now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+			LatestOriginalCompactReadyAt: now.Add(-time.Hour).Format(time.RFC3339Nano),
+			UpdatedAt:                    now.Add(-time.Minute).Format(time.RFC3339Nano),
+		},
+	}, state.OverviewStats{
+		OriginalArtifacts:          4,
+		RewrittenOriginalArtifacts: 3,
+		InputArtifacts:             3,
+		InitialClickHouseParts:     20,
+		DurableArtifacts:           1,
+		DurableClickHouseParts:     3,
+		ActiveCompactionBatches:    1,
+		ActiveCompactionInputs:     2,
+		ActiveCompactionInputParts: 10,
+		ActiveCompactionParts:      2,
+		ActiveMerges:               2,
+		MergeProgress:              0.375,
+		CompactionWorkers:          1,
+		CompactionStages:           map[string]int{"merging": 1},
+	}, now, 24*time.Hour)
+
+	if overview.Compaction.CurrentArtifacts != 2 || overview.Compaction.CurrentClickHouseParts != 5 {
+		t.Fatalf("current compaction output = %+v", overview.Compaction)
+	}
+	if overview.Compaction.PartReductionPercent == nil || *overview.Compaction.PartReductionPercent != 75 {
+		t.Fatalf("part reduction = %v", overview.Compaction.PartReductionPercent)
+	}
+	if overview.Compaction.PartReductionRatio == nil || *overview.Compaction.PartReductionRatio != 4 {
+		t.Fatalf("part reduction ratio = %v", overview.Compaction.PartReductionRatio)
+	}
+	if overview.Compaction.Finalization.Blocked != 1 {
+		t.Fatalf("finalization = %+v", overview.Compaction.Finalization)
+	}
+
+	got := captureFileOutput(t, func(out *os.File) { printOverview(out, overview) })
+	for _, want := range []string{
+		"PARTFORGE OVERVIEW",
+		"initial_ch_parts: 20 observed from 3/4 rewritten artifacts",
+		"current_artifacts: 2 (durable=1 active_batches=1)",
+		"current_ch_parts: 5 (durable=3 live=2)",
+		"part_reduction: 20 -> 5 (75.0% fewer, 4.0x reduction)",
+		"active: batches=1 input_artifacts=2 input_parts=10 current_parts=2 merges=2 merge_wave=37.5% workers=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("overview output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSelectOverviewJobsDefaultsToUnfinished(t *testing.T) {
+	jobs := []state.Job{
+		{JobID: "active", Total: 1, Counts: map[state.Status]int{state.StatusInProgress: 1}},
+		{JobID: "done", Total: 2, Counts: map[state.Status]int{state.StatusImported: 1, state.StatusSuperseded: 1}},
+	}
+	selected, err := selectOverviewJobs(jobs, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].JobID != "active" {
+		t.Fatalf("selected jobs = %+v", selected)
+	}
+	selected, err = selectOverviewJobs(jobs, []string{"done"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].JobID != "done" {
+		t.Fatalf("explicit jobs = %+v", selected)
+	}
+	if _, err := selectOverviewJobs(jobs, []string{"missing"}, false); err == nil {
+		t.Fatal("expected missing job error")
+	}
+}
+
 func TestBuildListJobsOutputPreservesJobIDList(t *testing.T) {
 	got := buildListJobsOutput([]state.Job{
 		{

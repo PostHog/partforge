@@ -203,4 +203,4 @@ Notes:
 - `import-finished -part-id=<part-id>` imports a single finished part, for controlling import load. After the first attach the table is no longer empty, so subsequent single-part imports need `-require-empty=false`.
 - The import work-dir must be on the **same filesystem** as the destination table's `detached` directory (parts are moved, not copied). Unset, it defaults to a directory on the destination ClickHouse disk; if `-work-dir` is set and fails that check, the command errors before downloading anything.
 
-Track progress with `partforge list-jobs` and `partforge job-status -job-id=<id>` (see [operations.md](operations.md)).
+Track campaign progress with `partforge overview`, scan individual jobs with `partforge list-jobs`, and inspect one job with `partforge job-status -job-id=<id>` (see [operations.md](operations.md)).

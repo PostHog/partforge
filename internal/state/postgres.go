@@ -137,17 +137,39 @@ type Part struct {
 }
 
 type Job struct {
-	JobID                      string         `json:"job_id"`
-	Name                       string         `json:"name,omitempty"`
-	Total                      int            `json:"total"`
-	Counts                     map[Status]int `json:"counts,omitempty"`
-	SourceBytesTotal           uint64         `json:"source_bytes_total,omitempty"`
-	SourceBytesCompleted       uint64         `json:"source_bytes_completed,omitempty"`
-	RewriteStartedAt           string         `json:"rewrite_started_at,omitempty"`
-	DestinationActivePartCount uint64         `json:"destination_active_part_count,omitempty"`
-	DestinationPartitionCount  int            `json:"destination_partition_count,omitempty"`
-	SubmittedAt                string         `json:"submitted_at,omitempty"`
-	UpdatedAt                  string         `json:"updated_at,omitempty"`
+	JobID                        string         `json:"job_id"`
+	Name                         string         `json:"name,omitempty"`
+	Total                        int            `json:"total"`
+	Counts                       map[Status]int `json:"counts,omitempty"`
+	SourceBytesTotal             uint64         `json:"source_bytes_total,omitempty"`
+	SourceBytesCompleted         uint64         `json:"source_bytes_completed,omitempty"`
+	RewriteStartedAt             string         `json:"rewrite_started_at,omitempty"`
+	DestinationActivePartCount   uint64         `json:"destination_active_part_count,omitempty"`
+	DestinationPartitionCount    int            `json:"destination_partition_count,omitempty"`
+	LatestOriginalCompactReadyAt string         `json:"latest_original_compact_ready_at,omitempty"`
+	NormalizedCompactReady       bool           `json:"normalized_compact_ready,omitempty"`
+	SubmittedAt                  string         `json:"submitted_at,omitempty"`
+	UpdatedAt                    string         `json:"updated_at,omitempty"`
+}
+
+type OverviewStats struct {
+	OriginalArtifacts          int
+	RewrittenOriginalArtifacts int
+	InputArtifacts             int
+	InitialClickHouseParts     uint64
+	DurableArtifacts           int
+	DurableClickHouseParts     uint64
+	ActiveCompactionBatches    int
+	ActiveCompactionInputs     int
+	ActiveCompactionInputParts uint64
+	ActiveCompactionParts      uint64
+	ActiveMerges               uint64
+	MergeProgress              float64
+	OldestCompactingAt         string
+	RewriteWorkers             int
+	CompactionWorkers          int
+	RewriteStages              map[string]int
+	CompactionStages           map[string]int
 }
 
 type QueryProgress struct {
@@ -1247,6 +1269,7 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
  SELECT job_id, status, created_at, updated_at, COALESCE(data->>'job_name', '') AS name,
  COALESCE((data->>'destination_active_part_count')::numeric, 0) AS part_count,
 	source_artifact_bytes, COALESCE(data->>'started_at', '') AS rewrite_started_at,
+	original_compact_ready_at, compact_normalized,
 	COALESCE(data->>'compact_ready_at', '') <> '' OR
 	 (COALESCE((data->>'empty_output')::boolean, false) AND COALESCE(data->>'finished_at', '') <> '') AS rewrite_completed,
  COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb) AS partitions
@@ -1259,7 +1282,8 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
  min(s.created_at), max(s.updated_at), sum(CASE WHEN s.status <> 'SUPERSEDED' THEN part_count ELSE 0 END)::text,
 	COALESCE(max(p.count), 0), sum(s.source_artifact_bytes)::text,
 	sum(CASE WHEN s.rewrite_completed THEN s.source_artifact_bytes ELSE 0 END)::text,
-	COALESCE(min(NULLIF(s.rewrite_started_at, '')) FILTER (WHERE s.source_artifact_bytes > 0), '')
+	COALESCE(min(NULLIF(s.rewrite_started_at, '')) FILTER (WHERE s.source_artifact_bytes > 0), ''),
+	max(s.original_compact_ready_at), bool_or(s.status = 'COMPACT_READY' AND s.compact_normalized)
  FROM selected s LEFT JOIN partition_counts p USING (job_id)
  GROUP BY s.job_id, s.status ORDER BY s.job_id, s.status`, values)
 	if err != nil {
@@ -1271,7 +1295,9 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 		var jobID, minName, maxName, createdAt, updatedAt, activeCount, sourceBytes, completedBytes, rewriteStartedAt string
 		var status Status
 		var count, partitions int
-		if err := rows.Scan(&jobID, &status, &count, &minName, &maxName, &createdAt, &updatedAt, &activeCount, &partitions, &sourceBytes, &completedBytes, &rewriteStartedAt); err != nil {
+		var latestOriginalCompactReadyAt pgtype.Timestamptz
+		var normalizedCompactReady bool
+		if err := rows.Scan(&jobID, &status, &count, &minName, &maxName, &createdAt, &updatedAt, &activeCount, &partitions, &sourceBytes, &completedBytes, &rewriteStartedAt, &latestOriginalCompactReadyAt, &normalizedCompactReady); err != nil {
 			return nil, err
 		}
 		if minName != maxName {
@@ -1306,6 +1332,13 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 		if rewriteStartedAt != "" && (job.RewriteStartedAt == "" || rewriteStartedAt < job.RewriteStartedAt) {
 			job.RewriteStartedAt = rewriteStartedAt
 		}
+		if latestOriginalCompactReadyAt.Valid {
+			value := formatTime(latestOriginalCompactReadyAt.Time)
+			if job.LatestOriginalCompactReadyAt == "" || value > job.LatestOriginalCompactReadyAt {
+				job.LatestOriginalCompactReadyAt = value
+			}
+		}
+		job.NormalizedCompactReady = job.NormalizedCompactReady || normalizedCompactReady
 		job.DestinationActivePartCount += n
 		job.DestinationPartitionCount = partitions
 		if createdAt < job.SubmittedAt {
@@ -1316,6 +1349,141 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 		}
 	}
 	return jobs, rows.Err()
+}
+
+func (s *Store) OverviewStats(ctx context.Context, jobIDs []string) (OverviewStats, error) {
+	if len(jobIDs) == 0 {
+		return OverviewStats{RewriteStages: map[string]int{}, CompactionStages: map[string]int{}}, nil
+	}
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `WITH selected AS MATERIALIZED (
+ SELECT job_id, status, worker_id, updated_at, original_compact_ready_at,
+  COALESCE((data->>'compact_generation')::int, 0) AS generation,
+  jsonb_array_length(COALESCE(NULLIF(data->'compact_input_part_ids', 'null'::jsonb), '[]'::jsonb)) AS compact_inputs,
+  COALESCE((data->>'destination_active_part_count')::numeric, 0) AS destination_parts,
+  COALESCE((data->>'compact_input_part_count')::numeric, 0) AS compact_input_parts,
+  COALESCE((data->>'compact_input_bytes')::numeric, 0) AS compact_input_bytes,
+  COALESCE((data->>'compact_output_part_count')::numeric, 0) AS compact_output_parts,
+  COALESCE((data->>'compact_active_merges')::numeric, 0) AS active_merges,
+  COALESCE((data->>'compact_merge_progress')::double precision, 0) AS merge_progress,
+  COALESCE(data->>'compact_output_part_id', '') AS compact_output_part_id,
+  COALESCE(data->>'compacting_at', '') AS compacting_at,
+  COALESCE(NULLIF(btrim(data->>'rewrite_stage'), ''), 'unknown') AS rewrite_stage,
+  COALESCE(NULLIF(btrim(data->>'compact_stage'), ''), 'unknown') AS compact_stage,
+  COALESCE((data->>'empty_output')::boolean, false) AS empty_output,
+  COALESCE(data->>'finished_at', '') AS finished_at
+ FROM `+s.tableSQL+` WHERE job_id = ANY($1::text[])
+), parts AS MATERIALIZED (
+ SELECT *, generation <= 0 AND compact_inputs = 0 AS original
+ FROM selected
+), batches AS MATERIALIZED (
+ SELECT job_id,
+  COALESCE(NULLIF(compact_output_part_id, ''), worker_id || ':' || compacting_at) AS batch_id,
+  count(*) AS input_artifacts,
+  CASE WHEN max(compact_input_parts) > 0 THEN max(compact_input_parts) ELSE sum(destination_parts) END AS input_parts,
+  CASE WHEN max(compact_input_parts) > 0 THEN max(compact_output_parts) ELSE sum(destination_parts) END AS current_parts,
+  max(active_merges) AS active_merges,
+  max(merge_progress) AS merge_progress,
+  max(compact_input_bytes) AS input_bytes,
+  min(NULLIF(compacting_at, '')) AS compacting_at,
+  max(compact_stage) AS stage
+ FROM parts WHERE status = 'COMPACTING'
+ GROUP BY job_id, COALESCE(NULLIF(compact_output_part_id, ''), worker_id || ':' || compacting_at)
+), rewrite_stages AS (
+ SELECT rewrite_stage AS stage, count(*) AS count FROM parts WHERE status = 'IN_PROGRESS' GROUP BY rewrite_stage
+), compact_stages AS (
+ SELECT stage, count(*) AS count FROM batches GROUP BY stage
+)
+SELECT jsonb_build_object(
+ 'original_artifacts', (SELECT count(*) FROM parts WHERE original),
+ 'rewritten_original_artifacts', (SELECT count(*) FROM parts WHERE original AND (original_compact_ready_at IS NOT NULL OR (empty_output AND finished_at <> ''))),
+ 'input_artifacts', (SELECT count(*) FROM parts WHERE original AND original_compact_ready_at IS NOT NULL AND destination_parts > 0),
+ 'initial_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE original AND original_compact_ready_at IS NOT NULL),
+ 'durable_artifacts', (SELECT count(*) FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND destination_parts > 0 AND (original_compact_ready_at IS NOT NULL OR NOT original)),
+ 'durable_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND (original_compact_ready_at IS NOT NULL OR NOT original)),
+ 'active_compaction_batches', (SELECT count(*) FROM batches),
+ 'active_compaction_inputs', (SELECT COALESCE(sum(input_artifacts), 0) FROM batches),
+ 'active_compaction_input_parts', (SELECT COALESCE(sum(input_parts), 0)::text FROM batches),
+ 'active_compaction_parts', (SELECT COALESCE(sum(current_parts), 0)::text FROM batches),
+ 'active_merges', (SELECT COALESCE(sum(active_merges), 0)::text FROM batches),
+ 'merge_progress', (SELECT COALESCE(sum(merge_progress * input_bytes::double precision) / NULLIF(sum(input_bytes)::double precision, 0), avg(merge_progress), 0) FROM batches),
+ 'oldest_compacting_at', (SELECT COALESCE(min(compacting_at), '') FROM batches),
+ 'rewrite_workers', (SELECT count(DISTINCT worker_id) FROM parts WHERE status = 'IN_PROGRESS' AND btrim(worker_id) <> ''),
+ 'compaction_workers', (SELECT count(DISTINCT worker_id) FROM parts WHERE status = 'COMPACTING' AND btrim(worker_id) <> ''),
+ 'rewrite_stages', (SELECT COALESCE(jsonb_object_agg(stage, count), '{}'::jsonb) FROM rewrite_stages),
+ 'compaction_stages', (SELECT COALESCE(jsonb_object_agg(stage, count), '{}'::jsonb) FROM compact_stages)
+)`, jobIDs).Scan(&raw)
+	if err != nil {
+		return OverviewStats{}, fmt.Errorf("query overview stats: %w", err)
+	}
+	var value struct {
+		OriginalArtifacts          int            `json:"original_artifacts"`
+		RewrittenOriginalArtifacts int            `json:"rewritten_original_artifacts"`
+		InputArtifacts             int            `json:"input_artifacts"`
+		InitialClickHouseParts     string         `json:"initial_clickhouse_parts"`
+		DurableArtifacts           int            `json:"durable_artifacts"`
+		DurableClickHouseParts     string         `json:"durable_clickhouse_parts"`
+		ActiveCompactionBatches    int            `json:"active_compaction_batches"`
+		ActiveCompactionInputs     int            `json:"active_compaction_inputs"`
+		ActiveCompactionInputParts string         `json:"active_compaction_input_parts"`
+		ActiveCompactionParts      string         `json:"active_compaction_parts"`
+		ActiveMerges               string         `json:"active_merges"`
+		MergeProgress              float64        `json:"merge_progress"`
+		OldestCompactingAt         string         `json:"oldest_compacting_at"`
+		RewriteWorkers             int            `json:"rewrite_workers"`
+		CompactionWorkers          int            `json:"compaction_workers"`
+		RewriteStages              map[string]int `json:"rewrite_stages"`
+		CompactionStages           map[string]int `json:"compaction_stages"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return OverviewStats{}, fmt.Errorf("decode overview stats: %w", err)
+	}
+	parse := func(name, input string) (uint64, error) {
+		n, err := strconv.ParseUint(input, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse overview %s: %w", name, err)
+		}
+		return n, nil
+	}
+	initialParts, err := parse("initial ClickHouse parts", value.InitialClickHouseParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	durableParts, err := parse("durable ClickHouse parts", value.DurableClickHouseParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	activeInputParts, err := parse("active compaction input parts", value.ActiveCompactionInputParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	activeParts, err := parse("active compaction parts", value.ActiveCompactionParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	activeMerges, err := parse("active merges", value.ActiveMerges)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	return OverviewStats{
+		OriginalArtifacts:          value.OriginalArtifacts,
+		RewrittenOriginalArtifacts: value.RewrittenOriginalArtifacts,
+		InputArtifacts:             value.InputArtifacts,
+		InitialClickHouseParts:     initialParts,
+		DurableArtifacts:           value.DurableArtifacts,
+		DurableClickHouseParts:     durableParts,
+		ActiveCompactionBatches:    value.ActiveCompactionBatches,
+		ActiveCompactionInputs:     value.ActiveCompactionInputs,
+		ActiveCompactionInputParts: activeInputParts,
+		ActiveCompactionParts:      activeParts,
+		ActiveMerges:               activeMerges,
+		MergeProgress:              value.MergeProgress,
+		OldestCompactingAt:         value.OldestCompactingAt,
+		RewriteWorkers:             value.RewriteWorkers,
+		CompactionWorkers:          value.CompactionWorkers,
+		RewriteStages:              value.RewriteStages,
+		CompactionStages:           value.CompactionStages,
+	}, nil
 }
 
 func (s *Store) ListJobParts(ctx context.Context, jobID string) ([]Part, error) {

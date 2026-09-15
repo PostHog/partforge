@@ -310,6 +310,70 @@ func TestPostgresListJobsAggregatesCompletedSourceBytes(t *testing.T) {
 	}
 }
 
+func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC()
+	original := func(id string, status Status, parts uint64) Part {
+		p := NewPart("job", id, "bucket", "source/"+id, "finished/"+id, now)
+		p.Status = status
+		p.CompactReadyAt = formatTime(now)
+		p.DestinationDatabase = "db"
+		p.DestinationTable = "table"
+		p.DestinationSchema = "CREATE TABLE db.table (x UInt64) ENGINE=MergeTree ORDER BY x"
+		p.DestinationActivePartCount = parts
+		p.DestinationActivePartBytes = parts * 100
+		p.DestinationActivePartitionCounts = map[string]uint64{"p": parts}
+		return p
+	}
+	first := original("first", StatusSuperseded, 6)
+	first.SupersededBy = "compact-done"
+	second := original("second", StatusSuperseded, 4)
+	second.SupersededBy = "compact-done"
+	third := original("third", StatusCompacting, 5)
+	fourth := original("fourth", StatusCompacting, 5)
+	for _, p := range []*Part{&third, &fourth} {
+		p.WorkerID = "compactor"
+		p.CompactingAt = formatTime(now)
+		p.CompactOutputPartID = "compact-active"
+		p.CompactInputPartCount = 10
+		p.CompactInputBytes = 1000
+		p.CompactOutputPartCount = 2
+		p.CompactActiveMerges = 2
+		p.CompactMergeProgress = 0.375
+		p.CompactStage = "merging"
+	}
+	done := NewCompactPart("job", "compact-done", "bucket", "finished/compact-done", "db", "table", "CREATE TABLE db.table (x UInt64) ENGINE=MergeTree ORDER BY x", []string{"first", "second"}, 1, PartStats{Count: 3, Bytes: 300}, map[string]uint64{"p": 3}, now, now)
+	done.Status = StatusFinished
+	done.FinishedAt = formatTime(now)
+	pending := NewPart("job", "pending", "bucket", "source/pending", "finished/pending", now)
+	inProgress := NewPart("job", "active", "bucket", "source/active", "finished/active", now)
+	inProgress.Status = StatusInProgress
+	inProgress.WorkerID = "rewriter"
+	inProgress.RewriteStage = "insert_select"
+	seedPostgresParts(t, s, []Part{first, second, third, fourth, done, pending, inProgress})
+
+	stats, err := s.OverviewStats(ctx, []string{"job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.OriginalArtifacts != 6 || stats.RewrittenOriginalArtifacts != 4 || stats.InputArtifacts != 4 {
+		t.Fatalf("artifact stats = %+v", stats)
+	}
+	if stats.InitialClickHouseParts != 20 || stats.DurableArtifacts != 1 || stats.DurableClickHouseParts != 3 {
+		t.Fatalf("durable stats = %+v", stats)
+	}
+	if stats.ActiveCompactionBatches != 1 || stats.ActiveCompactionInputs != 2 || stats.ActiveCompactionInputParts != 10 || stats.ActiveCompactionParts != 2 {
+		t.Fatalf("active compact stats = %+v", stats)
+	}
+	if stats.ActiveMerges != 2 || stats.MergeProgress != 0.375 || stats.RewriteWorkers != 1 || stats.CompactionWorkers != 1 {
+		t.Fatalf("worker progress = %+v", stats)
+	}
+	if stats.RewriteStages["insert_select"] != 1 || stats.CompactionStages["merging"] != 1 {
+		t.Fatalf("stages = rewrite:%v compact:%v", stats.RewriteStages, stats.CompactionStages)
+	}
+}
+
 func TestPostgresCompactScheduling(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)

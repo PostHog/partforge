@@ -112,6 +112,12 @@ The destination table must be empty by default. Set -require-empty=false only wh
 		Details: "Use -json when another tool needs stable machine-readable output.",
 	},
 	{
+		Name:    "overview",
+		Usage:   "[flags]",
+		Summary: "Show aggregate rewrite, compaction, and import progress across jobs.",
+		Details: "By default, fully imported jobs are excluded. Repeat -job-id to inspect one campaign, or use -all to include imported jobs. Use -json for machine-readable output.",
+	},
+	{
 		Name:    "job-status",
 		Usage:   "[flags]",
 		Summary: "Show one job's progress, state counts, compact finalization ETA, and failed part errors.",
@@ -280,6 +286,8 @@ func run() error {
 		return runImportFinished(ctx, os.Args[2:])
 	case "list-jobs":
 		return runListJobs(ctx, os.Args[2:])
+	case "overview":
+		return runOverview(ctx, os.Args[2:])
 	case "job-status":
 		return runJobStatus(ctx, os.Args[2:])
 	case "retry-failed":
@@ -2823,6 +2831,103 @@ func runListJobs(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runOverview(ctx context.Context, args []string) error {
+	fs := newCommandFlagSet("overview")
+	var (
+		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		jobIDs          jobIDListFlag
+		includeAll      = fs.Bool("all", false, "include fully imported jobs")
+		compactWindow   = fs.Duration("compact-window", defaultCompactWindow, "worker compact window used to report finalization readiness")
+		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		postgresURL     = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
+	)
+	fs.Var(&jobIDs, "job-id", "job id to include; may be repeated")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "overview"); err != nil {
+		return err
+	}
+	if *includeAll && len(jobIDs) > 0 {
+		return errors.New("all cannot be combined with job-id")
+	}
+	if *compactWindow < 0 {
+		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
+	}
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *postgresURL,
+		IAMAuth:  *postgresIAMAuth,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobs, err := stateStore.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	jobs, err = selectOverviewJobs(jobs, jobIDs, *includeAll)
+	if err != nil {
+		return err
+	}
+	selectedIDs := make([]string, len(jobs))
+	for i, job := range jobs {
+		selectedIDs[i] = job.JobID
+	}
+	stats, err := stateStore.OverviewStats(ctx, selectedIDs)
+	if err != nil {
+		return err
+	}
+	overview := buildOverview(jobs, stats, time.Now().UTC(), *compactWindow)
+	if *jsonOutput {
+		return writeJSON(os.Stdout, overview)
+	}
+	printOverview(os.Stdout, overview)
+	return nil
+}
+
+func selectOverviewJobs(jobs []state.Job, selected []string, includeAll bool) ([]state.Job, error) {
+	if len(selected) == 0 {
+		if includeAll {
+			return jobs, nil
+		}
+		out := make([]state.Job, 0, len(jobs))
+		for _, job := range jobs {
+			if buildListJobDetail(job).Status != "IMPORTED" {
+				out = append(out, job)
+			}
+		}
+		return out, nil
+	}
+	wanted := make(map[string]struct{}, len(selected))
+	for _, jobID := range selected {
+		if _, exists := wanted[jobID]; exists {
+			return nil, fmt.Errorf("job-id %q was repeated", jobID)
+		}
+		wanted[jobID] = struct{}{}
+	}
+	out := make([]state.Job, 0, len(selected))
+	for _, job := range jobs {
+		if _, ok := wanted[job.JobID]; ok {
+			out = append(out, job)
+			delete(wanted, job.JobID)
+		}
+	}
+	if len(wanted) > 0 {
+		missing := make([]string, 0, len(wanted))
+		for jobID := range wanted {
+			missing = append(missing, jobID)
+		}
+		sort.Strings(missing)
+		return nil, fmt.Errorf("jobs not found: %s", strings.Join(missing, ", "))
+	}
+	return out, nil
+}
+
 func buildListJobsOutput(jobs []state.Job) listJobsOutput {
 	out := listJobsOutput{
 		Jobs:    make([]string, 0, len(jobs)),
@@ -2901,6 +3006,233 @@ func buildListJobDetailAt(job state.Job, now time.Time) listJobDetail {
 		UpdatedAt:            job.UpdatedAt,
 		StatusCounts:         listJobStatusCounts(job.Counts),
 	}
+}
+
+func buildOverview(jobs []state.Job, stats state.OverviewStats, now time.Time, compactWindow time.Duration) overviewOutput {
+	counts := map[state.Status]int{}
+	jobStatuses := map[string]int{}
+	var sourceBytesTotal, sourceBytesDone uint64
+	rewriteStartedAt, lastUpdatedAt := "", ""
+	failedJobs := 0
+	for _, job := range jobs {
+		status := buildListJobDetailAt(job, now).Status
+		jobStatuses[status]++
+		if job.Counts[state.StatusFailed] > 0 {
+			failedJobs++
+		}
+		for partStatus, count := range job.Counts {
+			counts[partStatus] += count
+		}
+		sourceBytesTotal += job.SourceBytesTotal
+		sourceBytesDone += job.SourceBytesCompleted
+		if job.RewriteStartedAt != "" && (rewriteStartedAt == "" || job.RewriteStartedAt < rewriteStartedAt) {
+			rewriteStartedAt = job.RewriteStartedAt
+		}
+		if job.UpdatedAt > lastUpdatedAt {
+			lastUpdatedAt = job.UpdatedAt
+		}
+	}
+	rewriteJob := state.Job{
+		SourceBytesTotal:     sourceBytesTotal,
+		SourceBytesCompleted: sourceBytesDone,
+		RewriteStartedAt:     rewriteStartedAt,
+	}
+	currentArtifacts := stats.DurableArtifacts + stats.ActiveCompactionBatches
+	currentParts := stats.DurableClickHouseParts + stats.ActiveCompactionParts
+	var reductionPercent, reductionRatio *float64
+	if stats.InitialClickHouseParts > 0 && currentParts <= stats.InitialClickHouseParts {
+		value := float64(stats.InitialClickHouseParts-currentParts) / float64(stats.InitialClickHouseParts) * 100
+		reductionPercent = &value
+		if currentParts > 0 {
+			value := float64(stats.InitialClickHouseParts) / float64(currentParts)
+			reductionRatio = &value
+		}
+	}
+	failedArtifacts := counts[state.StatusFailed]
+	status := "EMPTY"
+	switch {
+	case failedArtifacts > 0:
+		status = "ATTENTION"
+	case counts[state.StatusReady]+counts[state.StatusInProgress]+counts[state.StatusCompactReady]+counts[state.StatusCompacting]+counts[state.StatusImporting] > 0:
+		status = "RUNNING"
+	case counts[state.StatusFinished] > 0:
+		status = "READY_FOR_IMPORT"
+	case counts[state.StatusImported] > 0:
+		status = "COMPLETE"
+	}
+	etaSeconds := listJobETA(rewriteJob, now)
+	etaAt := ""
+	if etaSeconds != nil {
+		etaAt = now.Add(time.Duration(*etaSeconds) * time.Second).Format(time.RFC3339)
+	}
+	return overviewOutput{
+		Status: status,
+		Jobs: overviewJobs{
+			Total:    len(jobs),
+			ByStatus: jobStatuses,
+		},
+		Rewrite: overviewRewrite{
+			ArtifactsTotal:     stats.OriginalArtifacts,
+			ArtifactsCompleted: stats.RewrittenOriginalArtifacts,
+			ArtifactsReady:     counts[state.StatusReady],
+			ArtifactsActive:    counts[state.StatusInProgress],
+			Workers:            stats.RewriteWorkers,
+			Stages:             stats.RewriteStages,
+			SourceBytesTotal:   sourceBytesTotal,
+			SourceBytesDone:    sourceBytesDone,
+			ProgressPercent:    bytePercent(sourceBytesDone, sourceBytesTotal),
+			ETASeconds:         etaSeconds,
+			ETAAt:              etaAt,
+		},
+		Compaction: overviewCompaction{
+			InputArtifacts:            stats.InputArtifacts,
+			InitialClickHouseParts:    stats.InitialClickHouseParts,
+			CurrentArtifacts:          currentArtifacts,
+			DurableArtifacts:          stats.DurableArtifacts,
+			CurrentClickHouseParts:    currentParts,
+			DurableClickHouseParts:    stats.DurableClickHouseParts,
+			PartReductionPercent:      reductionPercent,
+			PartReductionRatio:        reductionRatio,
+			ActiveBatches:             stats.ActiveCompactionBatches,
+			ActiveBatchInputArtifacts: stats.ActiveCompactionInputs,
+			ActiveBatchInputParts:     stats.ActiveCompactionInputParts,
+			ActiveBatchCurrentParts:   stats.ActiveCompactionParts,
+			ActiveMerges:              stats.ActiveMerges,
+			MergeProgressPercent:      stats.MergeProgress * 100,
+			Workers:                   stats.CompactionWorkers,
+			Stages:                    stats.CompactionStages,
+			OldestBatchAt:             stats.OldestCompactingAt,
+			Finalization:              overviewFinalizationForJobs(jobs, now, compactWindow),
+		},
+		Import: overviewImport{
+			JobsReady:          jobStatuses["READY_FOR_IMPORT"],
+			JobsImporting:      jobStatuses["IMPORTING"],
+			JobsImported:       jobStatuses["IMPORTED"],
+			ArtifactsReady:     counts[state.StatusFinished],
+			ArtifactsImporting: counts[state.StatusImporting],
+			ArtifactsImported:  counts[state.StatusImported],
+		},
+		Attention: overviewAttention{
+			FailedJobs:      failedJobs,
+			FailedArtifacts: failedArtifacts,
+		},
+		LastUpdatedAt: lastUpdatedAt,
+	}
+}
+
+func overviewFinalizationForJobs(jobs []state.Job, now time.Time, compactWindow time.Duration) overviewFinalization {
+	var out overviewFinalization
+	for _, job := range jobs {
+		ready := job.Counts[state.StatusCompactReady]
+		compacting := job.Counts[state.StatusCompacting]
+		if ready == 0 && compacting == 0 {
+			continue
+		}
+		if job.NormalizedCompactReady {
+			out.ReadyNow++
+			continue
+		}
+		if ready == 0 || job.Counts[state.StatusReady]+job.Counts[state.StatusInProgress]+compacting+job.Counts[state.StatusFailed] > 0 {
+			out.Blocked++
+			continue
+		}
+		readyAt, err := time.Parse(time.RFC3339Nano, job.LatestOriginalCompactReadyAt)
+		if err != nil {
+			out.Unknown++
+			continue
+		}
+		finalizeAfter := readyAt.Add(compactWindow)
+		if !now.Before(finalizeAfter) {
+			out.ReadyNow++
+			continue
+		}
+		out.WaitingWindow++
+		value := finalizeAfter.UTC().Format(time.RFC3339Nano)
+		if value > out.LatestAfter {
+			out.LatestAfter = value
+		}
+	}
+	return out
+}
+
+func printOverview(out io.Writer, overview overviewOutput) {
+	fmt.Fprintln(out, "PARTFORGE OVERVIEW")
+	fmt.Fprintf(out, "status: %s\n", overview.Status)
+	fmt.Fprintf(out, "jobs: %d", overview.Jobs.Total)
+	if value := formatStringCounts(overview.Jobs.ByStatus); value != "" {
+		fmt.Fprintf(out, " (%s)", value)
+	}
+	fmt.Fprintln(out)
+	if overview.LastUpdatedAt != "" {
+		fmt.Fprintf(out, "last_update: %s\n", overview.LastUpdatedAt)
+	}
+
+	fmt.Fprintln(out, "\nREWRITE")
+	fmt.Fprintf(out, "data: %s/%s %.1f%%\n", formatBytes(overview.Rewrite.SourceBytesDone), formatBytes(overview.Rewrite.SourceBytesTotal), overview.Rewrite.ProgressPercent)
+	fmt.Fprintf(out, "artifacts: %d/%d complete, ready=%d active=%d workers=%d\n", overview.Rewrite.ArtifactsCompleted, overview.Rewrite.ArtifactsTotal, overview.Rewrite.ArtifactsReady, overview.Rewrite.ArtifactsActive, overview.Rewrite.Workers)
+	if value := formatStringCounts(overview.Rewrite.Stages); value != "" {
+		fmt.Fprintf(out, "stages: %s\n", value)
+	}
+	if overview.Rewrite.ETASeconds == nil {
+		fmt.Fprintln(out, "eta: -")
+	} else {
+		fmt.Fprintf(out, "eta: %s", formatListJobETA(overview.Rewrite.ETASeconds))
+		if overview.Rewrite.ETAAt != "" && *overview.Rewrite.ETASeconds > 0 {
+			fmt.Fprintf(out, " (%s)", overview.Rewrite.ETAAt)
+		}
+		fmt.Fprintln(out)
+	}
+
+	fmt.Fprintln(out, "\nCOMPACTION")
+	fmt.Fprintf(out, "input_artifacts: %d\n", overview.Compaction.InputArtifacts)
+	fmt.Fprintf(out, "initial_ch_parts: %d", overview.Compaction.InitialClickHouseParts)
+	if overview.Rewrite.ArtifactsCompleted < overview.Rewrite.ArtifactsTotal {
+		fmt.Fprintf(out, " observed from %d/%d rewritten artifacts", overview.Rewrite.ArtifactsCompleted, overview.Rewrite.ArtifactsTotal)
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "current_artifacts: %d (durable=%d active_batches=%d)\n", overview.Compaction.CurrentArtifacts, overview.Compaction.DurableArtifacts, overview.Compaction.ActiveBatches)
+	fmt.Fprintf(out, "current_ch_parts: %d (durable=%d live=%d)\n", overview.Compaction.CurrentClickHouseParts, overview.Compaction.DurableClickHouseParts, overview.Compaction.ActiveBatchCurrentParts)
+	if overview.Compaction.PartReductionPercent != nil {
+		fmt.Fprintf(out, "part_reduction: %d -> %d (%.1f%% fewer", overview.Compaction.InitialClickHouseParts, overview.Compaction.CurrentClickHouseParts, *overview.Compaction.PartReductionPercent)
+		if overview.Compaction.PartReductionRatio != nil {
+			fmt.Fprintf(out, ", %.1fx reduction", *overview.Compaction.PartReductionRatio)
+		}
+		fmt.Fprintln(out, ")")
+	} else {
+		fmt.Fprintln(out, "part_reduction: -")
+	}
+	fmt.Fprintf(out, "active: batches=%d input_artifacts=%d input_parts=%d current_parts=%d merges=%d merge_wave=%.1f%% workers=%d\n", overview.Compaction.ActiveBatches, overview.Compaction.ActiveBatchInputArtifacts, overview.Compaction.ActiveBatchInputParts, overview.Compaction.ActiveBatchCurrentParts, overview.Compaction.ActiveMerges, overview.Compaction.MergeProgressPercent, overview.Compaction.Workers)
+	if value := formatStringCounts(overview.Compaction.Stages); value != "" {
+		fmt.Fprintf(out, "stages: %s\n", value)
+	}
+	finalize := overview.Compaction.Finalization
+	fmt.Fprintf(out, "finalize: ready_now=%d waiting_window=%d blocked=%d unknown=%d", finalize.ReadyNow, finalize.WaitingWindow, finalize.Blocked, finalize.Unknown)
+	if finalize.LatestAfter != "" {
+		fmt.Fprintf(out, " latest_after=%s", finalize.LatestAfter)
+	}
+	fmt.Fprintln(out)
+
+	fmt.Fprintln(out, "\nIMPORT")
+	fmt.Fprintf(out, "jobs: ready=%d importing=%d imported=%d\n", overview.Import.JobsReady, overview.Import.JobsImporting, overview.Import.JobsImported)
+	fmt.Fprintf(out, "artifacts: ready=%d importing=%d imported=%d\n", overview.Import.ArtifactsReady, overview.Import.ArtifactsImporting, overview.Import.ArtifactsImported)
+
+	fmt.Fprintln(out, "\nATTENTION")
+	fmt.Fprintf(out, "failed: artifacts=%d jobs=%d\n", overview.Attention.FailedArtifacts, overview.Attention.FailedJobs)
+}
+
+func formatStringCounts(counts map[string]int) string {
+	keys := make([]string, 0, len(counts))
+	for key, count := range counts {
+		if count > 0 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, fmt.Sprintf("%s=%d", key, counts[key]))
+	}
+	return strings.Join(values, ", ")
 }
 
 func listJobStatusCounts(counts map[state.Status]int) []statusCount {
@@ -4281,6 +4613,78 @@ type listJobDetail struct {
 	StatusCounts         []statusCount `json:"status_counts,omitempty"`
 }
 
+type overviewOutput struct {
+	Status        string             `json:"status"`
+	Jobs          overviewJobs       `json:"jobs"`
+	Rewrite       overviewRewrite    `json:"rewrite"`
+	Compaction    overviewCompaction `json:"compaction"`
+	Import        overviewImport     `json:"import"`
+	Attention     overviewAttention  `json:"attention"`
+	LastUpdatedAt string             `json:"last_updated_at,omitempty"`
+}
+
+type overviewJobs struct {
+	Total    int            `json:"total"`
+	ByStatus map[string]int `json:"by_status"`
+}
+
+type overviewRewrite struct {
+	ArtifactsTotal     int            `json:"artifacts_total"`
+	ArtifactsCompleted int            `json:"artifacts_completed"`
+	ArtifactsReady     int            `json:"artifacts_ready"`
+	ArtifactsActive    int            `json:"artifacts_active"`
+	Workers            int            `json:"workers"`
+	Stages             map[string]int `json:"stages,omitempty"`
+	SourceBytesTotal   uint64         `json:"source_bytes_total"`
+	SourceBytesDone    uint64         `json:"source_bytes_done"`
+	ProgressPercent    float64        `json:"progress_percent"`
+	ETASeconds         *int64         `json:"eta_seconds,omitempty"`
+	ETAAt              string         `json:"eta_at,omitempty"`
+}
+
+type overviewCompaction struct {
+	InputArtifacts            int                  `json:"input_artifacts"`
+	InitialClickHouseParts    uint64               `json:"initial_clickhouse_parts"`
+	CurrentArtifacts          int                  `json:"current_artifacts"`
+	DurableArtifacts          int                  `json:"durable_artifacts"`
+	CurrentClickHouseParts    uint64               `json:"current_clickhouse_parts"`
+	DurableClickHouseParts    uint64               `json:"durable_clickhouse_parts"`
+	PartReductionPercent      *float64             `json:"part_reduction_percent,omitempty"`
+	PartReductionRatio        *float64             `json:"part_reduction_ratio,omitempty"`
+	ActiveBatches             int                  `json:"active_batches"`
+	ActiveBatchInputArtifacts int                  `json:"active_batch_input_artifacts"`
+	ActiveBatchInputParts     uint64               `json:"active_batch_input_parts"`
+	ActiveBatchCurrentParts   uint64               `json:"active_batch_current_parts"`
+	ActiveMerges              uint64               `json:"active_merges"`
+	MergeProgressPercent      float64              `json:"merge_progress_percent"`
+	Workers                   int                  `json:"workers"`
+	Stages                    map[string]int       `json:"stages,omitempty"`
+	OldestBatchAt             string               `json:"oldest_batch_at,omitempty"`
+	Finalization              overviewFinalization `json:"finalization"`
+}
+
+type overviewFinalization struct {
+	ReadyNow      int    `json:"ready_now"`
+	WaitingWindow int    `json:"waiting_window"`
+	Blocked       int    `json:"blocked"`
+	Unknown       int    `json:"unknown"`
+	LatestAfter   string `json:"latest_after,omitempty"`
+}
+
+type overviewImport struct {
+	JobsReady          int `json:"jobs_ready"`
+	JobsImporting      int `json:"jobs_importing"`
+	JobsImported       int `json:"jobs_imported"`
+	ArtifactsReady     int `json:"artifacts_ready"`
+	ArtifactsImporting int `json:"artifacts_importing"`
+	ArtifactsImported  int `json:"artifacts_imported"`
+}
+
+type overviewAttention struct {
+	FailedJobs      int `json:"failed_jobs"`
+	FailedArtifacts int `json:"failed_artifacts"`
+}
+
 type retryFailedOutput struct {
 	JobID      string        `json:"job_id"`
 	Forced     bool          `json:"forced"`
@@ -5081,6 +5485,21 @@ func (f *partIDListFlag) Set(value string) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return errors.New("part-id must not be empty")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+type jobIDListFlag []string
+
+func (f *jobIDListFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *jobIDListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("job-id must not be empty")
 	}
 	*f = append(*f, value)
 	return nil
