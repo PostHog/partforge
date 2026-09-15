@@ -120,6 +120,9 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker migrate -postgres
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 
 docker compose exec -T clickhouse clickhouse-client --query \
+  "INSERT INTO src.events VALUES (6, 'excluded', 60, '2024-02-01')"
+
+docker compose exec -T clickhouse clickhouse-client --query \
   "BACKUP TABLE src.events TO S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')"
 
 docker compose exec -T clickhouse clickhouse-client --query \
@@ -156,7 +159,7 @@ fi
 
 incremental_part_count="$(
   docker compose exec -T clickhouse clickhouse-client --query \
-    "SELECT countDistinct(_part) FROM src.events"
+    "SELECT countDistinct(_part) FROM src.events WHERE toYYYYMM(event_date) = 202401"
 )"
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
@@ -165,6 +168,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   worker \
   upload-backup \
   -backup=s3://partforge/e2e-native-incremental \
+  --include-partitions=202401 \
   -database=src \
   -table=events \
   -destination-schema-file=e2e/sql/destination.sql \
@@ -235,6 +239,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   worker \
   upload-backup \
   -backup=s3://partforge/e2e-native-backup \
+  --include-partitions=202401 \
   -database=src \
   -table=events \
   -destination-schema-file=e2e/sql/destination.sql \

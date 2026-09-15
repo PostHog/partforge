@@ -122,6 +122,8 @@ partforge upload-backup \
   -zero-copy
 ```
 
+Add `-include-partitions=202401,202402` to include only those exact partition IDs (the prefix before the first underscore in a part name). Spaces around IDs are ignored; every requested ID must exist in the selected table. Omit the flag to include all partitions. The filter applies to both copying and `-zero-copy`.
+
 The path must be the exact full or incremental backup prefix. Incrementals are resolved through their `base_backup` chain; each locator must use `S3('s3://bucket/prefix')`. `-zero-copy` stores only manifests in the PartForge source prefix; workers fetch source files from every referenced backup layer, while all finished artifacts still use the PartForge bucket. Omit it to materialize an independent copy. Lightweight and encrypted backups are rejected.
 
 For multiple shards with the same destination schema and insert-select, run the first `upload-freeze` with the SQL files and later shards with `-copy-sql-from-job=<first-job-id>`. To test another destination schema against the same uploaded source parts, run `upload-freeze -copy-parts-from-job=<source-job-id>` with the new SQL files.

@@ -3,9 +3,84 @@ package chbackup
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestPrepareIncludesPartitions(t *testing.T) {
+	index := writeIndex(t, `<config><version>1</version><contents>`+
+		`<file><name>data/src/events/202401_1_1_0/checksums.txt</name><size>10</size><checksum>a</checksum></file>`+
+		`<file><name>data/src/events/202401_2_2_0_5/checksums.txt</name><size>10</size><checksum>a</checksum></file>`+
+		`<file><name>data/src/events/202402_3_3_0/checksums.txt</name><size>10</size><checksum>a</checksum></file>`+
+		`<file><name>data/src/events/all_4_4_0/checksums.txt</name><size>10</size><checksum>a</checksum><data_file>data/src/events/202402_3_3_0/checksums.txt</data_file></file>`+
+		`<file><name>metadata/src/events.sql</name><size>50</size><checksum>b</checksum></file>`+
+		`</contents></config>`)
+	for _, tt := range []struct {
+		include string
+		want    []string
+		err     string
+	}{
+		{"", []string{"202401_1_1_0", "202401_2_2_0_5", "202402_3_3_0", "all_4_4_0"}, ""},
+		{"202401", []string{"202401_1_1_0", "202401_2_2_0_5"}, ""},
+		{" 202401, all,202401 ", []string{"202401_1_1_0", "202401_2_2_0_5", "all_4_4_0"}, ""},
+		{"20240", nil, `partition ID "20240" not found`},
+		{"202401,missing", nil, `partition ID "missing" not found`},
+		{"202401,", nil, "empty partition ID"},
+		{" ", nil, "empty partition ID"},
+	} {
+		t.Run(tt.include, func(t *testing.T) {
+			plan, err := Prepare([]Layer{{Bucket: "backups", Prefix: "full", IndexPath: index}}, "src", "events", tt.include)
+			if tt.err != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.err) {
+					t.Fatalf("error = %v, want %q", err, tt.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			if err := plan.ScanParts(func(part Part) error {
+				names = append(names, part.Name)
+				if part.Name == "all_4_4_0" && part.Files[0].Segments[0].Key != "full/data/src/events/202402_3_3_0/checksums.txt" {
+					t.Fatalf("excluded partition's deduplicated source lost: %+v", part)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(names, tt.want) || plan.Info().PartCount != len(tt.want) {
+				t.Fatalf("parts = %v, count = %d; want %v", names, plan.Info().PartCount, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareSkipsExcludedPartitionBaseRequirements(t *testing.T) {
+	index := writeIndex(t, `<config><version>1</version><contents>`+
+		`<file><name>data/src/events/202401_1_1_0/checksums.txt</name><size>10</size><checksum>a</checksum></file>`+
+		`<file><name>data/src/events/202402_2_2_0/checksums.txt</name><size>10</size><checksum>b</checksum><use_base>true</use_base></file>`+
+		`<file><name>metadata/src/events.sql</name><size>50</size><checksum>c</checksum></file>`+
+		`</contents></config>`)
+	plan, err := Prepare([]Layer{{Bucket: "backups", Prefix: "incremental", IndexPath: index}}, "src", "events", "202401")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	if err := plan.ScanParts(func(part Part) error {
+		count++
+		if part.Name != "202401_1_1_0" {
+			t.Fatalf("unexpected part: %s", part.Name)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || plan.Info().PartCount != 1 {
+		t.Fatalf("parts = %d/%d, want 1", count, plan.Info().PartCount)
+	}
+}
 
 func TestPrepareResolvesFullBackupDeduplication(t *testing.T) {
 	index := writeIndex(t, `<config><version>1</version><uuid>full</uuid><contents>`+
@@ -14,7 +89,7 @@ func TestPrepareResolvesFullBackupDeduplication(t *testing.T) {
 		`<file><name>data/src/events/all_2_2_0/checksums.txt</name><size>10</size><checksum>a</checksum><data_file>data/src/events/all_1_1_0/checksums.txt</data_file></file>`+
 		`<file><name>metadata/src/events.sql</name><size>50</size><checksum>b</checksum></file>`+
 		`</contents></config>`)
-	plan, err := Prepare([]Layer{{Bucket: "backups", Prefix: "full", IndexPath: index}}, "src", "events")
+	plan, err := Prepare([]Layer{{Bucket: "backups", Prefix: "full", IndexPath: index}}, "src", "events", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +125,7 @@ func TestPrepareResolvesIncrementalRenameAndPartialFile(t *testing.T) {
 	plan, err := Prepare([]Layer{
 		{Bucket: "backups", Prefix: "incremental", IndexPath: head},
 		{Bucket: "backups", Prefix: "base", IndexPath: base},
-	}, "src", "events")
+	}, "src", "events", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +148,7 @@ func TestPrepareRejectsUnsafePath(t *testing.T) {
 	index := writeIndex(t, `<config><version>1</version><contents>`+
 		`<file><name>data/src/events/all_1_1_0/../../escape</name><size>1</size><checksum>a</checksum></file>`+
 		`</contents></config>`)
-	_, err := Prepare([]Layer{{Bucket: "bucket", Prefix: "backup", IndexPath: index}}, "src", "events")
+	_, err := Prepare([]Layer{{Bucket: "bucket", Prefix: "backup", IndexPath: index}}, "src", "events", "")
 	if err == nil || !strings.Contains(err.Error(), "unsafe path") {
 		t.Fatalf("error = %v", err)
 	}

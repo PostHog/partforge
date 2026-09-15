@@ -165,6 +165,8 @@ partforge upload-backup \
   -zero-copy
 ```
 
+Add `-include-partitions=202401,202402` to include only those exact partition IDs (the prefix before the first underscore in a part name). Spaces around IDs are ignored; every requested ID must exist in the selected table. Omit the flag to include all partitions. The filter applies to both copying and `-zero-copy`.
+
 `-backup` must identify the exact prefix containing `.backup`, `metadata/`, and `data/`. For an incremental, the command follows `base_backup` recursively and validates each `base_backup_uuid`; S3 base locators must have the form `S3('s3://bucket/prefix')`. It resolves ClickHouse's checksum-based file reuse, including files made from a base prefix plus an incremental suffix, and registers `READY` rows. By default it materializes each logical part into PartForge's normal source layout. With `-zero-copy`, it stores ordered source pointers and workers download files directly from all referenced backup layers; finished and compacted artifacts still go to the PartForge bucket. Every referenced backup must remain available until the job finishes. Lightweight and encrypted backups are unsupported. `-copy-sql-from-job` is supported in place of the two SQL files.
 
 ### 4. worker

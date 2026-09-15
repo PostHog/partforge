@@ -421,6 +421,7 @@ func runUploadBackup(ctx context.Context, args []string) error {
 	var (
 		configPath            = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
 		backupURI             = fs.String("backup", "", "exact s3://bucket/prefix of a native ClickHouse backup")
+		includePartitions     = fs.String("include-partitions", "", "comma-separated partition IDs to include; empty includes all partitions")
 		database              = fs.String("database", "", "source database stored in the backup")
 		table                 = fs.String("table", "", "source table stored in the backup")
 		destinationSchemaFile = fs.String("destination-schema-file", "", "path to SQL file containing the full destination CREATE TABLE")
@@ -474,7 +475,7 @@ func runUploadBackup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	backupPlan, err := chbackup.Prepare(layers, *database, *table)
+	backupPlan, err := chbackup.Prepare(layers, *database, *table, *includePartitions)
 	if err != nil {
 		return err
 	}

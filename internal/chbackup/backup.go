@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"strings"
@@ -48,6 +49,7 @@ type Plan struct {
 	layers       []Layer
 	database     string
 	table        string
+	partitions   map[string]struct{}
 	baseResolved map[contentKey][]Segment
 	info         Info
 }
@@ -121,7 +123,7 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}
 }
 
-func Prepare(layers []Layer, database, table string) (*Plan, error) {
+func Prepare(layers []Layer, database, table, includePartitions string) (*Plan, error) {
 	if len(layers) == 0 {
 		return nil, fmt.Errorf("at least one ClickHouse backup layer is required")
 	}
@@ -134,12 +136,22 @@ func Prepare(layers []Layer, database, table string) (*Plan, error) {
 		}
 	}
 
+	partitions := make(map[string]struct{})
+	if includePartitions != "" {
+		for _, id := range strings.Split(includePartitions, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				return nil, fmt.Errorf("include-partitions contains an empty partition ID")
+			}
+			partitions[id] = struct{}{}
+		}
+	}
 	required := make(map[contentKey]struct{})
 	index, err := os.Open(layers[0].IndexPath)
 	if err != nil {
 		return nil, err
 	}
-	header, metadata, partCount, scanErr := scanTable(index, database, table, func(part rawPart) error {
+	header, metadata, partCount, scanErr := scanTable(index, database, table, partitions, func(part rawPart) error {
 		for _, file := range part.Files {
 			addBaseRequirement(required, file)
 		}
@@ -189,7 +201,7 @@ func Prepare(layers []Layer, database, table string) (*Plan, error) {
 		}
 	}
 
-	plan := &Plan{layers: append([]Layer(nil), layers...), database: database, table: table}
+	plan := &Plan{layers: append([]Layer(nil), layers...), database: database, table: table, partitions: partitions}
 	if len(resolved) > 1 {
 		plan.baseResolved = resolved[1]
 	}
@@ -213,7 +225,7 @@ func (p *Plan) ScanParts(onPart func(Part) error) error {
 	if err != nil {
 		return err
 	}
-	_, _, _, scanErr := scanTable(index, p.database, p.table, func(raw rawPart) error {
+	_, _, _, scanErr := scanTable(index, p.database, p.table, p.partitions, func(raw rawPart) error {
 		part := Part{Name: raw.Name, Bytes: raw.Bytes, Files: make([]File, 0, len(raw.Files))}
 		for _, file := range raw.Files {
 			resolved, err := p.resolveHeadFile(file)
@@ -303,7 +315,8 @@ func findContent(indexPath string, wanted map[contentKey]struct{}) (map[contentK
 	return found, closeErr
 }
 
-func scanTable(r io.Reader, database, table string, onPart func(rawPart) error) (Header, rawFile, int, error) {
+func scanTable(r io.Reader, database, table string, partitions map[string]struct{}, onPart func(rawPart) error) (Header, rawFile, int, error) {
+	missing := maps.Clone(partitions)
 	dataPrefix := path.Join("data", EscapeForFileName(database), EscapeForFileName(table)) + "/"
 	metadataName := path.Join("metadata", EscapeForFileName(database), EscapeForFileName(table)+".sql")
 	var metadata rawFile
@@ -342,6 +355,13 @@ func scanTable(r io.Reader, database, table string, onPart func(rawPart) error) 
 		if partName == "mutations" {
 			return flush()
 		}
+		if len(partitions) > 0 {
+			partitionID, _, _ := strings.Cut(partName, "_")
+			if _, included := partitions[partitionID]; !included {
+				return flush()
+			}
+			delete(missing, partitionID)
+		}
 		if current.Name != partName {
 			if err := flush(); err != nil {
 				return err
@@ -364,6 +384,9 @@ func scanTable(r io.Reader, database, table string, onPart func(rawPart) error) 
 	}
 	if metadata.Name == "" || metadata.Size == 0 {
 		return Header{}, rawFile{}, 0, fmt.Errorf("table %s.%s metadata not found in backup", database, table)
+	}
+	for id := range missing {
+		return Header{}, rawFile{}, 0, fmt.Errorf("partition ID %q not found in backup for table %s.%s", id, database, table)
 	}
 	if partCount == 0 {
 		return Header{}, rawFile{}, 0, fmt.Errorf("table %s.%s has no parts in backup", database, table)
