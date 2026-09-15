@@ -24,7 +24,37 @@ func NormalizeCreateTable(query string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return q[:engineStart] + normalizedEngine + q[engineEnd:], nil
+	return stripTableSetting(q[:engineStart]+normalizedEngine+q[engineEnd:], "storage_policy")
+}
+
+func stripTableSetting(q, name string) (string, error) {
+	idx := indexKeyword(q, "SETTINGS")
+	if idx < 0 {
+		return q, nil
+	}
+	start := idx + len("SETTINGS")
+	settings, err := splitTopLevelArgs(q[start:])
+	if err != nil {
+		return "", err
+	}
+	kept := settings[:0]
+	for _, setting := range settings {
+		pos := 0
+		settingName, err := readIdentifier(setting, &pos)
+		if err != nil {
+			return "", fmt.Errorf("parse table setting: %w", err)
+		}
+		if !strings.EqualFold(settingName, name) {
+			kept = append(kept, setting)
+		}
+	}
+	if len(kept) == len(settings) {
+		return q, nil
+	}
+	if len(kept) == 0 {
+		return strings.TrimSpace(q[:idx]), nil
+	}
+	return q[:start] + " " + strings.Join(kept, ", "), nil
 }
 
 func ForTable(query, database, table string) (string, error) {

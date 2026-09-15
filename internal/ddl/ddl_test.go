@@ -26,6 +26,31 @@ func TestNormalizeReplicatedReplacingMergeTree(t *testing.T) {
 	}
 }
 
+func TestNormalizeStripsStoragePolicy(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{
+			"CREATE TABLE db.t (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS storage_policy = 's3_tiered'",
+			"CREATE TABLE db.t (x UInt64) ENGINE = MergeTree ORDER BY x",
+		},
+		{
+			"CREATE TABLE db.t (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS index_granularity = 8192, storage_policy = 's3_tiered', min_bytes_for_wide_part = 0",
+			"CREATE TABLE db.t (x UInt64) ENGINE = MergeTree ORDER BY x SETTINGS index_granularity = 8192, min_bytes_for_wide_part = 0",
+		},
+	}
+	for _, test := range tests {
+		got, err := NormalizeCreateTable(test.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != test.want {
+			t.Fatalf("got %q, want %q", got, test.want)
+		}
+	}
+}
+
 func TestForTable(t *testing.T) {
 	in := "CREATE TABLE `old_db`.`old_table` (x UInt64) ENGINE = MergeTree ORDER BY x"
 	got, err := ForTable(in, "new_db", "new_table")
