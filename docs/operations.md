@@ -82,7 +82,7 @@ Each part starts from the original insert settings; reductions only apply within
 ## Inspecting jobs
 
 ```sh
-partforge list-jobs                 # compact status, artifact count, byte-weighted progress, ETA, and optional name
+partforge list-jobs                 # aggregate active tasks, job status, artifact count, byte-weighted progress, ETA, and optional name
 partforge job-status -job-id=job-123
 ```
 

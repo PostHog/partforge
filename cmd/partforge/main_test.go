@@ -1672,6 +1672,7 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 	})
 
 	for _, want := range []string{
+		"ACTIVE TASKS  IN_PROGRESS=0, COMPACTING=0",
 		"JOB_ID",
 		"STATUS",
 		"ARTIFACTS",
@@ -1694,6 +1695,19 @@ func TestPrintJobsIncludesNames(t *testing.T) {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("printJobs output contains removed column %q:\n%s", unwanted, got)
 		}
+	}
+}
+
+func TestPrintJobsSummarizesActiveTasks(t *testing.T) {
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobs(out, []state.Job{
+			{Counts: map[state.Status]int{state.StatusInProgress: 1, state.StatusCompacting: 61}},
+			{Counts: map[state.Status]int{state.StatusInProgress: 1, state.StatusCompacting: 202}},
+		})
+	})
+
+	if !strings.HasPrefix(got, "ACTIVE TASKS  IN_PROGRESS=2, COMPACTING=263\n\n") {
+		t.Fatalf("printJobs output missing active task summary at top:\n%s", got)
 	}
 }
 

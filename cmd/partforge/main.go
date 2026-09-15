@@ -2844,6 +2844,12 @@ func buildListJobsOutput(jobs []state.Job) listJobsOutput {
 
 func printJobs(out *os.File, jobs []state.Job) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	inProgress, compacting := 0, 0
+	for _, job := range jobs {
+		inProgress += job.Counts[state.StatusInProgress]
+		compacting += job.Counts[state.StatusCompacting]
+	}
+	fmt.Fprintf(tw, "ACTIVE TASKS\tIN_PROGRESS=%d, COMPACTING=%d\n\n", inProgress, compacting)
 	fmt.Fprintln(tw, "JOB_ID\tSTATUS\tARTIFACTS\tDATA\tETA\tNAME\tCOUNTS")
 	for _, job := range jobs {
 		detail := buildListJobDetail(job)
