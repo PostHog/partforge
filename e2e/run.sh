@@ -460,7 +460,7 @@ overview="$(
     -job-id="$JOB_ID" \
     -postgres-url="$POSTGRES_URL"
 )"
-for metric in input_artifacts initial_ch_parts current_artifacts current_ch_parts part_reduction; do
+for metric in input_artifacts initial_ch_parts current_artifacts current_ch_parts compacted_ch_parts waiting_ch_parts part_reduction; do
   if ! grep -F "$metric:" <<<"$overview" >/dev/null; then
     echo "overview did not contain $metric; output:" >&2
     echo "$overview" >&2

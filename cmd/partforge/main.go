@@ -3040,6 +3040,7 @@ func buildOverview(jobs []state.Job, stats state.OverviewStats, now time.Time, c
 	}
 	currentArtifacts := stats.DurableArtifacts + stats.ActiveCompactionBatches
 	currentParts := stats.DurableClickHouseParts + stats.ActiveCompactionParts
+	currentBytes := stats.DurableClickHouseBytes + stats.ActiveCompactionBytes
 	var reductionPercent, reductionRatio *float64
 	if stats.InitialClickHouseParts > 0 && currentParts <= stats.InitialClickHouseParts {
 		value := float64(stats.InitialClickHouseParts-currentParts) / float64(stats.InitialClickHouseParts) * 100
@@ -3088,16 +3089,25 @@ func buildOverview(jobs []state.Job, stats state.OverviewStats, now time.Time, c
 		Compaction: overviewCompaction{
 			InputArtifacts:            stats.InputArtifacts,
 			InitialClickHouseParts:    stats.InitialClickHouseParts,
+			InitialClickHouseBytes:    stats.InitialClickHouseBytes,
 			CurrentArtifacts:          currentArtifacts,
 			DurableArtifacts:          stats.DurableArtifacts,
 			CurrentClickHouseParts:    currentParts,
 			DurableClickHouseParts:    stats.DurableClickHouseParts,
+			CurrentClickHouseBytes:    currentBytes,
+			DurableClickHouseBytes:    stats.DurableClickHouseBytes,
+			CompactedClickHouseParts:  stats.CompactedClickHouseParts,
+			CompactedClickHouseBytes:  stats.CompactedClickHouseBytes,
+			WaitingClickHouseParts:    stats.WaitingClickHouseParts,
+			WaitingClickHouseBytes:    stats.WaitingClickHouseBytes,
 			PartReductionPercent:      reductionPercent,
 			PartReductionRatio:        reductionRatio,
 			ActiveBatches:             stats.ActiveCompactionBatches,
 			ActiveBatchInputArtifacts: stats.ActiveCompactionInputs,
 			ActiveBatchInputParts:     stats.ActiveCompactionInputParts,
+			ActiveBatchInputBytes:     stats.ActiveCompactionInputBytes,
 			ActiveBatchCurrentParts:   stats.ActiveCompactionParts,
+			ActiveBatchCurrentBytes:   stats.ActiveCompactionBytes,
 			ActiveMerges:              stats.ActiveMerges,
 			MergeProgressPercent:      stats.MergeProgress * 100,
 			Workers:                   stats.CompactionWorkers,
@@ -3190,9 +3200,11 @@ func printOverview(out io.Writer, overview overviewOutput) {
 	if overview.Rewrite.ArtifactsCompleted < overview.Rewrite.ArtifactsTotal {
 		fmt.Fprintf(out, " observed from %d/%d rewritten artifacts", overview.Rewrite.ArtifactsCompleted, overview.Rewrite.ArtifactsTotal)
 	}
-	fmt.Fprintln(out)
+	fmt.Fprintf(out, " (data=%s)\n", formatBytes(overview.Compaction.InitialClickHouseBytes))
 	fmt.Fprintf(out, "current_artifacts: %d (durable=%d active_batches=%d)\n", overview.Compaction.CurrentArtifacts, overview.Compaction.DurableArtifacts, overview.Compaction.ActiveBatches)
-	fmt.Fprintf(out, "current_ch_parts: %d (durable=%d live=%d)\n", overview.Compaction.CurrentClickHouseParts, overview.Compaction.DurableClickHouseParts, overview.Compaction.ActiveBatchCurrentParts)
+	fmt.Fprintf(out, "current_ch_parts: %d (durable=%d live=%d) data=%s (durable=%s live=%s)\n", overview.Compaction.CurrentClickHouseParts, overview.Compaction.DurableClickHouseParts, overview.Compaction.ActiveBatchCurrentParts, formatBytes(overview.Compaction.CurrentClickHouseBytes), formatBytes(overview.Compaction.DurableClickHouseBytes), formatBytes(overview.Compaction.ActiveBatchCurrentBytes))
+	fmt.Fprintf(out, "compacted_ch_parts: %d (data=%s)\n", overview.Compaction.CompactedClickHouseParts, formatBytes(overview.Compaction.CompactedClickHouseBytes))
+	fmt.Fprintf(out, "waiting_ch_parts: %d (data=%s)\n", overview.Compaction.WaitingClickHouseParts, formatBytes(overview.Compaction.WaitingClickHouseBytes))
 	if overview.Compaction.PartReductionPercent != nil {
 		fmt.Fprintf(out, "part_reduction: %d -> %d (%.1f%% fewer", overview.Compaction.InitialClickHouseParts, overview.Compaction.CurrentClickHouseParts, *overview.Compaction.PartReductionPercent)
 		if overview.Compaction.PartReductionRatio != nil {
@@ -3202,7 +3214,7 @@ func printOverview(out io.Writer, overview overviewOutput) {
 	} else {
 		fmt.Fprintln(out, "part_reduction: -")
 	}
-	fmt.Fprintf(out, "active: batches=%d input_artifacts=%d input_parts=%d current_parts=%d merges=%d merge_wave=%.1f%% workers=%d\n", overview.Compaction.ActiveBatches, overview.Compaction.ActiveBatchInputArtifacts, overview.Compaction.ActiveBatchInputParts, overview.Compaction.ActiveBatchCurrentParts, overview.Compaction.ActiveMerges, overview.Compaction.MergeProgressPercent, overview.Compaction.Workers)
+	fmt.Fprintf(out, "active: batches=%d input_artifacts=%d input_parts=%d current_parts=%d merges=%d merge_wave=%.1f%% workers=%d input_data=%s current_data=%s\n", overview.Compaction.ActiveBatches, overview.Compaction.ActiveBatchInputArtifacts, overview.Compaction.ActiveBatchInputParts, overview.Compaction.ActiveBatchCurrentParts, overview.Compaction.ActiveMerges, overview.Compaction.MergeProgressPercent, overview.Compaction.Workers, formatBytes(overview.Compaction.ActiveBatchInputBytes), formatBytes(overview.Compaction.ActiveBatchCurrentBytes))
 	if value := formatStringCounts(overview.Compaction.Stages); value != "" {
 		fmt.Fprintf(out, "stages: %s\n", value)
 	}
@@ -4646,16 +4658,25 @@ type overviewRewrite struct {
 type overviewCompaction struct {
 	InputArtifacts            int                  `json:"input_artifacts"`
 	InitialClickHouseParts    uint64               `json:"initial_clickhouse_parts"`
+	InitialClickHouseBytes    uint64               `json:"initial_clickhouse_bytes"`
 	CurrentArtifacts          int                  `json:"current_artifacts"`
 	DurableArtifacts          int                  `json:"durable_artifacts"`
 	CurrentClickHouseParts    uint64               `json:"current_clickhouse_parts"`
 	DurableClickHouseParts    uint64               `json:"durable_clickhouse_parts"`
+	CurrentClickHouseBytes    uint64               `json:"current_clickhouse_bytes"`
+	DurableClickHouseBytes    uint64               `json:"durable_clickhouse_bytes"`
+	CompactedClickHouseParts  uint64               `json:"compacted_clickhouse_parts"`
+	CompactedClickHouseBytes  uint64               `json:"compacted_clickhouse_bytes"`
+	WaitingClickHouseParts    uint64               `json:"waiting_clickhouse_parts"`
+	WaitingClickHouseBytes    uint64               `json:"waiting_clickhouse_bytes"`
 	PartReductionPercent      *float64             `json:"part_reduction_percent,omitempty"`
 	PartReductionRatio        *float64             `json:"part_reduction_ratio,omitempty"`
 	ActiveBatches             int                  `json:"active_batches"`
 	ActiveBatchInputArtifacts int                  `json:"active_batch_input_artifacts"`
 	ActiveBatchInputParts     uint64               `json:"active_batch_input_parts"`
+	ActiveBatchInputBytes     uint64               `json:"active_batch_input_bytes"`
 	ActiveBatchCurrentParts   uint64               `json:"active_batch_current_parts"`
+	ActiveBatchCurrentBytes   uint64               `json:"active_batch_current_bytes"`
 	ActiveMerges              uint64               `json:"active_merges"`
 	MergeProgressPercent      float64              `json:"merge_progress_percent"`
 	Workers                   int                  `json:"workers"`

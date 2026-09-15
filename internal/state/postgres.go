@@ -157,12 +157,20 @@ type OverviewStats struct {
 	RewrittenOriginalArtifacts int
 	InputArtifacts             int
 	InitialClickHouseParts     uint64
+	InitialClickHouseBytes     uint64
 	DurableArtifacts           int
 	DurableClickHouseParts     uint64
+	DurableClickHouseBytes     uint64
+	CompactedClickHouseParts   uint64
+	CompactedClickHouseBytes   uint64
+	WaitingClickHouseParts     uint64
+	WaitingClickHouseBytes     uint64
 	ActiveCompactionBatches    int
 	ActiveCompactionInputs     int
 	ActiveCompactionInputParts uint64
+	ActiveCompactionInputBytes uint64
 	ActiveCompactionParts      uint64
+	ActiveCompactionBytes      uint64
 	ActiveMerges               uint64
 	MergeProgress              float64
 	OldestCompactingAt         string
@@ -1358,12 +1366,14 @@ func (s *Store) OverviewStats(ctx context.Context, jobIDs []string) (OverviewSta
 	var raw []byte
 	err := s.pool.QueryRow(ctx, `WITH selected AS MATERIALIZED (
  SELECT job_id, status, worker_id, updated_at, original_compact_ready_at,
-  COALESCE((data->>'compact_generation')::int, 0) AS generation,
-  jsonb_array_length(COALESCE(NULLIF(data->'compact_input_part_ids', 'null'::jsonb), '[]'::jsonb)) AS compact_inputs,
-  COALESCE((data->>'destination_active_part_count')::numeric, 0) AS destination_parts,
-  COALESCE((data->>'compact_input_part_count')::numeric, 0) AS compact_input_parts,
-  COALESCE((data->>'compact_input_bytes')::numeric, 0) AS compact_input_bytes,
-  COALESCE((data->>'compact_output_part_count')::numeric, 0) AS compact_output_parts,
+ COALESCE((data->>'compact_generation')::int, 0) AS generation,
+ jsonb_array_length(COALESCE(NULLIF(data->'compact_input_part_ids', 'null'::jsonb), '[]'::jsonb)) AS compact_inputs,
+ COALESCE((data->>'destination_active_part_count')::numeric, 0) AS destination_parts,
+ COALESCE((data->>'destination_active_part_bytes')::numeric, 0) AS destination_bytes,
+ COALESCE((data->>'compact_input_part_count')::numeric, 0) AS compact_input_parts,
+ COALESCE((data->>'compact_input_bytes')::numeric, 0) AS compact_input_bytes,
+ COALESCE((data->>'compact_output_part_count')::numeric, 0) AS compact_output_parts,
+ COALESCE((data->>'compact_output_bytes')::numeric, 0) AS compact_output_bytes,
   COALESCE((data->>'compact_active_merges')::numeric, 0) AS active_merges,
   COALESCE((data->>'compact_merge_progress')::double precision, 0) AS merge_progress,
   COALESCE(data->>'compact_output_part_id', '') AS compact_output_part_id,
@@ -1382,6 +1392,7 @@ func (s *Store) OverviewStats(ctx context.Context, jobIDs []string) (OverviewSta
   count(*) AS input_artifacts,
   CASE WHEN max(compact_input_parts) > 0 THEN max(compact_input_parts) ELSE sum(destination_parts) END AS input_parts,
   CASE WHEN max(compact_input_parts) > 0 THEN max(compact_output_parts) ELSE sum(destination_parts) END AS current_parts,
+  CASE WHEN max(compact_input_parts) > 0 THEN max(compact_output_bytes) ELSE sum(destination_bytes) END AS current_bytes,
   max(active_merges) AS active_merges,
   max(merge_progress) AS merge_progress,
   max(compact_input_bytes) AS input_bytes,
@@ -1399,12 +1410,20 @@ SELECT jsonb_build_object(
  'rewritten_original_artifacts', (SELECT count(*) FROM parts WHERE original AND (original_compact_ready_at IS NOT NULL OR (empty_output AND finished_at <> ''))),
  'input_artifacts', (SELECT count(*) FROM parts WHERE original AND original_compact_ready_at IS NOT NULL AND destination_parts > 0),
  'initial_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE original AND original_compact_ready_at IS NOT NULL),
+ 'initial_clickhouse_bytes', (SELECT COALESCE(sum(destination_bytes), 0)::text FROM parts WHERE original AND original_compact_ready_at IS NOT NULL),
  'durable_artifacts', (SELECT count(*) FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND destination_parts > 0 AND (original_compact_ready_at IS NOT NULL OR NOT original)),
  'durable_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND (original_compact_ready_at IS NOT NULL OR NOT original)),
+ 'durable_clickhouse_bytes', (SELECT COALESCE(sum(destination_bytes), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND (original_compact_ready_at IS NOT NULL OR NOT original)),
+ 'compacted_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND NOT original),
+ 'compacted_clickhouse_bytes', (SELECT COALESCE(sum(destination_bytes), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND NOT original),
+ 'waiting_clickhouse_parts', (SELECT COALESCE(sum(destination_parts), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND original AND original_compact_ready_at IS NOT NULL),
+ 'waiting_clickhouse_bytes', (SELECT COALESCE(sum(destination_bytes), 0)::text FROM parts WHERE status NOT IN ('SUPERSEDED', 'COMPACTING') AND original AND original_compact_ready_at IS NOT NULL),
  'active_compaction_batches', (SELECT count(*) FROM batches),
  'active_compaction_inputs', (SELECT COALESCE(sum(input_artifacts), 0) FROM batches),
  'active_compaction_input_parts', (SELECT COALESCE(sum(input_parts), 0)::text FROM batches),
+ 'active_compaction_input_bytes', (SELECT COALESCE(sum(input_bytes), 0)::text FROM batches),
  'active_compaction_parts', (SELECT COALESCE(sum(current_parts), 0)::text FROM batches),
+ 'active_compaction_bytes', (SELECT COALESCE(sum(current_bytes), 0)::text FROM batches),
  'active_merges', (SELECT COALESCE(sum(active_merges), 0)::text FROM batches),
  'merge_progress', (SELECT COALESCE(sum(merge_progress * input_bytes::double precision) / NULLIF(sum(input_bytes)::double precision, 0), avg(merge_progress), 0) FROM batches),
  'oldest_compacting_at', (SELECT COALESCE(min(compacting_at), '') FROM batches),
@@ -1421,12 +1440,20 @@ SELECT jsonb_build_object(
 		RewrittenOriginalArtifacts int            `json:"rewritten_original_artifacts"`
 		InputArtifacts             int            `json:"input_artifacts"`
 		InitialClickHouseParts     string         `json:"initial_clickhouse_parts"`
+		InitialClickHouseBytes     string         `json:"initial_clickhouse_bytes"`
 		DurableArtifacts           int            `json:"durable_artifacts"`
 		DurableClickHouseParts     string         `json:"durable_clickhouse_parts"`
+		DurableClickHouseBytes     string         `json:"durable_clickhouse_bytes"`
+		CompactedClickHouseParts   string         `json:"compacted_clickhouse_parts"`
+		CompactedClickHouseBytes   string         `json:"compacted_clickhouse_bytes"`
+		WaitingClickHouseParts     string         `json:"waiting_clickhouse_parts"`
+		WaitingClickHouseBytes     string         `json:"waiting_clickhouse_bytes"`
 		ActiveCompactionBatches    int            `json:"active_compaction_batches"`
 		ActiveCompactionInputs     int            `json:"active_compaction_inputs"`
 		ActiveCompactionInputParts string         `json:"active_compaction_input_parts"`
+		ActiveCompactionInputBytes string         `json:"active_compaction_input_bytes"`
 		ActiveCompactionParts      string         `json:"active_compaction_parts"`
+		ActiveCompactionBytes      string         `json:"active_compaction_bytes"`
 		ActiveMerges               string         `json:"active_merges"`
 		MergeProgress              float64        `json:"merge_progress"`
 		OldestCompactingAt         string         `json:"oldest_compacting_at"`
@@ -1449,7 +1476,31 @@ SELECT jsonb_build_object(
 	if err != nil {
 		return OverviewStats{}, err
 	}
+	initialBytes, err := parse("initial ClickHouse bytes", value.InitialClickHouseBytes)
+	if err != nil {
+		return OverviewStats{}, err
+	}
 	durableParts, err := parse("durable ClickHouse parts", value.DurableClickHouseParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	durableBytes, err := parse("durable ClickHouse bytes", value.DurableClickHouseBytes)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	compactedParts, err := parse("compacted ClickHouse parts", value.CompactedClickHouseParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	compactedBytes, err := parse("compacted ClickHouse bytes", value.CompactedClickHouseBytes)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	waitingParts, err := parse("waiting ClickHouse parts", value.WaitingClickHouseParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	waitingBytes, err := parse("waiting ClickHouse bytes", value.WaitingClickHouseBytes)
 	if err != nil {
 		return OverviewStats{}, err
 	}
@@ -1457,7 +1508,15 @@ SELECT jsonb_build_object(
 	if err != nil {
 		return OverviewStats{}, err
 	}
+	activeInputBytes, err := parse("active compaction input bytes", value.ActiveCompactionInputBytes)
+	if err != nil {
+		return OverviewStats{}, err
+	}
 	activeParts, err := parse("active compaction parts", value.ActiveCompactionParts)
+	if err != nil {
+		return OverviewStats{}, err
+	}
+	activeBytes, err := parse("active compaction bytes", value.ActiveCompactionBytes)
 	if err != nil {
 		return OverviewStats{}, err
 	}
@@ -1470,12 +1529,20 @@ SELECT jsonb_build_object(
 		RewrittenOriginalArtifacts: value.RewrittenOriginalArtifacts,
 		InputArtifacts:             value.InputArtifacts,
 		InitialClickHouseParts:     initialParts,
+		InitialClickHouseBytes:     initialBytes,
 		DurableArtifacts:           value.DurableArtifacts,
 		DurableClickHouseParts:     durableParts,
+		DurableClickHouseBytes:     durableBytes,
+		CompactedClickHouseParts:   compactedParts,
+		CompactedClickHouseBytes:   compactedBytes,
+		WaitingClickHouseParts:     waitingParts,
+		WaitingClickHouseBytes:     waitingBytes,
 		ActiveCompactionBatches:    value.ActiveCompactionBatches,
 		ActiveCompactionInputs:     value.ActiveCompactionInputs,
 		ActiveCompactionInputParts: activeInputParts,
+		ActiveCompactionInputBytes: activeInputBytes,
 		ActiveCompactionParts:      activeParts,
+		ActiveCompactionBytes:      activeBytes,
 		ActiveMerges:               activeMerges,
 		MergeProgress:              value.MergeProgress,
 		OldestCompactingAt:         value.OldestCompactingAt,

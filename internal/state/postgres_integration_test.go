@@ -339,6 +339,7 @@ func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.
 		p.CompactInputPartCount = 10
 		p.CompactInputBytes = 1000
 		p.CompactOutputPartCount = 2
+		p.CompactOutputBytes = 200
 		p.CompactActiveMerges = 2
 		p.CompactMergeProgress = 0.375
 		p.CompactStage = "merging"
@@ -347,6 +348,14 @@ func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.
 	done.Status = StatusFinished
 	done.FinishedAt = formatTime(now)
 	pending := NewPart("job", "pending", "bucket", "source/pending", "finished/pending", now)
+	pending.Status = StatusCompactReady
+	pending.CompactReadyAt = formatTime(now)
+	pending.DestinationDatabase = "db"
+	pending.DestinationTable = "table"
+	pending.DestinationSchema = "CREATE TABLE db.table (x UInt64) ENGINE=MergeTree ORDER BY x"
+	pending.DestinationActivePartCount = 4
+	pending.DestinationActivePartBytes = 400
+	pending.DestinationActivePartitionCounts = map[string]uint64{"p": 4}
 	inProgress := NewPart("job", "active", "bucket", "source/active", "finished/active", now)
 	inProgress.Status = StatusInProgress
 	inProgress.WorkerID = "rewriter"
@@ -357,13 +366,16 @@ func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.OriginalArtifacts != 6 || stats.RewrittenOriginalArtifacts != 4 || stats.InputArtifacts != 4 {
+	if stats.OriginalArtifacts != 6 || stats.RewrittenOriginalArtifacts != 5 || stats.InputArtifacts != 5 {
 		t.Fatalf("artifact stats = %+v", stats)
 	}
-	if stats.InitialClickHouseParts != 20 || stats.DurableArtifacts != 1 || stats.DurableClickHouseParts != 3 {
+	if stats.InitialClickHouseParts != 24 || stats.InitialClickHouseBytes != 2400 || stats.DurableArtifacts != 2 || stats.DurableClickHouseParts != 7 || stats.DurableClickHouseBytes != 700 {
 		t.Fatalf("durable stats = %+v", stats)
 	}
-	if stats.ActiveCompactionBatches != 1 || stats.ActiveCompactionInputs != 2 || stats.ActiveCompactionInputParts != 10 || stats.ActiveCompactionParts != 2 {
+	if stats.CompactedClickHouseParts != 3 || stats.CompactedClickHouseBytes != 300 || stats.WaitingClickHouseParts != 4 || stats.WaitingClickHouseBytes != 400 {
+		t.Fatalf("compaction state stats = %+v", stats)
+	}
+	if stats.ActiveCompactionBatches != 1 || stats.ActiveCompactionInputs != 2 || stats.ActiveCompactionInputParts != 10 || stats.ActiveCompactionInputBytes != 1000 || stats.ActiveCompactionParts != 2 || stats.ActiveCompactionBytes != 200 {
 		t.Fatalf("active compact stats = %+v", stats)
 	}
 	if stats.ActiveMerges != 2 || stats.MergeProgress != 0.375 || stats.RewriteWorkers != 1 || stats.CompactionWorkers != 1 {

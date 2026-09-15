@@ -1748,12 +1748,20 @@ func TestBuildOverviewReportsPhysicalPartReduction(t *testing.T) {
 		RewrittenOriginalArtifacts: 3,
 		InputArtifacts:             3,
 		InitialClickHouseParts:     20,
+		InitialClickHouseBytes:     2000,
 		DurableArtifacts:           1,
 		DurableClickHouseParts:     3,
+		DurableClickHouseBytes:     300,
+		CompactedClickHouseParts:   3,
+		CompactedClickHouseBytes:   300,
+		WaitingClickHouseParts:     0,
+		WaitingClickHouseBytes:     0,
 		ActiveCompactionBatches:    1,
 		ActiveCompactionInputs:     2,
 		ActiveCompactionInputParts: 10,
+		ActiveCompactionInputBytes: 1000,
 		ActiveCompactionParts:      2,
+		ActiveCompactionBytes:      200,
 		ActiveMerges:               2,
 		MergeProgress:              0.375,
 		CompactionWorkers:          1,
@@ -1762,6 +1770,9 @@ func TestBuildOverviewReportsPhysicalPartReduction(t *testing.T) {
 
 	if overview.Compaction.CurrentArtifacts != 2 || overview.Compaction.CurrentClickHouseParts != 5 {
 		t.Fatalf("current compaction output = %+v", overview.Compaction)
+	}
+	if overview.Compaction.CurrentClickHouseBytes != 500 || overview.Compaction.CompactedClickHouseBytes != 300 || overview.Compaction.WaitingClickHouseBytes != 0 {
+		t.Fatalf("current compaction bytes = %+v", overview.Compaction)
 	}
 	if overview.Compaction.PartReductionPercent == nil || *overview.Compaction.PartReductionPercent != 75 {
 		t.Fatalf("part reduction = %v", overview.Compaction.PartReductionPercent)
@@ -1776,11 +1787,13 @@ func TestBuildOverviewReportsPhysicalPartReduction(t *testing.T) {
 	got := captureFileOutput(t, func(out *os.File) { printOverview(out, overview) })
 	for _, want := range []string{
 		"PARTFORGE OVERVIEW",
-		"initial_ch_parts: 20 observed from 3/4 rewritten artifacts",
+		"initial_ch_parts: 20 observed from 3/4 rewritten artifacts (data=2.0 KB)",
 		"current_artifacts: 2 (durable=1 active_batches=1)",
-		"current_ch_parts: 5 (durable=3 live=2)",
+		"current_ch_parts: 5 (durable=3 live=2) data=500 B (durable=300 B live=200 B)",
+		"compacted_ch_parts: 3 (data=300 B)",
+		"waiting_ch_parts: 0 (data=0 B)",
 		"part_reduction: 20 -> 5 (75.0% fewer, 4.0x reduction)",
-		"active: batches=1 input_artifacts=2 input_parts=10 current_parts=2 merges=2 merge_wave=37.5% workers=1",
+		"active: batches=1 input_artifacts=2 input_parts=10 current_parts=2 merges=2 merge_wave=37.5% workers=1 input_data=1000 B current_data=200 B",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("overview output missing %q:\n%s", want, got)
