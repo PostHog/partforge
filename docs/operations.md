@@ -10,6 +10,7 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 - **`-poll-interval`** (default `10s`) — how long to wait before re-checking for work when idle.
 - **`-compact-window`** (default `24h`) — the job-wide compaction period after the last original source artifact finishes rewriting; also the hard deadline for claimed compact merge waits. `0` finalizes as soon as no useful compaction remains.
 - **`-insert-chunk-min-rows`** (default `10000000`) — minimum source rows per local insert chunk, up to 20 chunks per part. Parts below 20 million rows stay unsplit. `0` disables chunking for SQL requiring the whole source part. Completed chunks survive handled insert memory errors, but not worker/node loss. See [chunk semantics and recovery limits](rewrite-flow.md#local-insert-checkpoints).
+- **`-compact-max-artifacts`** (default `20`, up to `99`; `1` disables batching) and **`-compact-max-bytes`** (default `150 GiB`, `0` disables) — bound one batch of single-part artifacts merged together. Keep the byte cap well under a third of free work-dir disk; ClickHouse will not merge beyond its ~150 GiB merge target anyway.
 - **`-default-compression-codec`** (default `ZSTD(5)`) — applied to the destination table during compaction only. Rewrites use the destination schema's compression settings without an override.
 - **`-clickhouse-binary`**, **`-clickhouse-config-file`**, **`-clickhouse-url`** — locate the local ClickHouse the worker starts.
 

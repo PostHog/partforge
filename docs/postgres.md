@@ -50,6 +50,7 @@ The original primary key `(job_id, part_id)`, state columns, and full `data` JSO
 | `compact_parts`, `compact_eligible` | Ordered partial index for most-fragmented eligible compact claims |
 | `compact_bytes` | Persisted compact data size used for claim metadata and diagnostics |
 | `compact_normalized` | Identify artifacts containing one physical part |
+| `compact_partition_id` | Generated from `data` for normalized artifacts; groups sibling artifacts for batch claims |
 | `compact_stale_at` | Indexed stale-compaction lookup, preserving the existing earlier-of-heartbeat-and-claim timeout |
 | `original_compact_ready_at` | Indexed job compact deadline lookup |
 

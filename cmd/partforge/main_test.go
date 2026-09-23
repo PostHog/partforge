@@ -300,7 +300,7 @@ func TestSummarizeJobCompactFinalizationReadyForSingleUnmergeablePart(t *testing
 				"202606": 1,
 			},
 		},
-		{PartID: "part-in-progress", Status: state.StatusInProgress},
+		{PartID: "part-finished", Status: state.StatusFinished},
 	}, jobSummaryOptions{
 		Now:           now,
 		CompactWindow: 2 * time.Hour,
@@ -2671,6 +2671,22 @@ func TestChunkedRewriteProgressOverridesQueryRatio(t *testing.T) {
 		}
 		if got := partRewriteProgressPercent(part); got == nil || *got != value {
 			t.Fatalf("part details progress = %v, want %g", got, value)
+		}
+	}
+}
+
+func TestSummarizeJobCompactWaitsForBatchableSiblings(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	single := func(id string, status state.Status) state.Part {
+		return state.Part{PartID: id, Status: status, CompactReadyAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano), DestinationActivePartCount: 1, DestinationActivePartitionCounts: map[string]uint64{"202606": 1}}
+	}
+	for name, parts := range map[string][]state.Part{
+		"siblings":        {single("a", state.StatusCompactReady), single("b", state.StatusCompactReady)},
+		"rewrite may add": {single("a", state.StatusCompactReady), {PartID: "r", Status: state.StatusInProgress}},
+	} {
+		summary := summarizeJobWithOptions("job-1", parts, jobSummaryOptions{Now: now, CompactWindow: 2 * time.Hour})
+		if summary.Compact == nil || summary.Compact.FinalizeStatus == "ready" {
+			t.Fatalf("%s: compact summary = %+v, want not ready", name, summary.Compact)
 		}
 	}
 }

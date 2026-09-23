@@ -308,13 +308,16 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	}, nil
 }
 
+// Normalization merges every destination partition that has multiple parts
+// across all inputs, whether from one fragmented artifact or a batch of siblings.
 func compactInputNeedsNormalization(inputs []CompactInput) bool {
-	if len(inputs) != 1 {
-		return false
-	}
-	for _, count := range inputs[0].PartitionCounts {
-		if count > 1 {
-			return true
+	counts := map[string]uint64{}
+	for _, input := range inputs {
+		for partitionID, count := range input.PartitionCounts {
+			counts[partitionID] += count
+			if counts[partitionID] > 1 {
+				return true
+			}
 		}
 	}
 	return false

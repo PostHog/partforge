@@ -294,8 +294,11 @@ func TestCompactInputNeedsNormalization(t *testing.T) {
 	}}) {
 		t.Fatal("expected one part per partition to be normalized")
 	}
-	if compactInputNeedsNormalization([]CompactInput{{PartitionCounts: map[string]uint64{"202606": 2}}, {PartitionCounts: map[string]uint64{"202606": 1}}}) {
-		t.Fatal("expected multi-input compaction not to use normalization path")
+	if !compactInputNeedsNormalization([]CompactInput{{PartitionCounts: map[string]uint64{"202606": 1}}, {PartitionCounts: map[string]uint64{"202606": 1}}}) {
+		t.Fatal("expected sibling batch in one partition to need normalization")
+	}
+	if compactInputNeedsNormalization([]CompactInput{{PartitionCounts: map[string]uint64{"202606": 1}}, {PartitionCounts: map[string]uint64{"202607": 1}}}) {
+		t.Fatal("expected disjoint single-part inputs to be normalized")
 	}
 }
 

@@ -193,7 +193,7 @@ func TestPostgresLegacyMigrationIsAtomic(t *testing.T) {
 func TestPostgresClaimsAndProgress(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	parts := make([]Part, 64)
 	for i := range parts {
 		parts[i] = NewPart(fmt.Sprintf("job-%d", i%10), fmt.Sprintf("part-%03d", i), "bucket", "source", "finished", now)
@@ -278,7 +278,7 @@ func TestPostgresClaimsAndProgress(t *testing.T) {
 func TestPostgresListJobsAggregatesCompletedSourceBytes(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	parts := []Part{
 		NewPart("job", "small", "bucket", "source/small", "finished/small", now),
 		NewPart("job", "large", "bucket", "source/large", "finished/large", now),
@@ -313,7 +313,7 @@ func TestPostgresListJobsAggregatesCompletedSourceBytes(t *testing.T) {
 func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	original := func(id string, status Status, parts uint64) Part {
 		p := NewPart("job", id, "bucket", "source/"+id, "finished/"+id, now)
 		p.Status = status
@@ -389,7 +389,7 @@ func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.
 func TestPostgresCompactScheduling(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	parts := make([]Part, 20)
 	for i := range parts {
 		p := NewPart("job", fmt.Sprintf("part-%02d", i), "bucket", "source", "finished", now)
@@ -452,7 +452,7 @@ func TestPostgresCompactScheduling(t *testing.T) {
 		}
 		seen[b.Parts[0].PartID] = true
 	}
-	if n, err := s.FinalizeCompactReadyJob(ctx, "job", time.Hour, now); err != nil || n != 0 {
+	if n, err := s.FinalizeCompactReadyJob(ctx, "job", time.Hour, CompactBatching{}, now); err != nil || n != 0 {
 		t.Fatalf("active job finalized: %d %v", n, err)
 	}
 	if n, err := s.ReleaseStaleCompactingParts(ctx, now.Add(2*time.Hour), time.Hour); err != nil || n != 20 {
@@ -461,7 +461,7 @@ func TestPostgresCompactScheduling(t *testing.T) {
 	if b, err := s.ClaimNextCompactBatch(ctx, "late", now.Add(2*time.Hour), CompactClaimOptions{CompactWindow: time.Hour}); err != nil || b != nil {
 		t.Fatalf("claimed expired work: %+v %v", b, err)
 	}
-	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, now.Add(2*time.Hour), false); err != nil || n != 20 {
+	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, CompactBatching{}, now.Add(2*time.Hour), false); err != nil || n != 20 {
 		t.Fatalf("finalized: %d %v", n, err)
 	}
 	// The shared cadence must skip a second scan even when new normalized work arrives.
@@ -471,10 +471,10 @@ func TestPostgresCompactScheduling(t *testing.T) {
 	normalized.DestinationActivePartCount = 1
 	normalized.DestinationActivePartitionCounts = map[string]uint64{"p": 1}
 	seedPostgresParts(t, s, []Part{normalized})
-	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, now.Add(2*time.Hour), false); err != nil || n != 0 {
+	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, CompactBatching{}, now.Add(2*time.Hour), false); err != nil || n != 0 {
 		t.Fatalf("maintenance ran twice: %d %v", n, err)
 	}
-	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, now.Add(2*time.Hour), true); err != nil || n != 1 {
+	if n, err := s.MaintainCompaction(ctx, time.Hour, time.Hour, CompactBatching{}, now.Add(2*time.Hour), true); err != nil || n != 1 {
 		t.Fatalf("normalized finalization: %d %v", n, err)
 	}
 }
@@ -482,7 +482,7 @@ func TestPostgresCompactScheduling(t *testing.T) {
 func TestPostgresCompactSchedulingPrioritizesPartCount(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	makePart := func(id string, parts, bytes uint64) Part {
 		p := NewPart("job", id, "bucket", "source/"+id, "finished/"+id, now)
 		p.Status = StatusCompactReady
@@ -512,7 +512,7 @@ func TestPostgresCompactSchedulingPrioritizesPartCount(t *testing.T) {
 func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	makePart := func(job, id, partition string, size uint64, status Status) Part {
 		p := NewPart(job, id, "bucket", "source", "finished", now)
 		p.Status = status
@@ -603,7 +603,7 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 func TestPostgresClaimPlans(t *testing.T) {
 	ctx := context.Background()
 	s := postgresTestStore(t)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	parts := make([]Part, 20000)
 	for i := range parts {
 		p := NewPart(fmt.Sprintf("job-%d", i%10), fmt.Sprintf("part-%05d", i), "bucket", "source", "finished", now)
@@ -618,14 +618,19 @@ func TestPostgresClaimPlans(t *testing.T) {
 		if i%2 == 0 {
 			p.Status = StatusCompactReady
 		}
+		if i%4 == 2 {
+			p.DestinationActivePartCount = 1
+			p.DestinationActivePartitionCounts = map[string]uint64{fmt.Sprint(i % 100): 1}
+		}
 		parts[i] = p
 	}
 	seedPostgresParts(t, s, parts)
 	if _, err := s.pool.Exec(ctx, "ANALYZE "+s.tableSQL); err != nil {
 		t.Fatal(err)
 	}
-	compact, args := s.compactClaimQuery(CompactClaimOptions{CompactWindow: time.Hour}, now)
-	expired, expiredArgs := s.compactClaimQuery(CompactClaimOptions{CompactWindow: time.Hour}, now.Add(2*time.Hour))
+	compact, args := s.compactClaimQuery(CompactClaimOptions{CompactWindow: time.Hour}, now, false)
+	expired, expiredArgs := s.compactClaimQuery(CompactClaimOptions{CompactWindow: time.Hour}, now.Add(2*time.Hour), false)
+	batch, batchArgs := s.compactClaimQuery(CompactClaimOptions{CompactWindow: time.Hour, Batching: CompactBatching{MaxArtifacts: 20, MaxBytes: 1 << 40}}, now, true)
 	for _, test := range []struct {
 		name, query, index string
 		args               []any
@@ -633,6 +638,7 @@ func TestPostgresClaimPlans(t *testing.T) {
 		{"rewrite", s.readyClaimQuery(), "ready_priority_idx", nil},
 		{"compact", compact, "compact_priority_idx", args},
 		{"expired compact", expired, "compact_priority_idx", expiredArgs},
+		{"batch compact", batch, "compact_batch_idx", batchArgs},
 	} {
 		rows, err := s.pool.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS) "+test.query, test.args...)
 		if err != nil {
@@ -754,7 +760,7 @@ func TestPostgresApplicationSchedulingColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)
-	if n, err := s.FinalizeCompactReadyJob(ctx, part.JobID, time.Hour, now.Add(5*time.Minute)); err != nil || n != 1 {
+	if n, err := s.FinalizeCompactReadyJob(ctx, part.JobID, time.Hour, CompactBatching{}, now.Add(5*time.Minute)); err != nil || n != 1 {
 		t.Fatalf("finalized %d: %v", n, err)
 	}
 	assertSchedulingColumns(t, s)
@@ -920,4 +926,107 @@ func TestPostgresBulkDelete(t *testing.T) {
 	if err != nil || len(remaining) != len(others) {
 		t.Fatalf("bulk delete changed another job: count=%d err=%v", len(remaining), err)
 	}
+}
+
+func TestPostgresCompactBatchesNormalizedSiblings(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	batching := CompactBatching{MaxArtifacts: 20, MaxBytes: 70}
+	makePart := func(job, id, partition string, bytes uint64) Part {
+		p := NewPart(job, id, "bucket", "source/"+id, "finished/"+id, now)
+		p.Status = StatusCompactReady
+		p.CompactReadyAt = formatTime(now)
+		p.DestinationDatabase, p.DestinationTable, p.DestinationSchema = "db", "table", "schema"
+		p.DestinationActivePartCount = 1
+		p.DestinationActivePartBytes = bytes
+		p.DestinationActivePartitionCounts = map[string]uint64{partition: 1}
+		return p
+	}
+	rewriting := NewPart("job", "rewriting", "bucket", "source/r", "finished/r", now)
+	rewriting.Status = StatusInProgress
+	rewriting.WorkerID = "rewriter"
+	seedPostgresParts(t, s, []Part{
+		makePart("job", "a", "x", 10), makePart("job", "b", "x", 20), makePart("job", "c", "x", 30),
+		makePart("job", "big", "x", 100), makePart("job", "lonely", "y", 5), rewriting,
+	})
+	if n, err := s.FinalizeCompactReadyJob(ctx, "job", time.Hour, batching, now); err != nil || n != 0 {
+		t.Fatalf("finalized while rewrites may add siblings: %d %v", n, err)
+	}
+	if b, err := s.ClaimNextCompactBatch(ctx, "w", now, CompactClaimOptions{}); err != nil || b != nil {
+		t.Fatalf("claimed normalized work with batching disabled: %+v %v", b, err)
+	}
+	batch, err := s.ClaimNextCompactBatch(ctx, "w", now, CompactClaimOptions{CompactWindow: time.Hour, Batching: batching})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch == nil || strings.Join(compactPartIDs(batch.Parts), ",") != "a,b,c" || batch.InputBytes != 60 || batch.Generation != 1 {
+		t.Fatalf("batch = %+v", batch)
+	}
+	if b, err := s.ClaimNextCompactBatch(ctx, "w2", now, CompactClaimOptions{Batching: batching}); err != nil || b != nil {
+		t.Fatalf("claimed batch without mergeable siblings: %+v %v", b, err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE `+s.tableSQL+` SET status = 'FINISHED' WHERE part_id = 'rewriting'`); err != nil {
+		t.Fatal(err)
+	}
+	// The lonely partition finishes; big still waits on the compacting batch in its partition.
+	if n, err := s.FinalizeCompactReadyJob(ctx, "job", time.Hour, batching, now); err != nil || n != 1 {
+		t.Fatalf("lonely finalization: %d %v", n, err)
+	}
+	output := NewCompactPart("job", "out", "bucket", "finished/out", "db", "table", "schema", compactPartIDs(batch.Parts), batch.Generation, PartStats{Count: 1, Bytes: 60}, map[string]uint64{"x": 1}, now, now)
+	if err := s.CompleteCompaction(ctx, *batch, output, "w", now); err != nil {
+		t.Fatal(err)
+	}
+	// out+big exceeds the byte cap, so neither can merge further.
+	if n, err := s.FinalizeCompactReadyJob(ctx, "job", time.Hour, batching, now); err != nil || n != 2 {
+		t.Fatalf("capped finalization: %d %v", n, err)
+	}
+
+	// Concurrent claimers split one partition into disjoint batches.
+	var siblings []Part
+	for i := 0; i < 10; i++ {
+		siblings = append(siblings, makePart("many", fmt.Sprintf("s%02d", i), "z", 1))
+	}
+	seedPostgresParts(t, s, siblings)
+	var wg sync.WaitGroup
+	claimed := make(chan *CompactBatch, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			b, err := s.ClaimNextCompactBatch(ctx, fmt.Sprint("c", i), now, CompactClaimOptions{Batching: CompactBatching{MaxArtifacts: 3}})
+			if err != nil {
+				t.Error(err)
+			}
+			claimed <- b
+		}(i)
+	}
+	wg.Wait()
+	close(claimed)
+	seen := map[string]bool{}
+	for b := range claimed {
+		if b == nil {
+			continue
+		}
+		if len(b.Parts) < 2 || len(b.Parts) > 3 {
+			t.Fatalf("batch size %d", len(b.Parts))
+		}
+		for _, part := range b.Parts {
+			if seen[part.PartID] {
+				t.Fatalf("part %s claimed twice", part.PartID)
+			}
+			seen[part.PartID] = true
+		}
+	}
+	if len(seen) < 8 {
+		t.Fatalf("claimed %d of 10 siblings", len(seen))
+	}
+}
+
+func compactPartIDs(parts []Part) []string {
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		ids = append(ids, part.PartID)
+	}
+	return ids
 }

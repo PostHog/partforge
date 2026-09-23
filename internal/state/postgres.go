@@ -211,7 +211,17 @@ func clonePartitionCounts(counts map[string]uint64) map[string]uint64 {
 	return out
 }
 
+// CompactBatching bounds multi-artifact compaction of normalized artifacts.
+// MaxArtifacts below 2 disables batching; MaxBytes 0 disables the byte cap.
+type CompactBatching struct {
+	MaxArtifacts int
+	MaxBytes     uint64
+}
+
+func (b CompactBatching) enabled() bool { return b.MaxArtifacts >= 2 }
+
 type CompactClaimOptions struct {
+	Batching             CompactBatching
 	CompactWindow        time.Duration
 	ExcludedJobIDs       map[string]struct{}
 	JobID                string
@@ -718,35 +728,43 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 	if strings.TrimSpace(workerID) == "" {
 		return nil, errors.New("worker id is required")
 	}
+	if opts.Batching.MaxArtifacts > MaxCompactBatchParts {
+		return nil, fmt.Errorf("compact batch max artifacts %d exceeds %d", opts.Batching.MaxArtifacts, MaxCompactBatchParts)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	query, args := s.compactClaimQuery(opts, now)
-	var data []byte
-	err = tx.QueryRow(ctx, query, args...).Scan(&data)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
+	// Fragmented artifacts first; otherwise batch normalized siblings of one partition.
+	query, args := s.compactClaimQuery(opts, now, false)
+	parts, err := s.queryPartsTx(ctx, tx, query, args)
 	if err != nil {
 		return nil, fmt.Errorf("claim compact-ready part: %w", err)
 	}
-	part, err := partFromJSON(data)
+	if len(parts) == 0 && opts.Batching.enabled() {
+		if parts, err = s.claimNormalizedSiblingsTx(ctx, tx, opts, now); err != nil {
+			return nil, fmt.Errorf("claim compact-ready batch: %w", err)
+		}
+	}
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	for i := range parts {
+		setStatus(&parts[i], StatusCompacting, now)
+		parts[i].CompactingAt = formatTime(now)
+		parts[i].WorkerID = workerID
+		parts[i].Error = ""
+		parts[i].CompactCooldownUntil = ""
+	}
+	batch, err := compactBatchFromParts(parts)
 	if err != nil {
 		return nil, err
 	}
-	setStatus(&part, StatusCompacting, now)
-	part.CompactingAt = formatTime(now)
-	part.WorkerID = workerID
-	part.Error = ""
-	part.CompactCooldownUntil = ""
-	batch, err := compactBatchFromParts([]Part{part})
-	if err != nil {
-		return nil, err
-	}
-	if err := s.savePartTx(ctx, tx, part); err != nil {
-		return nil, err
+	for _, part := range parts {
+		if err := s.savePartTx(ctx, tx, part); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -754,11 +772,65 @@ func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now 
 	return batch, nil
 }
 
-// Claim the most fragmented eligible unlocked artifact using the compact queue index.
-func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time) (string, []any) {
+// Anchor on the smallest normalized artifact with a sibling that fits the byte cap,
+// then lock the smallest unlocked siblings. SKIP LOCKED means concurrent claimers
+// never share a row; a claimer left with fewer than two rows claims nothing.
+func (s *Store) claimNormalizedSiblingsTx(ctx context.Context, tx pgx.Tx, opts CompactClaimOptions, now time.Time) ([]Part, error) {
+	query, args := s.compactClaimQuery(opts, now, true)
+	anchors, err := s.queryPartsTx(ctx, tx, query, args)
+	if err != nil || len(anchors) == 0 {
+		return nil, err
+	}
+	anchor := anchors[0]
+	candidates, err := s.queryPartsTx(ctx, tx, `SELECT data FROM `+s.tableSQL+` WHERE job_id = $1 AND compact_partition_id = (SELECT compact_partition_id FROM `+s.tableSQL+` WHERE job_id = $1 AND part_id = $2)
+ AND status = 'COMPACT_READY' AND compact_normalized ORDER BY compact_bytes, created_at, part_id LIMIT $3 FOR UPDATE SKIP LOCKED`, []any{anchor.JobID, anchor.PartID, opts.Batching.MaxArtifacts})
+	if err != nil {
+		return nil, err
+	}
+	var selected []Part
+	var bytes uint64
+	for _, part := range candidates {
+		if opts.Batching.MaxBytes > 0 && bytes+part.DestinationActivePartBytes > opts.Batching.MaxBytes {
+			break
+		}
+		selected = append(selected, part)
+		bytes += part.DestinationActivePartBytes
+	}
+	if len(selected) < 2 {
+		return nil, nil
+	}
+	return selected, nil
+}
+
+func numericUint64(v uint64) pgtype.Numeric {
+	return pgtype.Numeric{Int: new(big.Int).SetUint64(v), Valid: true}
+}
+
+func (s *Store) queryPartsTx(ctx context.Context, tx pgx.Tx, query string, args []any) ([]Part, error) {
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Part, error) {
+		var data []byte
+		if err := row.Scan(&data); err != nil {
+			return Part{}, err
+		}
+		return partFromJSON(data)
+	})
+}
+
+// Claim the most fragmented eligible unlocked artifact using the compact queue index,
+// or with normalized set, the smallest normalized artifact that has a mergeable sibling.
+func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time, normalized bool) (string, []any) {
 	args := []any{}
 	bind := func(v any) string { args = append(args, v); return fmt.Sprintf("$%d", len(args)) }
 	filters := []string{"p.status = 'COMPACT_READY'", "p.compact_eligible"}
+	order := "p.compact_parts DESC, p.created_at, p.job_id, p.part_id"
+	if normalized {
+		filters = []string{"p.status = 'COMPACT_READY'", "p.compact_normalized", "EXISTS (SELECT FROM " + s.tableSQL + " sibling WHERE " + s.mergeableSiblingSQL("p", "sibling", bind(numericUint64(opts.Batching.MaxBytes))) + ")"}
+		order = "p.compact_bytes, p.created_at, p.job_id, p.part_id"
+	}
 	for _, filter := range []struct{ field, value string }{
 		{"p.job_id", opts.JobID}, {"p.data->>'bucket'", opts.Bucket},
 		{"p.data->>'destination_database'", opts.DestinationDatabase},
@@ -788,18 +860,31 @@ func (s *Store) compactClaimQuery(opts CompactClaimOptions, now time.Time) (stri
 		from += " LEFT JOIN LATERAL (SELECT original_compact_ready_at FROM " + s.tableSQL + " original WHERE original.job_id = p.job_id AND original_compact_ready_at IS NOT NULL ORDER BY original_compact_ready_at DESC LIMIT 1) deadline ON true"
 		filters = append(filters, "COALESCE(deadline.original_compact_ready_at > "+cutoff+", true)")
 	}
-	return "SELECT p.data FROM " + from + " WHERE " + strings.Join(filters, " AND ") + " ORDER BY p.compact_parts DESC, p.created_at, p.job_id, p.part_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED", args
+	return "SELECT p.data FROM " + from + " WHERE " + strings.Join(filters, " AND ") + " ORDER BY " + order + " LIMIT 1 FOR UPDATE OF p SKIP LOCKED", args
+}
+
+// A COMPACT_READY normalized sibling in the same job and partition that fits the byte cap.
+func (s *Store) mergeableSiblingSQL(p, sibling, maxBytes string) string {
+	return sibling + ".job_id = " + p + ".job_id AND " + sibling + ".compact_partition_id = " + p + ".compact_partition_id AND " + sibling + ".part_id <> " + p + ".part_id AND " +
+		sibling + ".status = 'COMPACT_READY' AND " + sibling + ".compact_normalized AND (" + maxBytes + "::numeric = 0 OR " + sibling + ".compact_bytes + " + p + ".compact_bytes <= " + maxBytes + "::numeric)"
 }
 
 func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("worker id is required")
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
 	for _, part := range batch.Parts {
-		_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-			return compactOwnedOrUnownedReady(current, workerID)
-		}, func(current *Part) error {
-			setStatus(current, StatusCompactReady, now)
+		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
+		if err == nil && !compactOwnedOrUnownedReady(current, workerID) {
+			err = &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s did not match expected state", part.JobID, part.PartID)}
+		}
+		if err == nil {
+			setStatus(&current, StatusCompactReady, now)
 			if strings.TrimSpace(current.CompactReadyAt) == "" {
 				current.CompactReadyAt = compactReadyAtForRelease(part, now)
 			}
@@ -807,14 +892,14 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 			current.CompactingAt = ""
 			current.Error = ""
 			current.CompactCooldownUntil = ""
-			clearCompactProgress(current)
-			return nil
-		})
+			clearCompactProgress(&current)
+			err = s.savePartTx(ctx, tx, current)
+		}
 		if err != nil {
 			return fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MarkCompactBatchFailed(ctx context.Context, batch CompactBatch, workerID string, cause error, now time.Time) error {

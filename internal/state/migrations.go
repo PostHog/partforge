@@ -63,6 +63,12 @@ func (s *Store) migrations() []string {
  DROP INDEX IF EXISTS %[2]s;
  CREATE INDEX %[3]s ON %[1]s (compact_parts DESC, created_at, job_id, part_id) WHERE status = 'COMPACT_READY' AND compact_eligible;`,
 			s.tableSQL, indexSQLInTableSchema(s.tableName, "compact_priority_idx"), s.indexSQL("compact_priority_idx")),
+		// Normalized artifacts batch with siblings in the same destination partition.
+		fmt.Sprintf(`ALTER TABLE %[1]s ADD COLUMN compact_partition_id text GENERATED ALWAYS AS (CASE WHEN compact_normalized THEN
+ COALESCE(jsonb_path_query_first(data, '$.destination_active_partition_counts.keyvalue() ? (@.value > 0 && @.key != "")') ->> 'key', '') ELSE '' END) STORED;
+ CREATE INDEX %[2]s ON %[1]s (job_id, compact_partition_id, compact_bytes, created_at, part_id) WHERE status = 'COMPACT_READY' AND compact_normalized;
+ CREATE INDEX %[3]s ON %[1]s (compact_bytes, created_at, job_id, part_id) WHERE status = 'COMPACT_READY' AND compact_normalized;`,
+			s.tableSQL, s.indexSQL("compact_sibling_idx"), s.indexSQL("compact_batch_idx")),
 	}
 }
 

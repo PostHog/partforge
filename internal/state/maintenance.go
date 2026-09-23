@@ -12,7 +12,7 @@ import (
 // MaintainCompaction runs at most once per ten seconds across looping workers.
 // A one-shot worker requests a pass immediately, still skipping active maintenance.
 // The reservation and work commit together, so failure does not consume the run.
-func (s *Store) MaintainCompaction(ctx context.Context, window, staleAfter time.Duration, now time.Time, once bool) (int, error) {
+func (s *Store) MaintainCompaction(ctx context.Context, window, staleAfter time.Duration, batching CompactBatching, now time.Time, once bool) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -31,7 +31,7 @@ func (s *Store) MaintainCompaction(ctx context.Context, window, staleAfter time.
 			return 0, err
 		}
 	}
-	finalized, err := s.finalizeCompactReadyTx(ctx, tx, "", window, now)
+	finalized, err := s.finalizeCompactReadyTx(ctx, tx, "", window, batching, now)
 	if err != nil {
 		return 0, err
 	}
@@ -88,7 +88,7 @@ func (s *Store) CompactDeadline(ctx context.Context, jobID string, window time.D
 	return readyAt.Add(window), nil
 }
 
-func (s *Store) FinalizeCompactReadyJob(ctx context.Context, jobID string, window time.Duration, now time.Time) (int, error) {
+func (s *Store) FinalizeCompactReadyJob(ctx context.Context, jobID string, window time.Duration, batching CompactBatching, now time.Time) (int, error) {
 	if jobID == "" {
 		return 0, errors.New("job id is required")
 	}
@@ -97,7 +97,7 @@ func (s *Store) FinalizeCompactReadyJob(ctx context.Context, jobID string, windo
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	n, err := s.finalizeCompactReadyTx(ctx, tx, jobID, window, now)
+	n, err := s.finalizeCompactReadyTx(ctx, tx, jobID, window, batching, now)
 	if err != nil {
 		return 0, err
 	}
@@ -107,14 +107,15 @@ func (s *Store) FinalizeCompactReadyJob(ctx context.Context, jobID string, windo
 	return n, nil
 }
 
-func (s *Store) finalizeCompactReadyTx(ctx context.Context, tx pgx.Tx, jobID string, window time.Duration, now time.Time) (int, error) {
+func (s *Store) finalizeCompactReadyTx(ctx context.Context, tx pgx.Tx, jobID string, window time.Duration, batching CompactBatching, now time.Time) (int, error) {
 	type summary struct {
-		jobID                         string
-		readyAt                       *time.Time
-		blocked, eligible, normalized bool
+		jobID                                    string
+		readyAt                                  *time.Time
+		blocked, rewriting, eligible, normalized bool
 	}
 	query := `SELECT job_id, max(original_compact_ready_at),
  bool_or(status IN ('READY', 'IN_PROGRESS', 'COMPACTING', 'FAILED')),
+ bool_or(status IN ('READY', 'IN_PROGRESS')),
  bool_or(status = 'COMPACT_READY' AND compact_eligible),
  bool_or(status = 'COMPACT_READY' AND compact_normalized)
  FROM ` + s.tableSQL
@@ -130,7 +131,7 @@ func (s *Store) finalizeCompactReadyTx(ctx context.Context, tx pgx.Tx, jobID str
 	}
 	jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (summary, error) {
 		var j summary
-		err := row.Scan(&j.jobID, &j.readyAt, &j.blocked, &j.eligible, &j.normalized)
+		err := row.Scan(&j.jobID, &j.readyAt, &j.blocked, &j.rewriting, &j.eligible, &j.normalized)
 		return j, err
 	})
 	if err != nil {
@@ -138,30 +139,36 @@ func (s *Store) finalizeCompactReadyTx(ctx context.Context, tx pgx.Tx, jobID str
 	}
 	finalized := 0
 	for _, j := range jobs {
-		// A normalized artifact can finish even while other work remains active.
-		normalizedOnly := j.normalized
-		if !normalizedOnly {
-			if j.blocked {
-				continue
-			}
+		expired := window > 0 && j.readyAt != nil && !now.Before(j.readyAt.Add(window))
+		all := false
+		if !j.blocked {
 			if window > 0 {
 				if j.readyAt == nil {
 					return 0, fmt.Errorf("job %s: no original compact-ready timestamp found", j.jobID)
 				}
-				if now.Before(j.readyAt.Add(window)) {
-					continue
-				}
-			} else if j.eligible {
-				continue
-			} // Leave useful work for claimers when the window is disabled.
+				all = expired
+			} else {
+				all = !j.eligible // Leave useful work for claimers when the window is disabled.
+			}
 		}
+		if !all && !j.normalized {
+			continue
+		}
+		// A normalized artifact finishes, even while other work remains active, once
+		// nothing can still merge with it: no mergeable sibling, no compaction or
+		// fragmented artifact touching its partition, and no rewrite that may add one.
 		tag, err := tx.Exec(ctx, `WITH candidates AS (
- SELECT job_id, part_id FROM `+s.tableSQL+`
- WHERE job_id = $1 AND status = 'COMPACT_READY' AND (NOT $2::boolean OR compact_normalized)
+ SELECT job_id, part_id FROM `+s.tableSQL+` p
+ WHERE job_id = $1 AND status = 'COMPACT_READY' AND (
+ (NOT compact_normalized AND $2::boolean) OR
+ (compact_normalized AND ($3::boolean OR NOT $4::boolean OR NOT ($5::boolean OR EXISTS (SELECT FROM `+s.tableSQL+` s WHERE
+ (`+s.mergeableSiblingSQL("p", "s", "$6")+`) OR
+ (s.job_id = p.job_id AND s.part_id <> p.part_id AND (s.status = 'COMPACTING' OR (s.status = 'COMPACT_READY' AND s.compact_eligible))
+ AND s.data->'destination_active_partition_counts' ? p.compact_partition_id))))))
  FOR UPDATE SKIP LOCKED)
- UPDATE `+s.tableSQL+` p SET status = 'FINISHED', updated_at = $3, compact_stale_at = NULL,
- data = (p.data - 'error' - 'compact_cooldown_until') || jsonb_build_object('status', 'FINISHED', 'updated_at', $3::text, 'finished_at', $3::text)
- FROM candidates c WHERE p.job_id = c.job_id AND p.part_id = c.part_id`, j.jobID, normalizedOnly, formatTime(now))
+ UPDATE `+s.tableSQL+` p SET status = 'FINISHED', updated_at = $7, compact_stale_at = NULL,
+ data = (p.data - 'error' - 'compact_cooldown_until') || jsonb_build_object('status', 'FINISHED', 'updated_at', $7::text, 'finished_at', $7::text)
+ FROM candidates c WHERE p.job_id = c.job_id AND p.part_id = c.part_id`, j.jobID, all, expired || all, batching.enabled(), j.rewriting, numericUint64(batching.MaxBytes), formatTime(now))
 		if err != nil {
 			return 0, err
 		}

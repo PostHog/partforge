@@ -409,35 +409,38 @@ fi
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker delete-job \
   -job-id=e2e-empty-job -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 
-normalized_finalize_log="$ROOT/.e2e/compact-normalized-finalize.log"
-CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
-  worker \
-  -role=compactor \
-  -s3-endpoint=http://localstack:4566 \
-  -postgres-url="$POSTGRES_URL" \
-  -compact-window=1h \
-  -once 2>&1 | tee "$normalized_finalize_log"
-
-if ! grep -F "finalized compact-ready artifacts" "$normalized_finalize_log" >/dev/null; then
-  echo "expected compact worker to finalize normalized artifact" >&2
-  exit 1
-fi
-
-compact_log="$ROOT/.e2e/compact-merge.log"
-CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
-  worker \
-  -role=compactor \
-  -s3-endpoint=http://localstack:4566 \
-  -postgres-url="$POSTGRES_URL" \
-  -compact-window=1h \
-  -once 2>&1 | tee "$compact_log"
-
-if ! grep -F "claimed compact-ready batch" "$compact_log" >/dev/null; then
-  echo "expected compact worker to claim fragmented artifact" >&2
-  exit 1
-fi
-if ! grep -F "completed compact batch" "$compact_log" >/dev/null; then
-  echo "expected compact worker to complete fragmented artifact" >&2
+# Rewrites leave one or more single-part artifacts in 202401, depending on whether
+# chunk merges finished before measurement. A fragmented artifact is normalized
+# first; the single-part siblings must then merge in one batch, never finalize alone.
+batched=0
+for i in 1 2; do
+  compact_log="$ROOT/.e2e/compact-$i.log"
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    worker \
+    -role=compactor \
+    -s3-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL" \
+    -compact-window=1h \
+    -once 2>&1 | tee "$compact_log"
+  if grep -F "finalized compact-ready artifacts" "$compact_log" >/dev/null; then
+    echo "compact worker finalized a single-part artifact that still has a sibling" >&2
+    exit 1
+  fi
+  if ! grep -F "completed compact batch" "$compact_log" >/dev/null; then
+    echo "expected compact worker to complete a compact batch" >&2
+    exit 1
+  fi
+  if grep -F "claimed compact-ready batch" "$compact_log" | grep -F "input_artifacts=2" >/dev/null; then
+    if ! grep -F "completed compact batch" "$compact_log" | grep -F "output_parts=1" >/dev/null; then
+      echo "expected compact worker to merge sibling artifacts into one part" >&2
+      exit 1
+    fi
+    batched=1
+    break
+  fi
+done
+if (( batched == 0 )); then
+  echo "expected compact worker to batch sibling artifacts" >&2
   exit 1
 fi
 
@@ -513,8 +516,8 @@ diff -u e2e/expected.tsv "$ROOT/.e2e/actual.tsv"
 
 output_part_count="$(docker compose exec -T clickhouse clickhouse-client --query \
   "SELECT count() FROM system.parts WHERE database = 'dst' AND table = 'events_new' AND active")"
-if [[ "$output_part_count" != "$part_count" ]]; then
-  echo "output ClickHouse parts=$output_part_count, expected uploaded parts=$part_count" >&2
+if [[ "$output_part_count" != "1" ]]; then
+  echo "output ClickHouse parts=$output_part_count, expected 1 from $part_count uploaded parts" >&2
   exit 1
 fi
 
