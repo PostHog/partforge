@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import pwd
+import shlex
 import shutil
 import sys
 import urllib.error
@@ -63,23 +64,32 @@ def download(url: str, destination: Path) -> None:
         raise RuntimeError(f"failed to download {url}: {error}") from error
 
 
-def install_function_config(manifest_url: str, names: list[str], destination: Path) -> None:
-    try:
-        with urllib.request.urlopen(manifest_url) as response:
-            source = ET.parse(response).getroot()
-    except (urllib.error.URLError, ET.ParseError) as error:
-        raise RuntimeError(f"failed to load UDF manifest {manifest_url}: {error}") from error
+def install_function_config(manifest_urls: list[str], destination: Path) -> set[Path]:
+    functions: dict[str, ET.Element] = {}
+    for manifest_url in manifest_urls:
+        try:
+            with urllib.request.urlopen(manifest_url) as response:
+                source = ET.parse(response).getroot()
+        except (urllib.error.URLError, ET.ParseError) as error:
+            raise RuntimeError(f"failed to load UDF manifest {manifest_url}: {error}") from error
+        for function in source.findall("function"):
+            name = require_str({"name": function.findtext("name")}, "name")
+            functions[name] = function
 
-    functions = {function.findtext("name"): function for function in source.findall("function")}
-    missing = [name for name in names if name not in functions]
-    if missing:
-        raise ValueError(f"UDF manifest is missing functions: {', '.join(missing)}")
-
+    if not functions:
+        raise ValueError("UDF manifests contain no functions")
+    scripts: set[Path] = set()
     selected = ET.Element("functions")
-    for name in names:
-        selected.append(functions[name])
+    for function in functions.values():
+        command = require_str({"command": function.findtext("command")}, "command")
+        script = Path(shlex.split(command)[0])
+        if script.is_absolute() or ".." in script.parts:
+            raise ValueError(f"invalid UDF script path: {script}")
+        scripts.add(script)
+        selected.append(function)
     ET.indent(selected)
     ET.ElementTree(selected).write(destination, encoding="unicode")
+    return scripts
 
 
 def chown_clickhouse(paths: list[Path]) -> None:
@@ -103,11 +113,10 @@ def load_config(config_path: Path) -> dict[str, Any]:
 def install_udfs(config_path: Path, arch: str, config_dir: Path, data_path: Path) -> None:
     config = load_config(config_path)
     base_url = source_url(config)
-    manifest_path = require_str(config, "manifest_path")
+    manifest_paths = config.get("manifest_paths")
+    if not isinstance(manifest_paths, list) or not manifest_paths or not all(isinstance(path, str) and path for path in manifest_paths):
+        raise ValueError("missing non-empty string list field: manifest_paths")
     binary_source_path = require_str(config, "binary_path")
-    udfs = config.get("udfs")
-    if not isinstance(udfs, list) or not udfs:
-        raise ValueError("missing non-empty list field: udfs")
 
     config_d_dir = config_dir / "config.d"
     user_defined_dir = config_dir / "user_defined"
@@ -126,29 +135,22 @@ def install_udfs(config_path: Path, arch: str, config_dir: Path, data_path: Path
     loader_config_path.chmod(0o644)
     installed_paths.append(loader_config_path)
 
-    function_names: list[str] = []
-    binaries: list[str] = []
-    for udf in udfs:
-        if not isinstance(udf, dict):
-            raise ValueError("each UDF entry must be a YAML object")
-
-        binaries.append(require_str(udf, "binary_name"))
-        names = udf.get("function_names")
-        if not isinstance(names, list) or not names or not all(isinstance(name, str) and name for name in names):
-            raise ValueError("each UDF entry must have non-empty string list field: function_names")
-        function_names.extend(names)
-
-    source_arch = {"amd64": "x86_64", "arm64": "aarch64"}[arch]
-    for binary_name in binaries:
-        binary_path = user_scripts_dir / binary_name
-        download(url_for(base_url, f"{binary_source_path}/{binary_name}_{source_arch}"), binary_path)
-        binary_path.chmod(0o550)
-        installed_paths.append(binary_path)
-
     function_config_path = user_defined_dir / "clickhouse-util-udfs_function.xml"
-    install_function_config(url_for(base_url, manifest_path), function_names, function_config_path)
+    scripts = install_function_config([url_for(base_url, path) for path in manifest_paths], function_config_path)
     function_config_path.chmod(0o644)
     installed_paths.append(function_config_path)
+    source_arch = {"amd64": "x86_64", "arm64": "aarch64"}[arch]
+    files = set(scripts)
+    for script in scripts:
+        if script.suffix != ".py":
+            files.add(Path(f"{script}_{source_arch}"))
+            files.add(script.parent / "run_udf.sh")
+    for script in sorted(files):
+        script_path = user_scripts_dir / script
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        download(url_for(base_url, f"{binary_source_path}/{script}"), script_path)
+        script_path.chmod(0o550)
+        installed_paths.append(script_path)
 
     chown_clickhouse(installed_paths)
 
