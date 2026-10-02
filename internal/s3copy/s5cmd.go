@@ -15,8 +15,11 @@ import (
 )
 
 const (
-	s5cmdRetries       = 3
-	s5cmdShutdownGrace = 5 * time.Second
+	// Match s5cmd's native request retry budget so throttled multipart requests
+	// can back off before we restart the entire transfer command.
+	s5cmdRequestRetries = 10
+	s5cmdCommandRetries = 3
+	s5cmdShutdownGrace  = 5 * time.Second
 )
 
 var s5cmdRetryBaseDelay = time.Second
@@ -134,7 +137,7 @@ func (c Copier) runS5cmd(ctx context.Context, fullArgs []string, acceptErr func(
 }
 
 func (c Copier) runS5cmdInput(ctx context.Context, fullArgs []string, input []byte, acceptErr func(error) bool) error {
-	maxAttempts := s5cmdRetries + 1
+	maxAttempts := s5cmdCommandRetries + 1
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		err := c.runArgs(ctx, fullArgs, input)
@@ -218,7 +221,7 @@ func (c Copier) copyArgs(args ...string) []string {
 }
 
 func (c Copier) args(command string, args ...string) []string {
-	fullArgs := []string{"--log=error", "--retry-count", fmt.Sprintf("%d", s5cmdRetries)}
+	fullArgs := []string{"--log=error", "--retry-count", fmt.Sprintf("%d", s5cmdRequestRetries)}
 	if c.NumWorkers > 0 {
 		fullArgs = append(fullArgs, "--numworkers", fmt.Sprintf("%d", c.NumWorkers))
 	}

@@ -22,7 +22,7 @@ func TestCopyArgsUseSharedS5cmdRetries(t *testing.T) {
 	got := copier.copyArgs("/tmp/source/", "s3://bucket/prefix/")
 	want := []string{
 		"--log=error",
-		"--retry-count", "3",
+		"--retry-count", "10",
 		"--numworkers", "64",
 		"--endpoint-url", "http://localhost:4566",
 		"cp",
@@ -39,7 +39,7 @@ func TestDeleteArgsUseSharedS5cmdRetries(t *testing.T) {
 	got := copier.deleteArgs("s3://bucket/prefix/*")
 	want := []string{
 		"--log=error",
-		"--retry-count", "3",
+		"--retry-count", "10",
 		"--numworkers", "64",
 		"--endpoint-url", "http://localhost:4566",
 		"rm",
@@ -55,7 +55,7 @@ func TestCopyArgsOmitsNumWorkersWhenUnset(t *testing.T) {
 	got := copier.copyArgs("/tmp/source/", "s3://bucket/prefix/")
 	want := []string{
 		"--log=error",
-		"--retry-count", "3",
+		"--retry-count", "10",
 		"cp",
 		"/tmp/source/",
 		"s3://bucket/prefix/",
@@ -141,7 +141,7 @@ func TestCopyObjectsRunsBatchFromStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(args), "--log=error --retry-count 3 --numworkers 8 --endpoint-url http://localhost:4566 run"; got != want {
+	if got, want := string(args), "--log=error --retry-count 10 --numworkers 8 --endpoint-url http://localhost:4566 run"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 	stdin, err := os.ReadFile(stdinFile)
