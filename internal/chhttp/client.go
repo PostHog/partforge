@@ -3,8 +3,10 @@ package chhttp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +25,32 @@ type QueryOptions struct {
 }
 
 type QuerySettings map[string]string
+
+type QuerySummary struct {
+	ReadRows        uint64 `json:"read_rows,string"`
+	ReadBytes       uint64 `json:"read_bytes,string"`
+	TotalRowsApprox uint64 `json:"total_rows_to_read,string"`
+	WrittenRows     uint64 `json:"written_rows,string"`
+	WrittenBytes    uint64 `json:"written_bytes,string"`
+}
+
+func (c Client) ExecWithSummary(ctx context.Context, query string, opts QueryOptions) (QuerySummary, error) {
+	opts.Settings = maps.Clone(opts.Settings)
+	if opts.Settings == nil {
+		opts.Settings = make(QuerySettings)
+	}
+	// Buffer the response so the summary contains the final counters.
+	opts.Settings["wait_end_of_query"] = "1"
+	_, headers, err := c.query(ctx, query, opts)
+	if err != nil {
+		return QuerySummary{}, err
+	}
+	var summary QuerySummary
+	if err := json.Unmarshal([]byte(headers.Get("X-ClickHouse-Summary")), &summary); err != nil {
+		return QuerySummary{}, fmt.Errorf("decode ClickHouse query summary: %w", err)
+	}
+	return summary, nil
+}
 
 type QueryError struct {
 	StatusCode int
@@ -48,16 +76,21 @@ func (c Client) QueryString(ctx context.Context, query string) (string, error) {
 }
 
 func (c Client) QueryStringWithOptions(ctx context.Context, query string, opts QueryOptions) (string, error) {
+	body, _, err := c.query(ctx, query, opts)
+	return body, err
+}
+
+func (c Client) query(ctx context.Context, query string, opts QueryOptions) (string, http.Header, error) {
 	if strings.TrimSpace(c.URL) == "" {
-		return "", fmt.Errorf("clickhouse URL is empty")
+		return "", nil, fmt.Errorf("clickhouse URL is empty")
 	}
 	endpoint, err := c.endpoint(opts)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(query))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Close = true
 	if c.User != "" {
@@ -65,17 +98,17 @@ func (c Client) QueryStringWithOptions(ctx context.Context, query string, opts Q
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", &QueryError{StatusCode: resp.StatusCode, Body: string(body)}
+		return "", nil, &QueryError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
-	return string(body), nil
+	return string(body), resp.Header, nil
 }
 
 func (c Client) endpoint(opts QueryOptions) (string, error) {

@@ -24,6 +24,9 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:26.6.8.7
+    environment:
+      CLICKHOUSE_UID: ${CLICKHOUSE_UID:-101}
+      CLICKHOUSE_GID: ${CLICKHOUSE_GID:-101}
     ports:
       - "18123:8123"
     volumes:

@@ -1046,12 +1046,17 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 		return metrics.QueryProgress{}, err
 	}
 
-	errCh := make(chan error, 1)
+	type insertResult struct {
+		summary chhttp.QuerySummary
+		err     error
+	}
+	errCh := make(chan insertResult, 1)
 	go func() {
-		errCh <- p.ClickHouse.ExecWithOptions(queryCtx, m.SQL.InsertSelect, chhttp.QueryOptions{
+		summary, err := p.ClickHouse.ExecWithSummary(queryCtx, m.SQL.InsertSelect, chhttp.QueryOptions{
 			QueryID:  queryID,
 			Settings: settings,
 		})
+		errCh <- insertResult{summary, err}
 	}()
 
 	recorder := p.recorder()
@@ -1061,21 +1066,16 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 	defer ticker.Stop()
 	for {
 		select {
-		case err := <-errCh:
-			if err != nil {
+		case result := <-errCh:
+			if result.err != nil {
+				return progress, result.err
+			}
+			finalProgress := metrics.QueryProgress(result.summary)
+			snapshot := tracker.snapshot(finalProgress, false)
+			recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
+			progress = finalProgress
+			if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
 				return progress, err
-			}
-			finalProgress, found, err := p.queryLogProgress(ctx, queryID)
-			if err != nil {
-				return progress, fmt.Errorf("read final query progress: %w", err)
-			}
-			if found {
-				snapshot := tracker.snapshot(finalProgress, false)
-				recorder.ObserveProgress(m, *tracker.snapshot(progress, false).QueryProgress, *snapshot.QueryProgress)
-				progress = finalProgress
-				if err := p.reportInsertProgress(ctx, m, snapshot); err != nil {
-					return progress, err
-				}
 			}
 			return progress, nil
 		case <-ticker.C:
@@ -1598,19 +1598,6 @@ func (p Processor) destinationFailedMergeCount(ctx context.Context, target merge
 func (p Processor) queryProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {
 	query := "SELECT read_rows, read_bytes, total_rows_approx, written_rows, written_bytes FROM system.processes WHERE query_id = " +
 		chhttp.StringLiteral(queryID) + " FORMAT TSV"
-	out, err := p.ClickHouse.QueryString(ctx, query)
-	if err != nil {
-		return metrics.QueryProgress{}, false, err
-	}
-	return parseQueryProgress(out)
-}
-
-func (p Processor) queryLogProgress(ctx context.Context, queryID string) (metrics.QueryProgress, bool, error) {
-	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
-		return metrics.QueryProgress{}, false, err
-	}
-	query := "SELECT read_rows, read_bytes, read_rows, written_rows, written_bytes FROM system.query_log WHERE query_id = " +
-		chhttp.StringLiteral(queryID) + " AND type = 'QueryFinish' ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
 		return metrics.QueryProgress{}, false, err
