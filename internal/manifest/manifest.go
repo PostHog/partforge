@@ -26,6 +26,8 @@ type Manifest struct {
 	SQL       SQLBundle  `json:"sql"`
 	S3        S3Refs     `json:"s3"`
 	CreatedAt time.Time  `json:"created_at"`
+
+	ClickHouseBuild string `json:"clickhouse_build,omitempty"`
 }
 
 type TableRef struct {
@@ -59,6 +61,9 @@ type SourceObject struct {
 }
 
 func (m Manifest) Validate() error {
+	if _, err := ResolveClickHouseBuild(m.ClickHouseBuild); err != nil {
+		return err
+	}
 	if m.Version != Version {
 		return Error("unsupported manifest version")
 	}
@@ -86,6 +91,17 @@ func (m Manifest) Validate() error {
 }
 
 type Error string
+
+func ResolveClickHouseBuild(build string) (string, error) {
+	switch build {
+	case "", "26.6":
+		return "26.6", nil
+	case "26.9-posthog":
+		return build, nil
+	default:
+		return "", Error("clickhouse-build must be 26.6 or 26.9-posthog")
+	}
+}
 
 func (e Error) Error() string { return string(e) }
 

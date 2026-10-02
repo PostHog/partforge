@@ -17,7 +17,8 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     GOPROXY=off CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=readonly -o /out/partforge ./cmd/partforge
 
-FROM clickhouse/clickhouse-server:26.6.1.1193 AS clickhouse
+FROM clickhouse/clickhouse-server:26.6.8.7 AS clickhouse
+FROM ghcr.io/posthog/clickhouse-posthog:26.9.5.2-posthog-2dbc5ba2dd25 AS clickhouse-posthog
 
 FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
@@ -32,7 +33,9 @@ RUN apt-get update \
     && ln -s clickhouse /usr/bin/clickhouse-server \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=clickhouse /usr/bin/clickhouse /usr/bin/clickhouse
+COPY --from=clickhouse-posthog /usr/bin/clickhouse /usr/bin/clickhouse-26.9-posthog
 COPY --from=clickhouse --chown=clickhouse:clickhouse --chmod=0400 /etc/clickhouse-server/config.xml /etc/clickhouse-server/users.xml /etc/clickhouse-server/
+COPY --from=clickhouse-posthog --chown=clickhouse:clickhouse --chmod=0400 /etc/clickhouse-server/config.xml /etc/clickhouse-server/users.xml /etc/clickhouse-server-26.9-posthog/
 COPY --from=clickhouse --chmod=0644 /etc/clickhouse-client/config.xml /etc/clickhouse-client/config.xml
 
 FROM clickhouse-runtime AS clickhouse-util-udfs
@@ -53,6 +56,8 @@ COPY --from=s5cmd /s5cmd /usr/local/bin/s5cmd
 COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/etc/clickhouse-server/config.d/clickhouse-util-udfs.xml /etc/clickhouse-server/config.d/clickhouse-util-udfs.xml
 COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/etc/clickhouse-server/user_defined/ /etc/clickhouse-server/user_defined/
 COPY --from=clickhouse-util-udfs --chown=clickhouse:clickhouse /out/var/lib/clickhouse/user_scripts/ /var/lib/clickhouse/user_scripts/
+RUN cp -a /etc/clickhouse-server/users.d /etc/clickhouse-server/config.d /etc/clickhouse-server-26.9-posthog/
+COPY --chown=clickhouse:clickhouse clickhouse/posthog.xml /etc/clickhouse-server-26.9-posthog/users.d/posthog.xml
 RUN chmod 0755 /usr/local/bin/partforge /usr/local/bin/s5cmd
 USER root
 ENTRYPOINT ["/usr/local/bin/partforge"]

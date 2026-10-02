@@ -11,6 +11,7 @@ COPY_JOB_ID="e2e-copy-job"
 BACKUP_JOB_ID="e2e-backup-job"
 BACKUP_COPY_JOB_ID="e2e-backup-copy-job"
 JOB_NAME="E2E import"
+CLICKHOUSE_BUILD="${PARTFORGE_E2E_CLICKHOUSE_BUILD:-26.6}"
 
 cd "$ROOT"
 
@@ -132,11 +133,11 @@ docker compose exec -T clickhouse clickhouse-client --query \
   "BACKUP TABLE src.events TO S3('http://localstack:4566/partforge/e2e-native-incremental', 'test', 'test') SETTINGS base_backup = S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')"
 
 # Production backup metadata uses s3:// base locators. ClickHouse preserves the
-# LocalStack HTTP endpoint and credentials, so normalize only this test index.
+# LocalStack HTTP endpoint, so normalize only this test index.
 docker compose exec -T localstack awslocal s3 cp \
   s3://partforge/e2e-native-incremental/.backup /tmp/e2e-native-incremental.backup >/dev/null
 docker compose exec -T localstack sed -i \
-  "s#S3('http://localstack:4566/partforge/e2e-native-backup', 'test', 'test')#S3('s3://partforge/e2e-native-backup')#" \
+  "s#S3('http://localstack:4566/partforge/e2e-native-backup')#S3('s3://partforge/e2e-native-backup')#" \
   /tmp/e2e-native-incremental.backup
 docker compose exec -T localstack grep -F \
   "<base_backup>S3('s3://partforge/e2e-native-backup')</base_backup>" \
@@ -167,6 +168,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   -v "$ROOT:/work:ro" \
   worker \
   upload-backup \
+  -clickhouse-build="$CLICKHOUSE_BUILD" \
   -backup=s3://partforge/e2e-native-incremental \
   --include-partitions=202401 \
   -database=src \
@@ -238,6 +240,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   -v "$ROOT:/work:ro" \
   worker \
   upload-backup \
+  -clickhouse-build="$CLICKHOUSE_BUILD" \
   -backup=s3://partforge/e2e-native-backup \
   --include-partitions=202401 \
   -database=src \
@@ -275,6 +278,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -v "$DATA_DIR:/var/lib/clickhouse" \
   worker \
   upload-freeze \
+  -clickhouse-build="$CLICKHOUSE_BUILD" \
   -database=src \
   -table=events \
   -freeze=e2e_freeze \
@@ -304,6 +308,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -v "$ROOT:/work:ro" \
   worker \
   upload-freeze \
+  -clickhouse-build="$CLICKHOUSE_BUILD" \
   -copy-parts-from-job="$JOB_ID" \
   -destination-schema-file=e2e/sql/destination.sql \
   -insert-select-file=e2e/sql/insert.sql \
@@ -348,6 +353,14 @@ for i in $(seq 1 "$part_count"); do
     -postgres-url="$POSTGRES_URL" \
     -once 2>&1 | tee "$worker_log"
   assert_worker_insert_memory_settings "$worker_log"
+  expected_binary=clickhouse
+  if [[ "$CLICKHOUSE_BUILD" == "26.9-posthog" ]]; then
+    expected_binary=clickhouse-26.9-posthog
+  fi
+  if ! grep -F "binary=$expected_binary config_file=" "$worker_log" >/dev/null; then
+    echo "worker did not use ClickHouse build $CLICKHOUSE_BUILD" >&2
+    exit 1
+  fi
   if grep -F 'stage=restart_clickhouse' "$worker_log" >/dev/null; then
     echo "inserter unexpectedly restarted ClickHouse after inserting" >&2
     exit 1
@@ -377,6 +390,7 @@ fi
 # Empty rewrites finish immediately and remain importable without S3 artifacts.
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   --workdir /work -v "$ROOT:/work:ro" worker upload-freeze \
+  -clickhouse-build="$CLICKHOUSE_BUILD" \
   -copy-parts-from-job="$JOB_ID" \
   -destination-schema-file=e2e/sql/destination.sql \
   -insert-select-file=e2e/sql/empty-insert.sql \
@@ -424,6 +438,10 @@ for i in 1 2; do
     -once 2>&1 | tee "$compact_log"
   if grep -F "finalized compact-ready artifacts" "$compact_log" >/dev/null; then
     echo "compact worker finalized a single-part artifact that still has a sibling" >&2
+    exit 1
+  fi
+  if ! grep -F "binary=$expected_binary config_file=" "$compact_log" >/dev/null; then
+    echo "compactor did not use ClickHouse build $CLICKHOUSE_BUILD" >&2
     exit 1
   fi
   if ! grep -F "completed compact batch" "$compact_log" >/dev/null; then
@@ -528,4 +546,4 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   -s3-endpoint=http://localstack:4566 \
   -postgres-url="$POSTGRES_URL"
 
-echo "e2e passed with $part_count frozen parts"
+echo "e2e passed with $part_count frozen parts using $CLICKHOUSE_BUILD"

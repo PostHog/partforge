@@ -131,6 +131,7 @@ type StageProgress struct {
 }
 
 type WorkItem struct {
+	ClickHouseBuild     string
 	Bucket              string
 	SourceKey           string
 	FinishedKey         string
@@ -363,6 +364,10 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	m, err := artifact.ReadManifest(sourceRoot)
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
+	}
+	m.ClickHouseBuild, err = manifest.ResolveClickHouseBuild(item.ClickHouseBuild)
+	if err != nil {
+		return ProcessResult{}, err
 	}
 	sourceManifest = &m
 	slog.Info(

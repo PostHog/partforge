@@ -64,7 +64,9 @@ jobs:
       - name: Run end-to-end tests
         env:
           PARTFORGE_E2E_SKIP_BUILD: "1"
-        run: ./e2e/run.sh
+        run: |
+          ./e2e/run.sh
+          PARTFORGE_E2E_CLICKHOUSE_BUILD=26.9-posthog ./e2e/run.sh
 
       - name: Clean up end-to-end services
         if: always()
