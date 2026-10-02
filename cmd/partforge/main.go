@@ -1681,7 +1681,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
 		"max_memory_usage_raw", insertSettings["max_memory_usage"],
-		"input_format_json_max_string_column_growth_step", insertSettings["input_format_json_max_string_column_growth_step"],
 		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", compactMergeBackgroundPoolSize,
 		"merge_concurrency_ratio", compactMergeConcurrencyRatio,

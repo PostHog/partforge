@@ -18,8 +18,8 @@ func TestInsertSelectSettings(t *testing.T) {
 	if settings["max_memory_usage"] != "7000" {
 		t.Fatalf("max_memory_usage = %q", settings["max_memory_usage"])
 	}
-	if settings["input_format_json_max_string_column_growth_step"] != "67108864" {
-		t.Fatalf("JSON growth step = %q", settings["input_format_json_max_string_column_growth_step"])
+	if len(settings) != 3 {
+		t.Fatalf("unexpected insert settings: %v", settings)
 	}
 	if _, ok := settings["max_block_size"]; ok {
 		t.Fatal("initial attempt must keep ClickHouse's default block size")
