@@ -16,6 +16,8 @@ Worker flags, metrics, and the admin/recovery commands. For deployment (ECS, IAM
 
 The worker auto-tunes ClickHouse insert and merge settings from detected CPU/memory (memory-capped inserts and a ~150 GiB local merge target), while compactor workers run one merge at a time. The derivation and the merge-wait state machine are documented in [rewrite-flow.md](rewrite-flow.md).
 
+S3 transfers retain their normal concurrency and use s5cmd's native ten retries per failed request, with exponential backoff and jitter (including `503 SlowDown`). This lets throttled multipart requests retry within the current upload before PartForge retries the entire command. Whole-command retries remain limited to three; persistent failures still fail the part. This is request backoff, not automatic worker-pool resizing.
+
 ## Metrics
 
 `partforge worker` serves Prometheus metrics on `:2112/metrics` by default. Use `-metrics-addr=""` to disable, or `-metrics-addr` / `-metrics-path` to change where it listens.
