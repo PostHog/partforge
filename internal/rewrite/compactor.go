@@ -253,8 +253,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		if err != nil {
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
-			} else if fragmentedCompactWaitIsFatal(normalizing, deadlineActive, err) {
-				return CompactResult{}, err
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
 				slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
 			} else if c.mergeStopRequested() && errors.Is(err, context.Canceled) {
@@ -653,10 +651,6 @@ func compactMergeTimeoutUntil(deadline, now time.Time) (time.Duration, bool) {
 		return 0, true
 	}
 	return deadline.Sub(now), true
-}
-
-func fragmentedCompactWaitIsFatal(normalizing, deadlineActive bool, err error) bool {
-	return normalizing && !(deadlineActive && errors.Is(err, context.DeadlineExceeded))
 }
 
 func compactMergeTimeoutsForDeadline(timeout, maxTimeout, remaining time.Duration) (time.Duration, time.Duration) {

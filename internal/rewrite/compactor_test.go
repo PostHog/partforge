@@ -20,7 +20,7 @@ import (
 	"github.com/PostHog/partforge/internal/s3copy"
 )
 
-func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
+func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 	for _, tt := range []struct {
 		name                 string
 		deadline             func() time.Time
@@ -29,6 +29,7 @@ func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
 		wantWait             bool
 		checkWait            bool
 		observerError        bool
+		stop                 string
 		wantError            string
 	}{
 		{
@@ -52,8 +53,45 @@ func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
 			observerError:        true,
 			wantError:            "observe compact merge failures",
 		},
+		{
+			name:                 "manual finalize without deadline releases unchanged input",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 2,
+			stop:                 "manual",
+		},
+		{
+			name:                 "manual finalize before deadline uploads useful output",
+			deadline:             func() time.Time { return time.Now().Add(time.Minute) },
+			partsAfterFirstQuery: 1,
+			stop:                 "manual",
+			wantReduced:          true,
+		},
+		{
+			name:                 "shutdown uploads useful output",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 1,
+			stop:                 "shutdown",
+			wantReduced:          true,
+		},
+		{
+			name:                 "unexpected cancellation remains fatal",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 2,
+			stop:                 "unexpected",
+			wantError:            "context canceled",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			processCtx, cancelProcess := context.WithCancel(context.Background())
+			defer cancelProcess()
+			stopCtx, cancelStop := context.WithCancel(context.Background())
+			defer cancelStop()
+			var manualCtx, shutdownCtx context.Context
+			if tt.stop == "manual" {
+				manualCtx = stopCtx
+			} else if tt.stop == "shutdown" {
+				shutdownCtx = stopCtx
+			}
 			root := t.TempDir()
 			dataPath := filepath.Join(root, "clickhouse", "store", "table")
 			diskPath := filepath.Join(root, "clickhouse")
@@ -90,6 +128,15 @@ func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
 					_, _ = io.WriteString(w, "202601\t"+strconv.FormatUint(parts, 10)+"\t20\t200\n")
 				case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
 					mergeCountQueries.Add(1)
+					if tt.stop != "" {
+						if tt.stop == "unexpected" {
+							cancelProcess()
+						} else {
+							cancelStop()
+						}
+						<-r.Context().Done()
+						return
+					}
 					_, _ = io.WriteString(w, "0\n")
 				case strings.Contains(query, "FROM system.part_log"):
 					if tt.observerError {
@@ -125,6 +172,8 @@ func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
 				MergeSettleMinWait: time.Second,
 				MergePollInterval:  time.Millisecond,
 				MergeDeadline:      tt.deadline(),
+				MergeStopContext:   manualCtx,
+				ShutdownContext:    shutdownCtx,
 				MergeTreeSettings: MergeTreeSettings{
 					MergeMaxBlockSize:        32768,
 					MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
@@ -132,7 +181,7 @@ func TestCompactHandlesFragmentedInputDeadline(t *testing.T) {
 					PoolFreeEntriesThreshold: 1,
 					DefaultCompressionCodec:  "ZSTD(5)",
 				},
-			}).Compact(context.Background(), CompactWorkItem{
+			}).Compact(processCtx, CompactWorkItem{
 				JobID:               "job-1",
 				OutputPartID:        "compact-1",
 				OutputFinishedKey:   "finished/compact-1",
@@ -526,18 +575,6 @@ func TestCompactMergeTimeoutUntil(t *testing.T) {
 	timeout, ok = compactMergeTimeoutUntil(now, now)
 	if !ok || timeout != 0 {
 		t.Fatalf("compactMergeTimeoutUntil elapsed = %s, %t; want 0, true", timeout, ok)
-	}
-}
-
-func TestFragmentedCompactWaitDeadlineIsNotFatal(t *testing.T) {
-	if fragmentedCompactWaitIsFatal(true, true, context.DeadlineExceeded) {
-		t.Fatal("expected fragmented compaction deadline to continue to output measurement")
-	}
-	if !fragmentedCompactWaitIsFatal(true, false, context.DeadlineExceeded) {
-		t.Fatal("expected an unrelated fragmented compaction deadline to remain fatal")
-	}
-	if !fragmentedCompactWaitIsFatal(true, true, errors.New("merge failed")) {
-		t.Fatal("expected a real fragmented compaction error to remain fatal")
 	}
 }
 
