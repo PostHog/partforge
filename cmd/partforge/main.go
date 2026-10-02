@@ -3223,6 +3223,10 @@ func overviewFinalizationForJobs(jobs []state.Job, now time.Time, compactWindow 
 func printOverview(out io.Writer, overview overviewOutput) {
 	fmt.Fprintln(out, "PARTFORGE OVERVIEW")
 	fmt.Fprintf(out, "status: %s\n", overview.Status)
+	printOverviewStats(out, overview)
+}
+
+func printOverviewStats(out io.Writer, overview overviewOutput) {
 	fmt.Fprintf(out, "jobs: %d", overview.Jobs.Total)
 	if value := formatStringCounts(overview.Jobs.ByStatus); value != "" {
 		fmt.Fprintf(out, " (%s)", value)
@@ -3394,19 +3398,31 @@ func runJobStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	jobs, err := stateStore.ListJobsByIDs(ctx, []string{*jobID})
+	if err != nil {
+		return err
+	}
+	stats, err := stateStore.OverviewStats(ctx, []string{*jobID})
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	overview := buildOverview(jobs, stats, now, *compactWindow)
 	summary := summarizeJobWithOptions(*jobID, jobParts, jobSummaryOptions{
-		Now:           time.Now().UTC(),
+		Now:           now,
 		CompactWindow: *compactWindow,
 	})
 	visibleParts := jobStatusVisibleParts(jobParts, *showAllParts)
 	if *jsonOutput {
-		out := jobStatusOutput{Summary: summary}
+		out := jobStatusOutput{Summary: summary, Overview: overview}
 		if *showParts || *showDetails {
 			out.Parts = visibleParts
 		}
 		return writeJSON(os.Stdout, out)
 	}
 	printJobSummary(os.Stdout, summary)
+	fmt.Fprintf(os.Stdout, "\noverview_status: %s\n", overview.Status)
+	printOverviewStats(os.Stdout, overview)
 	if *showParts {
 		printPartRowsWithLookup(os.Stdout, visibleParts, jobParts)
 	}
@@ -4579,6 +4595,9 @@ type jobSummary struct {
 	RewritePercent               float64                  `json:"rewrite_percent"`
 	ImportCompleted              int                      `json:"import_completed"`
 	ImportPercent                float64                  `json:"import_percent"`
+	ImportBytesTotal             uint64                   `json:"import_bytes_total"`
+	ImportBytesCompleted         uint64                   `json:"import_bytes_completed"`
+	ImportBytesPercent           float64                  `json:"import_bytes_percent"`
 	InputClickHouseParts         uint64                   `json:"input_clickhouse_parts"`
 	CurrentOutputClickHouseParts uint64                   `json:"current_output_clickhouse_parts"`
 	ReadRows                     uint64                   `json:"read_rows"`
@@ -4659,8 +4678,9 @@ type failedPart struct {
 }
 
 type jobStatusOutput struct {
-	Summary jobSummary   `json:"summary"`
-	Parts   []state.Part `json:"parts,omitempty"`
+	Summary  jobSummary     `json:"summary"`
+	Overview overviewOutput `json:"overview"`
+	Parts    []state.Part   `json:"parts,omitempty"`
 }
 
 type listJobsOutput struct {
@@ -4895,6 +4915,7 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 	}
 
 	var failed []failedPart
+	var importBytesTotal, importBytesCompleted uint64
 	var inputClickHouseParts, currentOutputClickHouseParts, readRows, readBytes, writtenRows, writtenBytes, failedMerges uint64
 	stageCounts := map[string]int{}
 	stageInputParts := map[string]uint64{}
@@ -4906,6 +4927,12 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 	var activeRewrites []activeRewriteSummary
 	for _, part := range parts {
 		counts[part.Status]++
+		if part.Status != state.StatusSuperseded {
+			importBytesTotal += part.DestinationActivePartBytes
+			if part.Status == state.StatusImported {
+				importBytesCompleted += part.DestinationActivePartBytes
+			}
+		}
 		if !isGeneratedCompactPart(part) {
 			inputClickHouseParts += originalInputPartCount(part)
 		}
@@ -4983,12 +5010,12 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		return activeRewrites[i].PartID < activeRewrites[j].PartID
 	})
 
-	total := len(parts)
-	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusSuperseded] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
+	total := len(parts) - counts[state.StatusSuperseded]
+	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
 	importCompleted := counts[state.StatusImported]
 	return jobSummary{
 		JobID:                        jobID,
-		Status:                       overallStatus(total, counts),
+		Status:                       overallStatus(len(parts), counts),
 		Total:                        total,
 		Counts:                       counts,
 		StatePartStats:               statePartStats(counts, stateInputParts, stateOutputParts),
@@ -5000,6 +5027,9 @@ func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOp
 		RewritePercent:               percent(rewriteCompleted, total),
 		ImportCompleted:              importCompleted,
 		ImportPercent:                percent(importCompleted, total),
+		ImportBytesTotal:             importBytesTotal,
+		ImportBytesCompleted:         importBytesCompleted,
+		ImportBytesPercent:           bytePercent(importBytesCompleted, importBytesTotal),
 		InputClickHouseParts:         inputClickHouseParts,
 		CurrentOutputClickHouseParts: currentOutputClickHouseParts,
 		ReadRows:                     readRows,
@@ -5281,7 +5311,8 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "status: %s\n", summary.Status)
 	fmt.Fprintf(out, "parts: %d\n", summary.Total)
 	fmt.Fprintf(out, "rewrite_complete: %d/%d %.1f%%\n", summary.RewriteCompleted, summary.Total, summary.RewritePercent)
-	fmt.Fprintf(out, "import_complete: %d/%d %.1f%%\n", summary.ImportCompleted, summary.Total, summary.ImportPercent)
+	fmt.Fprintf(out, "import_complete: %d/%d\n", summary.ImportCompleted, summary.Total)
+	fmt.Fprintf(out, "import_bytes: %s/%s %.1f%%\n", formatBytes(summary.ImportBytesCompleted), formatBytes(summary.ImportBytesTotal), summary.ImportBytesPercent)
 	fmt.Fprintf(out, "input_clickhouse_parts: %d\n", summary.InputClickHouseParts)
 	fmt.Fprintf(out, "current_output_clickhouse_parts: %d\n", summary.CurrentOutputClickHouseParts)
 	fmt.Fprintf(out, "read: %d rows %s\n", summary.ReadRows, formatBytes(summary.ReadBytes))

@@ -241,6 +241,38 @@ func TestSummarizeJobPartCounts(t *testing.T) {
 	}
 }
 
+func TestJobStatusImportProgressExcludesSupersededAndWeightsBytes(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "source", Status: state.StatusSuperseded, DestinationActivePartBytes: 100_000},
+		{PartID: "compact-old", Status: state.StatusSuperseded, CompactGeneration: 1, DestinationActivePartBytes: 50_000},
+		{PartID: "compact-new", Status: state.StatusImported, CompactGeneration: 2, DestinationActivePartBytes: 1024},
+		{PartID: "importing", Status: state.StatusImporting, DestinationActivePartBytes: 2048},
+		{PartID: "finished", Status: state.StatusFinished, DestinationActivePartBytes: 7168},
+	}
+	summary := summarizeJob("job-1", parts)
+	if summary.Total != 3 || summary.RewriteCompleted != 3 || summary.RewritePercent != 100 || summary.ImportCompleted != 1 {
+		t.Fatalf("artifact progress = %+v", summary)
+	}
+	if summary.Status != "IMPORTING" || summary.Counts[state.StatusSuperseded] != 2 {
+		t.Fatalf("state counts = %+v", summary)
+	}
+	if summary.ImportBytesTotal != 10240 || summary.ImportBytesCompleted != 1024 || summary.ImportBytesPercent != 10 {
+		t.Fatalf("byte progress = %+v", summary)
+	}
+	got := captureFileOutput(t, func(out *os.File) { printJobSummary(out, summary) })
+	for _, want := range []string{"parts: 3\n", "rewrite_complete: 3/3 100.0%", "import_complete: 1/3\n", "import_bytes: 1 KB/10 KB 10.0%"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("job-status missing %q:\n%s", want, got)
+		}
+	}
+	parts[3].Status = state.StatusImported
+	parts[4].Status = state.StatusImported
+	summary = summarizeJob("job-1", parts)
+	if summary.Status != "IMPORTED" || summary.ImportCompleted != 3 || summary.ImportBytesPercent != 100 {
+		t.Fatalf("completed import = %+v", summary)
+	}
+}
+
 func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
 	summary := summarizeJob("job-1", []state.Part{
 		{

@@ -308,6 +308,14 @@ func TestPostgresListJobsAggregatesCompletedSourceBytes(t *testing.T) {
 	if len(jobs) != 1 || jobs[0].SourceBytesTotal != 400 || jobs[0].SourceBytesCompleted != 300 || jobs[0].RewriteStartedAt != now.Format(timeFormat) {
 		t.Fatalf("job data progress = %+v", jobs)
 	}
+	seedPostgresParts(t, s, []Part{NewPart("other-job", "other", "bucket", "source/other", "finished/other", now)})
+	scoped, err := s.ListJobsByIDs(ctx, []string{"job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].JobID != "job" || scoped[0].SourceBytesTotal != 400 || scoped[0].SourceBytesCompleted != 300 {
+		t.Fatalf("job-scoped data progress = %+v", scoped)
+	}
 }
 
 func TestPostgresOverviewStatsTracksInitialAndCurrentClickHouseParts(t *testing.T) {

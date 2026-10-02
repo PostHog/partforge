@@ -568,6 +568,14 @@ for metric in input_artifacts initial_ch_parts current_artifacts current_ch_part
   fi
 done
 
+overview_stats="$(tail -n +3 <<<"$overview")"
+if [[ "$compact_status" != *"$overview_stats"* ]]; then
+  echo "job-status did not contain the same job-scoped stats as overview; output:" >&2
+  echo "$compact_status" >&2
+  echo "$overview" >&2
+  exit 1
+fi
+
 finalize_log="$ROOT/.e2e/compact-finalize.log"
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   finalize-compaction \
