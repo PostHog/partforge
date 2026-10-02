@@ -1419,6 +1419,14 @@ func (s *Store) ListJobIDsByStatus(ctx context.Context, statuses ...Status) ([]s
 }
 
 func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job, error) {
+	return s.listJobs(ctx, statuses, nil)
+}
+
+func (s *Store) ListJobsByIDs(ctx context.Context, jobIDs []string) ([]Job, error) {
+	return s.listJobs(ctx, allStatuses, jobIDs)
+}
+
+func (s *Store) listJobs(ctx context.Context, statuses []Status, jobIDs []string) ([]Job, error) {
 	values := make([]string, 0, len(statuses))
 	for _, status := range statuses {
 		if strings.TrimSpace(string(status)) == "" {
@@ -1434,7 +1442,7 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 	COALESCE(data->>'compact_ready_at', '') <> '' OR
 	 (COALESCE((data->>'empty_output')::boolean, false) AND COALESCE(data->>'finished_at', '') <> '') AS rewrite_completed,
  COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb) AS partitions
- FROM `+s.tableSQL+` WHERE status = ANY($1::text[])
+ FROM `+s.tableSQL+` WHERE status = ANY($1::text[]) AND ($2::text[] IS NULL OR job_id = ANY($2::text[]))
  ), partition_counts AS (
  SELECT job_id, count(DISTINCT p.key) AS count FROM selected,
  LATERAL jsonb_each_text(partitions) p
@@ -1446,7 +1454,7 @@ func (s *Store) ListJobsByStatus(ctx context.Context, statuses ...Status) ([]Job
 	COALESCE(min(NULLIF(s.rewrite_started_at, '')) FILTER (WHERE s.source_artifact_bytes > 0), ''),
 	max(s.original_compact_ready_at), bool_or(s.status = 'COMPACT_READY' AND s.compact_normalized)
  FROM selected s LEFT JOIN partition_counts p USING (job_id)
- GROUP BY s.job_id, s.status ORDER BY s.job_id, s.status`, values)
+ GROUP BY s.job_id, s.status ORDER BY s.job_id, s.status`, values, jobIDs)
 	if err != nil {
 		return nil, err
 	}
