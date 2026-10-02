@@ -1710,7 +1710,7 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
-	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
+	compactHeartbeatInterval := 5 * time.Second
 	slog.Info(
 		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
@@ -2159,7 +2159,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 		cancel()
 		if releaseErr != nil {
 			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch: %v", err, releaseErr)
@@ -2205,7 +2205,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if !compactDeadline.IsZero() && !time.Now().UTC().Before(compactDeadline) {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 		cancel()
 		if releaseErr != nil {
 			return true, releaseErr
@@ -2226,6 +2226,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	manualFinalizeCtx, requestManualFinalize := context.WithCancel(context.Background())
 	var manualFinalizeRequested atomic.Bool
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess, func() {
+		slog.Info("received compact finalization request", "stage", "manual_finalize_compact", "job_id", batch.JobID, "output_part_id", outputPartID)
 		manualFinalizeRequested.Store(true)
 		requestManualFinalize()
 	})
@@ -2254,7 +2255,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	if err != nil {
 		if shutdownRequested {
 			stateCtx, cancel := workerStateUpdateContext()
-			releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+			_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 			cancel()
 			if releaseErr != nil {
 				cleanupCompactNow()
@@ -2272,22 +2273,23 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if !result.Reduced {
 		now := time.Now().UTC()
+		var noReductionError error
 		if compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested.Load(), cfg.CompactWindow, compactDeadline, now) {
-			err := fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
-			cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
-			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
-			failErr := markCompactBatchFailed(err)
-			cleanupCompactNow()
-			return true, failErr
+			noReductionError = fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
 		}
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now)
+		failed, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now, noReductionError)
 		cancel()
 		if releaseErr != nil {
 			cleanupCompactNow()
 			return true, releaseErr
 		}
 		cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
+		if failed {
+			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
+			cleanupCompactNow()
+			return true, noReductionError
+		}
 		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
 		if shutdownRequested {
 			slog.Info("worker shutdown requested; stopping after compact batch made no useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
@@ -2576,20 +2578,6 @@ func compactLeaseStaleAfter(compactWindow time.Duration) time.Duration {
 		return 5 * time.Minute
 	}
 	return compactWindow
-}
-
-func compactLeaseHeartbeatInterval(staleAfter time.Duration) time.Duration {
-	if staleAfter <= 0 {
-		return time.Minute
-	}
-	interval := staleAfter / 20
-	if interval < 30*time.Second {
-		return 30 * time.Second
-	}
-	if interval > 5*time.Minute {
-		return 5 * time.Minute
-	}
-	return interval
 }
 
 func compactClaimSplay(compactWindow time.Duration) time.Duration {
@@ -3737,19 +3725,19 @@ func runFinalizeCompaction(ctx context.Context, command string, args []string) e
 	now := time.Now().UTC()
 	rows := make([]finalizeCompactionPartRow, 0, len(selectedParts))
 	requested, finished := 0, 0
-	for _, part := range selectedParts {
-		status, err := stateStore.RequestCompactFinalization(ctx, part, now)
-		if err != nil {
-			return err
-		}
-		if status == state.StatusFinished {
+	updatedParts, err := stateStore.RequestCompactFinalization(ctx, selectedParts, now)
+	if err != nil {
+		return err
+	}
+	for _, part := range updatedParts {
+		if part.Status == state.StatusFinished {
 			finished++
 		} else {
 			requested++
 		}
 		rows = append(rows, finalizeCompactionPartRow{
 			PartID:       part.PartID,
-			Status:       status,
+			Status:       part.Status,
 			WorkerID:     part.WorkerID,
 			OutputPartID: part.CompactOutputPartID,
 			RequestedAt:  now.Format(time.RFC3339Nano),

@@ -435,6 +435,73 @@ fi
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker delete-job \
   -job-id=e2e-empty-job -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 
+# Finalize a running compactor with the default window. Hold its download so
+# the real CLI request reaches the worker before merge waiting starts.
+(
+  compact_container=partforge-e2e-finalize-active
+  trap 'docker rm -f "$compact_container" >/dev/null 2>&1 || true' EXIT
+  state_columns="job_id, part_id, status, worker_id, created_at, updated_at, data, source_artifact_bytes, compact_bytes, compact_parts, compact_eligible, compact_normalized, compact_stale_at, original_compact_ready_at, source_job_id, source_part_id"
+  docker compose exec -T postgres psql -U partforge -d partforge -v ON_ERROR_STOP=1 -c \
+    "CREATE TABLE e2e_finalize_inputs AS SELECT $state_columns FROM partforge_state WHERE job_id = '$JOB_ID'"
+  cat > "$ROOT/.e2e/hold-compact-download" <<'SH'
+#!/bin/sh
+touch /work/.e2e/compact-download-started
+while [ ! -f /work/.e2e/release-compact-download ]; do sleep 0.1; done
+exec /usr/local/bin/s5cmd "$@"
+SH
+  chmod +x "$ROOT/.e2e/hold-compact-download"
+  active_log="$ROOT/.e2e/finalize-active-worker.log"
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --name "$compact_container" \
+    -v "$ROOT/.e2e:/work/.e2e" worker worker -role=compactor -once \
+    -s5cmd-binary=/work/.e2e/hold-compact-download \
+    -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL" \
+    > "$active_log" 2>&1 &
+  compact_pid=$!
+  for _ in $(seq 1 300); do
+    if [[ -f "$ROOT/.e2e/compact-download-started" ]]; then break; fi
+    sleep 0.1
+  done
+  if [[ ! -f "$ROOT/.e2e/compact-download-started" ]]; then
+    cat "$active_log" >&2
+    echo "compactor did not start downloading its input" >&2
+    exit 1
+  fi
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker finalize-compaction \
+    -job-id="$JOB_ID" -all -force -postgres-url="$POSTGRES_URL" \
+    > "$ROOT/.e2e/finalize-active-command.log"
+  for _ in $(seq 1 100); do
+    if grep -F 'received compact finalization request' "$active_log" >/dev/null; then break; fi
+    sleep 0.1
+  done
+  if ! grep -F 'received compact finalization request' "$active_log" >/dev/null; then
+    cat "$active_log" >&2
+    echo "default-window compactor did not acknowledge finalization within 10 seconds" >&2
+    exit 1
+  fi
+  touch "$ROOT/.e2e/release-compact-download"
+  wait "$compact_pid"
+  unfinished="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+    "SELECT count(*) FROM partforge_state WHERE job_id = '$JOB_ID' AND status NOT IN ('FINISHED', 'SUPERSEDED')")"
+  if [[ "$unfinished" != "0" ]]; then
+    cat "$active_log" >&2
+    echo "finalization left $unfinished artifacts unfinished" >&2
+    exit 1
+  fi
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
+    -v "$DATA_DIR:/var/lib/clickhouse" worker import-finished \
+    -database=dst -table=events_new -job-id="$JOB_ID" \
+    -clickhouse-url="$CH_HTTP_DOCKER" -s3-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL"
+  docker compose exec -T clickhouse clickhouse-client --query \
+    "SELECT id, name, amount_text, event_date, migrated FROM dst.events_new ORDER BY id FORMAT TSV" \
+    > "$ROOT/.e2e/finalize-active-import.tsv"
+  diff -u e2e/expected.tsv "$ROOT/.e2e/finalize-active-import.tsv"
+  # Restore the fixture to exercise ordinary compaction and import below.
+  docker compose exec -T clickhouse clickhouse-client --query "TRUNCATE TABLE dst.events_new"
+  docker compose exec -T postgres psql -U partforge -d partforge -v ON_ERROR_STOP=1 -c \
+    "BEGIN; DELETE FROM partforge_state WHERE job_id = '$JOB_ID'; INSERT INTO partforge_state ($state_columns) SELECT $state_columns FROM e2e_finalize_inputs; DROP TABLE e2e_finalize_inputs; COMMIT"
+)
+
 # Rewrites leave one or more single-part artifacts in 202401, depending on whether
 # chunk merges finished before measurement. A fragmented artifact is normalized
 # first; the single-part siblings must then merge in one batch, never finalize alone.

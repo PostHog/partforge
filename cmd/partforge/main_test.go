@@ -1189,9 +1189,6 @@ func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
 	if staleAfter != 2*time.Hour {
 		t.Fatalf("compactLeaseStaleAfter = %s, want 2h", staleAfter)
 	}
-	if got := compactLeaseHeartbeatInterval(staleAfter); got != 5*time.Minute {
-		t.Fatalf("compactLeaseHeartbeatInterval = %s, want 5m cap", got)
-	}
 	if got := compactLeaseStaleAfter(time.Minute); got != 5*time.Minute {
 		t.Fatalf("compactLeaseStaleAfter short window = %s, want 5m floor", got)
 	}
