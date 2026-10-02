@@ -170,8 +170,7 @@ func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 		switch {
 		case strings.HasPrefix(query, "INSERT "):
 			insertSettings = r.URL.Query()
-		case query == "SYSTEM FLUSH LOGS":
-		case strings.Contains(query, "system.query_log"):
+			w.Header().Set("X-ClickHouse-Summary", `{"written_rows":"1"}`)
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -404,6 +403,7 @@ func TestInsertRetryTiming(t *testing.T) {
 				query := string(body)
 				switch {
 				case strings.HasPrefix(query, "INSERT "):
+					w.Header().Set("X-ClickHouse-Summary", `{"written_rows":"1"}`)
 					inserts++
 					if tc.failFirst && inserts == 1 {
 						http.Error(w, tc.insertError, http.StatusInternalServerError)
@@ -415,7 +415,7 @@ func TestInsertRetryTiming(t *testing.T) {
 					if tc.cancelRecovery {
 						cancel()
 					}
-				case strings.HasPrefix(query, "CREATE TABLE "), query == "SYSTEM FLUSH LOGS", strings.Contains(query, "system.query_log"):
+				case strings.HasPrefix(query, "CREATE TABLE "):
 				default:
 					t.Errorf("unexpected query: %s", query)
 				}

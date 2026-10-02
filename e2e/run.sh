@@ -13,6 +13,9 @@ BACKUP_COPY_JOB_ID="e2e-backup-copy-job"
 JOB_NAME="E2E import"
 CLICKHOUSE_BUILD="${PARTFORGE_E2E_CLICKHOUSE_BUILD:-26.6}"
 
+# The host runner must own bind-mounted data for cleanup between builds.
+export CLICKHOUSE_UID="$(id -u)" CLICKHOUSE_GID="$(id -g)"
+
 cd "$ROOT"
 
 log_value() {

@@ -58,14 +58,17 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 					switch inserts {
 					case 1:
 						staged = []int{0, 1, 2}
+						w.Header().Set("X-ClickHouse-Summary", `{"read_rows":"6","read_bytes":"60","written_rows":"3","written_bytes":"30"}`)
 					case 2:
 						// A failed INSERT can already have written some parts.
 						staged = []int{3}
 						http.Error(w, "Code: 241. MEMORY_LIMIT_EXCEEDED", 500)
 					case 3:
 						staged = append(staged, 3, 4)
+						w.Header().Set("X-ClickHouse-Summary", `{"read_rows":"4","read_bytes":"40","written_rows":"2","written_bytes":"20"}`)
 					case 4:
 						// Last range is filtered out: it must still complete.
+						w.Header().Set("X-ClickHouse-Summary", `{"read_rows":"0","written_rows":"0"}`)
 					default:
 						t.Errorf("unexpected insert attempt %d", inserts)
 					}
@@ -99,17 +102,7 @@ func TestInsertChunksPreserveCompletedOutput(t *testing.T) {
 				case query == "EXCHANGE TABLES `db`.`dst` AND `db`.`dst__partforge_completed`":
 					exchanged = true
 				case query == "CREATE TABLE `db`.`dst__partforge_completed` AS `db`.`dst`",
-					query == "DROP TABLE `db`.`dst__partforge_completed` SYNC",
-					query == "SYSTEM FLUSH LOGS":
-				case strings.Contains(query, "system.query_log"):
-					switch inserts {
-					case 1:
-						fmt.Fprint(w, "6\t60\t6\t3\t30\n")
-					case 3:
-						fmt.Fprint(w, "4\t40\t4\t2\t20\n")
-					case 4:
-						fmt.Fprint(w, "0\t0\t0\t0\t0\n")
-					}
+					query == "DROP TABLE `db`.`dst__partforge_completed` SYNC":
 				default:
 					t.Errorf("unexpected query: %s", query)
 				}
@@ -181,6 +174,7 @@ func TestInsertFailureNote(t *testing.T) {
 					fmt.Fprint(w, "1\t7\t100\n")
 				}
 				if strings.HasPrefix(query, "INSERT ") {
+					w.Header().Set("X-ClickHouse-Summary", `{"written_rows":"1"}`)
 					inserts++
 					if inserts == tc.failInsert {
 						http.Error(w, "MEMORY_LIMIT_EXCEEDED", 500)
