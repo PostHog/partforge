@@ -503,12 +503,12 @@ done
 
 finalize_log="$ROOT/.e2e/compact-finalize.log"
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
-  worker \
-  -role=compactor \
-  -s3-endpoint=http://localstack:4566 \
+  finalize-compaction \
+  -job-id="$JOB_ID" \
+  -all \
+  -force \
   -postgres-url="$POSTGRES_URL" \
-  -compact-window=0s \
-  -once 2>&1 | tee "$finalize_log"
+  2>&1 | tee "$finalize_log"
 
 status="$(
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
@@ -522,8 +522,8 @@ if [[ "${status:-}" != "READY_FOR_IMPORT" ]]; then
   echo "job did not reach READY_FOR_IMPORT; status=${status:-<empty>}" >&2
   exit 1
 fi
-if ! grep -F "finalized compact-ready artifacts" "$finalize_log" >/dev/null; then
-  echo "expected compact worker to finalize normalized artifacts" >&2
+if ! grep -E '^finished: [1-9][0-9]*$' "$finalize_log" >/dev/null; then
+  echo "expected finalize-compaction to finish compact-ready artifacts immediately" >&2
   exit 1
 fi
 

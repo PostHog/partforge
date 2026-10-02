@@ -562,17 +562,14 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 		if batch == nil || batch.Parts[0].PartID != test.want {
 			t.Fatalf("claim for %+v = %+v, want %s", opts, batch, test.want)
 		}
-		if err := s.RequestCompactFinalization(ctx, batch.Parts[0], now); err != nil {
-			t.Fatal(err)
-		}
 		if err := s.UpdateCompactProgress(ctx, *batch, "output", "test", PartStats{Count: 2}, PartStats{Count: 1}, CompactProgress{Stage: "merging"}, now); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.HeartbeatCompactBatch(ctx, *batch, "wrong", now); !IsConditionalCheckFailed(err) {
 			t.Fatalf("compact ownership error = %v", err)
 		}
-		if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "test", now); err != nil || !requested {
-			t.Fatalf("finalize request lost: %v %v", requested, err)
+		if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "test", now); err != nil || requested {
+			t.Fatalf("unexpected finalize request: %v %v", requested, err)
 		}
 		if err := s.ReleaseCompactBatch(ctx, *batch, "test", now); err != nil {
 			t.Fatal(err)
@@ -597,6 +594,88 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	}
 	if _, err := s.ListJobs(ctx); err == nil {
 		t.Fatal("accepted conflicting job names")
+	}
+}
+
+func TestPostgresManualCompactFinalization(t *testing.T) {
+	for _, action := range []string{"ready", "release", "complete", "finished"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			s := postgresTestStore(t)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			part := NewPart("job", "part", "bucket", "source", "finished", now)
+			part.Status = StatusCompactReady
+			part.CompactReadyAt = formatTime(now)
+			part.DestinationDatabase, part.DestinationTable, part.DestinationSchema = "db", "table", "schema"
+			part.DestinationActivePartCount = 2
+			part.DestinationActivePartitionCounts = map[string]uint64{"p": 2}
+			if action == "finished" {
+				part.Status = StatusFinished
+			}
+			seedPostgresParts(t, s, []Part{part})
+			var batch *CompactBatch
+			wantStatus := StatusFinished
+			if action == "release" || action == "complete" {
+				var err error
+				batch, err = s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{})
+				if err != nil || batch == nil {
+					t.Fatalf("claim = %+v, %v", batch, err)
+				}
+				wantStatus = StatusCompacting
+			}
+			// Use the pre-claim snapshot: a worker may claim a ready artifact
+			// between CLI selection and the finalization transaction.
+			status, err := s.RequestCompactFinalization(ctx, part, now)
+			if action == "finished" {
+				if !IsConditionalCheckFailed(err) {
+					t.Fatalf("finished artifact error = %v", err)
+				}
+				return
+			}
+			if err != nil || status != wantStatus {
+				t.Fatalf("finalization = %s, %v; want %s", status, err, wantStatus)
+			}
+			if batch != nil {
+				if err := s.UpdateCompactProgress(ctx, *batch, "output", "worker", PartStats{Count: 2}, PartStats{Count: 1}, CompactProgress{Stage: "merging"}, now); err != nil {
+					t.Fatal(err)
+				}
+				if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "worker", now); err != nil || !requested {
+					t.Fatalf("finalize request lost: %v %v", requested, err)
+				}
+			}
+			wantID := part.PartID
+			switch action {
+			case "release":
+				if err := s.ReleaseCompactBatch(ctx, *batch, "worker", now); err != nil {
+					t.Fatal(err)
+				}
+			case "complete":
+				output := NewCompactPart(part.JobID, "output", part.Bucket, "output-key", "db", "table", "schema", []string{part.PartID}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, now, now)
+				if err := s.CompleteCompaction(ctx, *batch, output, "worker", now); err != nil {
+					t.Fatal(err)
+				}
+				wantID = output.PartID
+			}
+			parts, err := s.ListJobParts(ctx, part.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, got := range parts {
+				if got.PartID == wantID {
+					found = true
+					if got.Status != StatusFinished || got.FinishedAt != formatTime(now) || got.WorkerID != "" || got.CompactFinalizeRequestedAt != "" {
+						t.Fatalf("finalized artifact = %+v", got)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("missing finalized artifact %s", wantID)
+			}
+			if batch, err := s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{}); err != nil || batch != nil {
+				t.Fatalf("finalized artifact reclaimed: %+v, %v", batch, err)
+			}
+		})
 	}
 }
 

@@ -106,7 +106,7 @@ All take `-job-id`. Most use conditional updates and take `-force` where a guard
 | --- | --- |
 | `retry-failed` | Move failed parts back to their retryable state. `-part-id` / `-all`; `-include-in-progress` also resets stuck workers; `-stale` (with `-stale-after`, default `5m`) resets only in-progress parts with no recent progress; `-force` re-runs even completed parts. |
 | `set-part-state` | Force selected rows to a stable state (`READY`, `COMPACT_READY`, or `FINISHED`) and clear stale ownership. Select by repeated `-part-id` or by `-status`. |
-| `finalize-compaction` | Ask compacting workers to save current useful output and finish. |
+| `finalize-compaction` | Finish selected `COMPACT_READY` artifacts immediately and ask compacting workers to save current useful output and finish. Select by `-all`, repeated `-part-id`, or active `-output-part-id`; requires `-force`. |
 | `reset-compact-timer` | Restart the job's compact-window timer (sets `compact_ready_at` to now on every row). |
 | `reset-job` | Delete generated compact rows and move originals back to `READY` (full re-rewrite). `-delete-s3` also removes generated + rewritten artifacts (keeps uploaded `source/`). |
 | `reset-compaction` | Delete generated compact rows and move rewritten originals back to `COMPACT_READY` (re-compact only). `-delete-s3` removes generated compact artifacts. |
@@ -116,6 +116,8 @@ All take `-job-id`. Most use conditional updates and take `-force` where a guard
 
 Notes:
 
+- `finalize-compaction -job-id=JOB_ID -all -force` finishes waiting artifacts and requests active batches to finish. Active workers observe the request on their next compact heartbeat (30 seconds–5 minutes, 5 minutes with the default compact window). Useful output is uploaded and marked `FINISHED`; requested inputs also become `FINISHED` when a batch is released without a reduction. The result separates active requests (`requested`) from artifacts finished immediately (`finished`). This covers currently selected artifacts, not future rewrite output.
+- To finish only waiting artifacts manually, use `set-part-state -job-id=JOB_ID -status=COMPACT_READY -to-status=FINISHED -force`. Replace `-status=COMPACT_READY` with repeated `-part-id=PART_ID` to select individual artifacts.
 - `retry-failed` moves failed rewrite parts back to `READY` and failed import parts back to `FINISHED` (so `import-finished` retries the import stage without re-running the worker). Any move back to `READY` clears persisted rewrite progress and metrics.
 - `reset-job` and `reset-compaction` validate compaction lineage (`compact_input_part_ids` / `superseded_by`) and refuse to run if any part has started import.
 - `-delete-s3` variants derive the exact S3 target from the job's recorded rows and reject glob metacharacters before deleting. For jobs created with `upload-freeze -copy-parts-from-job`, borrowed source prefixes are not deleted; jobs that own referenced source parts are blocked from deletion while those references exist.

@@ -888,6 +888,10 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 		}
 		if err == nil {
 			setStatus(&current, StatusCompactReady, now)
+			if current.CompactFinalizeRequestedAt != "" {
+				setStatus(&current, StatusFinished, now)
+				current.FinishedAt = formatTime(now)
+			}
 			if strings.TrimSpace(current.CompactReadyAt) == "" {
 				current.CompactReadyAt = compactReadyAtForRelease(part, now)
 			}
@@ -984,18 +988,26 @@ func (s *Store) updateCompactProgress(ctx context.Context, part Part, workerID s
 	return requested, err
 }
 
-func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now time.Time) error {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusCompacting
+func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now time.Time) (Status, error) {
+	updated, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
+		return current.Status == StatusCompacting || current.Status == StatusCompactReady
 	}, func(current *Part) error {
+		if current.Status == StatusCompactReady {
+			setStatus(current, StatusFinished, now)
+			current.FinishedAt = formatTime(now)
+			current.Error = ""
+			current.CompactCooldownUntil = ""
+			clearCompactProgress(current)
+			return nil
+		}
 		current.CompactFinalizeRequestedAt = formatTime(now)
 		current.UpdatedAt = formatTime(now)
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
+		return "", fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
 	}
-	return nil
+	return updated.Status, nil
 }
 
 type CompactProgress struct {
@@ -1080,10 +1092,6 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	}
 	defer tx.Rollback(ctx)
 
-	if err := s.insertPartTx(ctx, tx, output); err != nil {
-		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
-	}
-
 	for _, part := range batch.Parts {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err != nil {
@@ -1091,6 +1099,10 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 		}
 		if !compactOwnedOrUnownedReady(current, workerID) {
 			return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, &conditionalCheckFailedError{})
+		}
+		if current.CompactFinalizeRequestedAt != "" {
+			setStatus(&output, StatusFinished, now)
+			output.FinishedAt = formatTime(now)
 		}
 		setStatus(&current, StatusSuperseded, now)
 		current.SupersededAt = formatTime(now)
@@ -1104,24 +1116,11 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 			return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.insertPartTx(ctx, tx, output); err != nil {
 		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 	}
-	return nil
-}
-
-func (s *Store) MarkCompactReadyFinished(ctx context.Context, part Part, now time.Time) error {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusCompactReady
-	}, func(current *Part) error {
-		setStatus(current, StatusFinished, now)
-		current.FinishedAt = formatTime(now)
-		current.Error = ""
-		current.CompactCooldownUntil = ""
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("mark compact-ready part %s/%s finished: %w", part.JobID, part.PartID, err)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 	}
 	return nil
 }
