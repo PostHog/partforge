@@ -23,7 +23,7 @@ services:
       - "15432:5432"
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.6.1.1193
+    image: clickhouse/clickhouse-server:26.6.8.7
     ports:
       - "18123:8123"
     volumes:

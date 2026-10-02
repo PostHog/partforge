@@ -117,6 +117,32 @@ func TestCompactBatchFromPartsRejectsMixedJobs(t *testing.T) {
 	}
 }
 
+func TestCompactBatchPreservesClickHouseBuild(t *testing.T) {
+	first := compactBatchTestPart("job", "part-a", StatusCompacting)
+	second := compactBatchTestPart("job", "part-b", StatusCompacting)
+	second.ClickHouseBuild = "26.6"
+	if _, err := compactBatchFromParts([]Part{first, second}); err != nil {
+		t.Fatalf("missing build must default to 26.6: %v", err)
+	}
+	second.ClickHouseBuild = "26.9-posthog"
+	if _, err := compactBatchFromParts([]Part{first, second}); err == nil || !strings.Contains(err.Error(), "mixes ClickHouse builds") {
+		t.Fatalf("expected mixed builds to fail: %v", err)
+	}
+	data, err := partJSON(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := partFromJSON(data)
+	if err != nil || got.ClickHouseBuild != second.ClickHouseBuild {
+		t.Fatalf("stored build=%q err=%v", got.ClickHouseBuild, err)
+	}
+	output := second
+	output.ClickHouseBuild = "26.6"
+	if err := validateCompactOutputForBatch(CompactBatch{Parts: []Part{second}}, output); err == nil {
+		t.Fatal("expected compact output with a different build to fail")
+	}
+}
+
 func TestUpdateCompactProgressRejectsMixedJobBatch(t *testing.T) {
 	err := (&Store{}).UpdateCompactProgress(context.Background(), CompactBatch{
 		JobID: "job-a",

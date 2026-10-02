@@ -66,6 +66,7 @@ type CompactProgressSnapshot struct {
 }
 
 type CompactWorkItem struct {
+	ClickHouseBuild     string
 	JobID               string
 	OutputPartID        string
 	OutputFinishedKey   string
@@ -129,6 +130,8 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		RestartClickHouse:   c.RestartClickHouse,
 	}
 	m := manifest.Manifest{
+		ClickHouseBuild: item.ClickHouseBuild,
+
 		Version: manifest.Version,
 		JobID:   item.JobID,
 		PartID:  item.OutputPartID,

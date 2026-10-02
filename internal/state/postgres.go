@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PostHog/partforge/internal/manifest"
+
 	"github.com/aws/aws-sdk-go-v2/config"
 	rdsauth "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/jackc/pgx/v5"
@@ -90,6 +92,7 @@ type Part struct {
 	Attempts       int    `json:"attempts"`
 	Error          string `json:"error,omitempty"`
 
+	ClickHouseBuild      string   `json:"clickhouse_build,omitempty"`
 	EmptyOutput          bool     `json:"empty_output,omitempty"`
 	SourceArtifactBytes  uint64   `json:"source_artifact_bytes,omitempty"`
 	DestinationDatabase  string   `json:"destination_database,omitempty"`
@@ -1182,6 +1185,11 @@ func validateCompactBatchParts(parts []Part) error {
 		if part.JobID != first.JobID {
 			return fmt.Errorf("compact batch mixes job ids %q and %q", first.JobID, part.JobID)
 		}
+		firstBuild, _ := manifest.ResolveClickHouseBuild(first.ClickHouseBuild)
+		partBuild, _ := manifest.ResolveClickHouseBuild(part.ClickHouseBuild)
+		if partBuild != firstBuild {
+			return fmt.Errorf("compact batch for job %s mixes ClickHouse builds %q and %q", first.JobID, firstBuild, partBuild)
+		}
 		if part.Bucket != first.Bucket {
 			return fmt.Errorf("compact batch for job %s mixes buckets %q and %q", first.JobID, first.Bucket, part.Bucket)
 		}
@@ -1208,6 +1216,17 @@ func validateCompactBatchPart(part Part) error {
 
 func validateCompactOutputForBatch(batch CompactBatch, output Part) error {
 	input := batch.Parts[0]
+	inputBuild, err := manifest.ResolveClickHouseBuild(input.ClickHouseBuild)
+	if err != nil {
+		return err
+	}
+	outputBuild, err := manifest.ResolveClickHouseBuild(output.ClickHouseBuild)
+	if err != nil {
+		return err
+	}
+	if outputBuild != inputBuild {
+		return fmt.Errorf("compact output %s/%s ClickHouse build does not match input build", output.JobID, output.PartID)
+	}
 	if output.JobID != batch.JobID {
 		return fmt.Errorf("compact output job id %q does not match batch job id %q", output.JobID, batch.JobID)
 	}
@@ -2117,6 +2136,9 @@ func IsConditionalCheckFailed(err error) bool {
 }
 
 func validatePart(part Part) error {
+	if _, err := manifest.ResolveClickHouseBuild(part.ClickHouseBuild); err != nil {
+		return err
+	}
 	if part.JobID == "" || part.PartID == "" || part.Bucket == "" || part.SourceKey == "" || part.FinishedKey == "" {
 		return errors.New("part state is missing job_id, part_id, bucket, source_key, or finished_key")
 	}

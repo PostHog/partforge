@@ -77,7 +77,6 @@ func TestReduceInsertSelectSettings(t *testing.T) {
 		"max_insert_threads": "6",
 		"max_memory_usage":   "12345",
 		"max_block_size":     "65409",
-		"input_format_json_max_string_column_growth_step": "67108864",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +90,7 @@ func TestReduceInsertSelectSettings(t *testing.T) {
 	if next["max_insert_threads"] != "3" {
 		t.Fatalf("max_insert_threads = %q", next["max_insert_threads"])
 	}
-	if next["max_block_size"] != "32704" || next["input_format_json_max_string_column_growth_step"] != "67108864" {
+	if next["max_block_size"] != "32704" {
 		t.Fatalf("retry block settings = %v", next)
 	}
 	if next["max_memory_usage"] != "12345" {
@@ -184,7 +183,6 @@ func TestRunInsertSelectSendsResourceSettings(t *testing.T) {
 		"max_threads":        "4",
 		"max_insert_threads": "4",
 		"max_memory_usage":   "34359738368",
-		"input_format_json_max_string_column_growth_step": "67108864",
 	}
 	err := (Processor{
 		ClickHouse:     chhttp.Client{URL: server.URL},

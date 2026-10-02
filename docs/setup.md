@@ -8,7 +8,15 @@ Requirements, configuration, and how to run the four stages by hand. For the hig
 - **Docker + Docker Compose** — to build/run the worker image and the local stack.
 - **`s5cmd`** on `PATH` for any command that moves S3 data as a local binary (`-s5cmd-binary` to override). The worker image bundles it.
 - **A Postgres database** for state and an **S3 bucket** for artifacts — see [postgres.md](postgres.md). Local compose provides both for local runs.
-- **ClickHouse** — a source to freeze from and a destination to import into. The worker brings its own ClickHouse (default server version `26.6.1.1193`, baked into the image).
+- **ClickHouse** — a source to freeze from and a destination to import into. The worker bundles upstream `26.6.8.7` and PostHog `26.9.5.2-posthog-2dbc5ba2dd25`. Upload commands default to upstream `26.6` when no build is specified.
+
+## Choosing the worker ClickHouse build
+
+Pass `-clickhouse-build=26.6` or `-clickhouse-build=26.9-posthog` to `upload-freeze` or `upload-backup`. The default is `26.6`, including jobs with no stored build field. The choice is stored with each part and used automatically by rewrite and compaction workers, including compaction restarts. No worker flag is needed.
+
+Copied jobs use the new upload command's build selection, so `-copy-parts-from-job` can reuse uploaded source parts with a different build. JSON config accepts `clickhouse_build` as the default for upload commands. Explicit worker `-clickhouse-binary` and `-clickhouse-config-file` values override the bundled paths.
+
+The PostHog profile enables worker AWS credentials for S3 queries and caps JSON String buffer growth at 64 MiB per step. Upstream 26.6 uses its native behavior for these settings.
 
 ## Local stack
 

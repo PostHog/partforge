@@ -34,6 +34,37 @@ func TestDefaultCompactWindow(t *testing.T) {
 	}
 }
 
+func TestWorkerClickHousePaths(t *testing.T) {
+	for _, test := range []struct {
+		build, wantBinary, wantConfig string
+	}{
+		{"", "clickhouse", "/etc/clickhouse-server/config.xml"},
+		{"26.6", "clickhouse", "/etc/clickhouse-server/config.xml"},
+		{"26.9-posthog", "clickhouse-26.9-posthog", "/etc/clickhouse-server-26.9-posthog/config.xml"},
+	} {
+		binary, config, err := workerClickHousePaths(test.build, "clickhouse", "/etc/clickhouse-server/config.xml")
+		if err != nil || binary != test.wantBinary || config != test.wantConfig {
+			t.Fatalf("build %q: binary=%q config=%q err=%v", test.build, binary, config, err)
+		}
+	}
+	binary, config, err := workerClickHousePaths("26.9-posthog", "/custom/clickhouse", "/custom/config.xml")
+	if err != nil || binary != "/custom/clickhouse" || config != "/custom/config.xml" {
+		t.Fatalf("custom paths: binary=%q config=%q err=%v", binary, config, err)
+	}
+	if _, _, err := workerClickHousePaths("26.8", "clickhouse", "config.xml"); err == nil {
+		t.Fatal("expected unknown build to fail")
+	}
+}
+
+func TestUploadCommandsRejectUnknownClickHouseBuild(t *testing.T) {
+	for _, upload := range []func(context.Context, []string) error{runUploadFreeze, runUploadBackup} {
+		err := upload(context.Background(), []string{"-config=", "-clickhouse-build=26.8"})
+		if err == nil || !strings.Contains(err.Error(), "clickhouse-build must be") {
+			t.Fatalf("expected build validation before uploading: %v", err)
+		}
+	}
+}
+
 func TestParseBaseBackupS3URI(t *testing.T) {
 	got, err := parseBaseBackupS3URI("S3('s3://backups/full/')")
 	if err != nil {

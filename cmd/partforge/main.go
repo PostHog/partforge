@@ -431,6 +431,7 @@ func runUploadBackup(ctx context.Context, args []string) error {
 		copySQLFromJob        = fs.String("copy-sql-from-job", "", "existing job id to copy destination schema and insert-select SQL from")
 		jobID                 = fs.String("job-id", "", "job id to store in manifests and Postgres; empty generates one")
 		jobName               = fs.String("job-name", "", "readable job name shown by list-jobs")
+		clickHouseBuild       = fs.String("clickhouse-build", "26.6", "worker ClickHouse build for this job: 26.6 or 26.9-posthog")
 		bucket                = fs.String("bucket", "", "S3 bucket for materialized source and finished part artifacts")
 		prefix                = fs.String("prefix", "partforge", "S3 key prefix under the artifact bucket")
 		workDir               = fs.String("work-dir", "", "parent directory for the downloaded backup index; empty uses the system temporary directory")
@@ -448,6 +449,10 @@ func runUploadBackup(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "upload-backup"); err != nil {
+		return err
+	}
+	resolvedBuild, err := manifest.ResolveClickHouseBuild(*clickHouseBuild)
+	if err != nil {
 		return err
 	}
 	if *backupURI == "" || *database == "" || *table == "" || *bucket == "" {
@@ -533,6 +538,7 @@ func runUploadBackup(ctx context.Context, args []string) error {
 	effectiveConcurrency := min(resolvedCopyConcurrency, backupInfo.PartCount)
 	copier.NumWorkers = resolveS5cmdNumWorkers(*s5cmdNumWorkers, effectiveConcurrency)
 	params := materializeBackupPartParams{
+		ClickHouseBuild:   resolvedBuild,
 		JobID:             resolvedJobID,
 		JobName:           strings.TrimSpace(*jobName),
 		BackupURI:         strings.TrimRight(*backupURI, "/"),
@@ -600,6 +606,7 @@ type backupPartResult struct {
 }
 
 type materializeBackupPartParams struct {
+	ClickHouseBuild   string
 	JobID             string
 	JobName           string
 	BackupURI         string
@@ -666,6 +673,8 @@ func materializeBackupPart(ctx context.Context, workerID int, task backupPartTas
 	}
 
 	m := manifest.Manifest{
+		ClickHouseBuild: params.ClickHouseBuild,
+
 		Version:   manifest.Version,
 		JobID:     params.JobID,
 		PartID:    partID,
@@ -699,6 +708,7 @@ func materializeBackupPart(ctx context.Context, workerID int, task backupPartTas
 
 	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
 	partState.JobName = params.JobName
+	partState.ClickHouseBuild = params.ClickHouseBuild
 	partState.SourceArtifactBytes = artifactBytes
 	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
 		return backupPartResult{}, fmt.Errorf("create state for %s: %w", sourceKey, err)
@@ -838,6 +848,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
 		jobID                 = fs.String("job-id", "", "job id to store in manifests and Postgres; empty generates one")
 		jobName               = fs.String("job-name", "", "readable job name shown by list-jobs")
+		clickHouseBuild       = fs.String("clickhouse-build", "26.6", "worker ClickHouse build for this job: 26.6 or 26.9-posthog")
 		bucket                = fs.String("bucket", "", "S3 bucket for source and finished part artifacts")
 		prefix                = fs.String("prefix", "partforge", "S3 key prefix under the bucket")
 		stateTable            = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
@@ -853,6 +864,10 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "upload-freeze"); err != nil {
+		return err
+	}
+	resolvedBuild, err := manifest.ResolveClickHouseBuild(*clickHouseBuild)
+	if err != nil {
 		return err
 	}
 	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
@@ -927,6 +942,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 			return err
 		}
 		copied, err := registerSourcePartsFromJob(ctx, stateStore, s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}, copyPartsJobID, copySourcePartsParams{
+			ClickHouseBuild:   resolvedBuild,
 			JobID:             resolvedJobID,
 			JobName:           resolvedJobName,
 			Dest:              destinationTableRef,
@@ -1005,6 +1021,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		tasks = append(tasks, uploadPartTask{Index: idx + 1, SourcePart: sourcePart})
 	}
 	uploadParams := uploadFreezePartParams{
+		ClickHouseBuild:   resolvedBuild,
 		JobID:             resolvedJobID,
 		JobName:           resolvedJobName,
 		FreezeName:        *freezeName,
@@ -1075,6 +1092,7 @@ type uploadPartResult struct {
 }
 
 type uploadFreezePartParams struct {
+	ClickHouseBuild   string
 	JobID             string
 	JobName           string
 	FreezeName        string
@@ -1209,6 +1227,7 @@ func sourcePartRef(part state.Part) (string, string) {
 }
 
 type copySourcePartsParams struct {
+	ClickHouseBuild   string
 	JobID             string
 	JobName           string
 	Dest              manifest.TableRef
@@ -1250,6 +1269,7 @@ func registerSourcePartsFromJob(ctx context.Context, store *state.Store, copier 
 		sourceOwnerJobID, sourceOwnerPartID := sourcePartRef(sourcePart)
 		part := state.NewPart(params.JobID, partID, params.Bucket, sourcePart.SourceKey, manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID), time.Now().UTC())
 		part.JobName = params.JobName
+		part.ClickHouseBuild = params.ClickHouseBuild
 		part.SourceArtifactBytes = sourcePart.SourceArtifactBytes
 		part.SourceJobID = sourceOwnerJobID
 		part.SourcePartID = sourceOwnerPartID
@@ -1380,6 +1400,8 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 	createdAt := time.Now().UTC()
 
 	m := manifest.Manifest{
+		ClickHouseBuild: params.ClickHouseBuild,
+
 		Version:   manifest.Version,
 		JobID:     params.JobID,
 		PartID:    partID,
@@ -1436,6 +1458,7 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 
 	partState := state.NewPart(params.JobID, partID, params.Bucket, sourceKey, finishedKey, createdAt)
 	partState.JobName = params.JobName
+	partState.ClickHouseBuild = params.ClickHouseBuild
 	partState.SourceArtifactBytes = partStats.Bytes
 	slog.Info("registering source part", "stage", "register_parts", "job_id", params.JobID, "worker_id", workerID, "part_id", partID, "source_key", sourceKey, "finished_key", finishedKey)
 	if err := params.StateStore.CreatePart(ctx, partState); err != nil {
@@ -1539,6 +1562,22 @@ func resolveS5cmdNumWorkers(configured, uploadConcurrency int) int {
 		return 1
 	}
 	return workers
+}
+
+func workerClickHousePaths(build, binary, configFile string) (string, string, error) {
+	resolved, err := manifest.ResolveClickHouseBuild(build)
+	if err != nil {
+		return "", "", err
+	}
+	if resolved == "26.9-posthog" {
+		if binary == "clickhouse" {
+			binary = "clickhouse-26.9-posthog"
+		}
+		if configFile == "/etc/clickhouse-server/config.xml" {
+			configFile = "/etc/clickhouse-server-26.9-posthog/config.xml"
+		}
+	}
+	return binary, configFile, nil
 }
 
 func runWorker(ctx context.Context, args []string) error {
@@ -1681,7 +1720,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
 		"max_memory_usage_raw", insertSettings["max_memory_usage"],
-		"input_format_json_max_string_column_growth_step", insertSettings["input_format_json_max_string_column_growth_step"],
 		"default_compression_codec", *defaultCompressionCodec,
 		"merge_background_pool_size", compactMergeBackgroundPoolSize,
 		"merge_concurrency_ratio", compactMergeConcurrencyRatio,
@@ -1827,6 +1865,7 @@ func runWorker(ctx context.Context, args []string) error {
 			FinishedKey:         part.FinishedKey,
 			JobID:               part.JobID,
 			PartID:              part.PartID,
+			ClickHouseBuild:     part.ClickHouseBuild,
 			SourceJobID:         part.SourceJobID,
 			SourcePartID:        part.SourcePartID,
 			DestinationDatabase: part.DestinationDatabase,
@@ -1853,6 +1892,10 @@ func runWorker(ctx context.Context, args []string) error {
 				"part_id", part.PartID,
 			)
 
+			binary, configFile, err := workerClickHousePaths(part.ClickHouseBuild, *clickHouseBinary, *clickHouseConfigFile)
+			if err != nil {
+				return rewrite.ProcessResult{}, cleanup, err
+			}
 			var server *chproc.Server
 			activateClickHouseMetrics := func() {
 				if prometheusMetrics != nil && clickHousePrometheusTarget != "" {
@@ -1879,8 +1922,8 @@ func runWorker(ctx context.Context, args []string) error {
 
 			startServer := func(ctx context.Context, tuning chproc.Tuning) (*chproc.Server, error) {
 				return chproc.Start(ctx, chproc.Config{
-					Binary:     *clickHouseBinary,
-					ConfigFile: *clickHouseConfigFile,
+					Binary:     binary,
+					ConfigFile: configFile,
 					DataDir:    runDirs.ClickHouse,
 					URL:        *clickHouseURL,
 					User:       *clickHouseUser,
@@ -1891,7 +1934,7 @@ func runWorker(ctx context.Context, args []string) error {
 				})
 			}
 
-			slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
+			slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "clickhouse_build", part.ClickHouseBuild, "binary", binary, "config_file", configFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
 			server, err = startServer(processCtx, chproc.Tuning{})
 			if err != nil {
 				return rewrite.ProcessResult{}, cleanup, err
@@ -2149,6 +2192,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	workItem := rewrite.CompactWorkItem{
 		JobID:               batch.JobID,
 		OutputPartID:        outputPartID,
+		ClickHouseBuild:     batch.Parts[0].ClickHouseBuild,
 		OutputFinishedKey:   outputFinishedKey,
 		DestinationDatabase: batch.Parts[0].DestinationDatabase,
 		DestinationTable:    batch.Parts[0].DestinationTable,
@@ -2280,6 +2324,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		Bytes: result.DestinationStats.Bytes,
 	}, partitionCountsFromRewrite(result.DestinationPartitions), compactReadyAt, time.Now().UTC())
 	output.JobName = batch.Parts[0].JobName
+	output.ClickHouseBuild = batch.Parts[0].ClickHouseBuild
 	stateCtx, cancel := workerStateUpdateContext()
 	err = cfg.StateStore.CompleteCompaction(stateCtx, currentBatch(), output, cfg.WorkerID, time.Now().UTC())
 	cancel()
@@ -2311,6 +2356,11 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 
 func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch, compactDeadline time.Time) (rewrite.CompactResult, func(), error) {
 	cleanup := func() {}
+	binary, configFile, err := workerClickHousePaths(item.ClickHouseBuild, cfg.ClickHouseBinary, cfg.ClickHouseConfigFile)
+	if err != nil {
+		return rewrite.CompactResult{}, cleanup, err
+	}
+	cfg.ClickHouseBinary, cfg.ClickHouseConfigFile = binary, configFile
 	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
 	if err != nil {
 		return rewrite.CompactResult{}, cleanup, err
