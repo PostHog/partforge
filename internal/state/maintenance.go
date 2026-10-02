@@ -61,6 +61,10 @@ func (s *Store) releaseStaleCompactingPartsTx(ctx context.Context, tx pgx.Tx, no
 			part.CompactReadyAt = compactReadyAtForRelease(part, now)
 		}
 		setStatus(&part, StatusCompactReady, now)
+		if part.CompactFinalizeRequestedAt != "" {
+			setStatus(&part, StatusFinished, now)
+			part.FinishedAt = formatTime(now)
+		}
 		part.WorkerID = ""
 		part.CompactingAt = ""
 		part.Error = ""

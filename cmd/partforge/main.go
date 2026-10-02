@@ -142,8 +142,8 @@ Select exactly one of -all, -part-id, or -stale. -include-in-progress resets stu
 	{
 		Name:    "finalize-compaction",
 		Usage:   "[flags]",
-		Summary: "Ask compacting workers to stop waiting for more merges and finish with current useful output.",
-		Details: "Select exactly one of -all, repeated -part-id, or -output-part-id. Workers observe the request through compact progress heartbeats. Requires -force.",
+		Summary: "Finish compact-ready artifacts and ask compacting workers to finish with current useful output.",
+		Details: "Select exactly one of -all, repeated -part-id, or -output-part-id. Compact-ready artifacts finish immediately; workers observe active batch requests through compact heartbeats. Requires -force.",
 	},
 	{
 		Name:    "finalise-compaction",
@@ -1710,7 +1710,7 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
-	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
+	compactHeartbeatInterval := 5 * time.Second
 	slog.Info(
 		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
@@ -2159,7 +2159,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 		cancel()
 		if releaseErr != nil {
 			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch: %v", err, releaseErr)
@@ -2205,7 +2205,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if !compactDeadline.IsZero() && !time.Now().UTC().Before(compactDeadline) {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 		cancel()
 		if releaseErr != nil {
 			return true, releaseErr
@@ -2226,6 +2226,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	manualFinalizeCtx, requestManualFinalize := context.WithCancel(context.Background())
 	var manualFinalizeRequested atomic.Bool
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess, func() {
+		slog.Info("received compact finalization request", "stage", "manual_finalize_compact", "job_id", batch.JobID, "output_part_id", outputPartID)
 		manualFinalizeRequested.Store(true)
 		requestManualFinalize()
 	})
@@ -2254,7 +2255,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	if err != nil {
 		if shutdownRequested {
 			stateCtx, cancel := workerStateUpdateContext()
-			releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+			_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
 			cancel()
 			if releaseErr != nil {
 				cleanupCompactNow()
@@ -2272,22 +2273,23 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if !result.Reduced {
 		now := time.Now().UTC()
+		var noReductionError error
 		if compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested.Load(), cfg.CompactWindow, compactDeadline, now) {
-			err := fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
-			cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
-			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
-			failErr := markCompactBatchFailed(err)
-			cleanupCompactNow()
-			return true, failErr
+			noReductionError = fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
 		}
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now)
+		failed, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now, noReductionError)
 		cancel()
 		if releaseErr != nil {
 			cleanupCompactNow()
 			return true, releaseErr
 		}
 		cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
+		if failed {
+			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
+			cleanupCompactNow()
+			return true, noReductionError
+		}
 		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
 		if shutdownRequested {
 			slog.Info("worker shutdown requested; stopping after compact batch made no useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
@@ -2333,17 +2335,6 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		failErr := markCompactBatchFailed(err)
 		cleanupCompactNow()
 		return true, failErr
-	}
-	if manualFinalizeRequested.Load() {
-		output.Status = state.StatusCompactReady
-		stateCtx, cancel := workerStateUpdateContext()
-		err = cfg.StateStore.MarkCompactReadyFinished(stateCtx, output, time.Now().UTC())
-		cancel()
-		if err != nil {
-			cleanupCompactNow()
-			return true, err
-		}
-		output.Status = state.StatusFinished
 	}
 	cfg.Metrics.CompactionCompleted(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
 	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(batch.Parts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes, "manual_finalize", manualFinalizeRequested.Load())
@@ -2587,20 +2578,6 @@ func compactLeaseStaleAfter(compactWindow time.Duration) time.Duration {
 		return 5 * time.Minute
 	}
 	return compactWindow
-}
-
-func compactLeaseHeartbeatInterval(staleAfter time.Duration) time.Duration {
-	if staleAfter <= 0 {
-		return time.Minute
-	}
-	interval := staleAfter / 20
-	if interval < 30*time.Second {
-		return 30 * time.Second
-	}
-	if interval > 5*time.Minute {
-		return 5 * time.Minute
-	}
-	return interval
 }
 
 func compactClaimSplay(compactWindow time.Duration) time.Duration {
@@ -3682,10 +3659,10 @@ func runFinalizeCompaction(ctx context.Context, command string, args []string) e
 	fs := newCommandFlagSet(command)
 	var (
 		configPath      = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
-		jobID           = fs.String("job-id", "", "job id containing compacting parts")
+		jobID           = fs.String("job-id", "", "job id containing compact-ready or compacting parts")
 		partIDs         partIDListFlag
 		outputPartID    = fs.String("output-part-id", "", "compact output part id from worker logs or compact progress")
-		all             = fs.Bool("all", false, "request finalization for all COMPACTING rows in the job")
+		all             = fs.Bool("all", false, "finalize all COMPACT_READY and COMPACTING rows in the job")
 		force           = fs.Bool("force", false, "required to request compaction finalization")
 		stateTable      = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region          = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
@@ -3693,7 +3670,7 @@ func runFinalizeCompaction(ctx context.Context, command string, args []string) e
 		postgresIAMAuth = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
 		jsonOutput      = fs.Bool("json", false, "print machine-readable JSON instead of text")
 	)
-	fs.Var(&partIDs, "part-id", "specific COMPACTING state part id to finalize; may be repeated")
+	fs.Var(&partIDs, "part-id", "specific COMPACT_READY or COMPACTING state part id to finalize; may be repeated")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -3742,17 +3719,25 @@ func runFinalizeCompaction(ctx context.Context, command string, args []string) e
 		return err
 	}
 	if len(selectedParts) == 0 {
-		return fmt.Errorf("no COMPACTING parts matched finalize-compaction selection for job %s", *jobID)
+		return fmt.Errorf("no COMPACT_READY or COMPACTING parts matched finalize-compaction selection for job %s", *jobID)
 	}
 
 	now := time.Now().UTC()
 	rows := make([]finalizeCompactionPartRow, 0, len(selectedParts))
-	for _, part := range selectedParts {
-		if err := stateStore.RequestCompactFinalization(ctx, part, now); err != nil {
-			return err
+	requested, finished := 0, 0
+	updatedParts, err := stateStore.RequestCompactFinalization(ctx, selectedParts, now)
+	if err != nil {
+		return err
+	}
+	for _, part := range updatedParts {
+		if part.Status == state.StatusFinished {
+			finished++
+		} else {
+			requested++
 		}
 		rows = append(rows, finalizeCompactionPartRow{
 			PartID:       part.PartID,
+			Status:       part.Status,
 			WorkerID:     part.WorkerID,
 			OutputPartID: part.CompactOutputPartID,
 			RequestedAt:  now.Format(time.RFC3339Nano),
@@ -3762,7 +3747,8 @@ func runFinalizeCompaction(ctx context.Context, command string, args []string) e
 	out := finalizeCompactionOutput{
 		JobID:       *jobID,
 		RequestedAt: now.Format(time.RFC3339Nano),
-		Requested:   len(rows),
+		Requested:   requested,
+		Finished:    finished,
 		Parts:       rows,
 	}
 	if *jsonOutput {
@@ -4816,14 +4802,16 @@ type finalizeCompactionOutput struct {
 	JobID       string                      `json:"job_id"`
 	RequestedAt string                      `json:"requested_at"`
 	Requested   int                         `json:"requested"`
+	Finished    int                         `json:"finished"`
 	Parts       []finalizeCompactionPartRow `json:"parts"`
 }
 
 type finalizeCompactionPartRow struct {
-	PartID       string `json:"part_id"`
-	WorkerID     string `json:"worker_id,omitempty"`
-	OutputPartID string `json:"output_part_id,omitempty"`
-	RequestedAt  string `json:"requested_at"`
+	PartID       string       `json:"part_id"`
+	Status       state.Status `json:"status"`
+	WorkerID     string       `json:"worker_id,omitempty"`
+	OutputPartID string       `json:"output_part_id,omitempty"`
+	RequestedAt  string       `json:"requested_at"`
 }
 
 type resetCompactTimerOutput struct {
@@ -5649,7 +5637,7 @@ func selectFinalizeCompactionParts(parts []state.Part, selection finalizeCompact
 	if selection.All {
 		selected := make([]state.Part, 0)
 		for _, part := range parts {
-			if part.Status == state.StatusCompacting {
+			if part.Status == state.StatusCompacting || part.Status == state.StatusCompactReady {
 				selected = append(selected, part)
 			}
 		}
@@ -5661,8 +5649,8 @@ func selectFinalizeCompactionParts(parts []state.Part, selection finalizeCompact
 			return nil, err
 		}
 		for _, part := range selected {
-			if part.Status != state.StatusCompacting {
-				return nil, fmt.Errorf("part %s is %s, expected %s", part.PartID, part.Status, state.StatusCompacting)
+			if part.Status != state.StatusCompacting && part.Status != state.StatusCompactReady {
+				return nil, fmt.Errorf("part %s is %s, expected COMPACT_READY or COMPACTING", part.PartID, part.Status)
 			}
 		}
 		return selected, nil
@@ -6093,13 +6081,14 @@ func printFinalizeCompactionResult(out *os.File, result finalizeCompactionOutput
 	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
 	fmt.Fprintf(out, "requested_at: %s\n", result.RequestedAt)
 	fmt.Fprintf(out, "requested: %d\n", result.Requested)
+	fmt.Fprintf(out, "finished: %d\n", result.Finished)
 	if len(result.Parts) == 0 {
 		return
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "\nPART_ID\tWORKER\tOUTPUT_PART_ID\tREQUESTED_AT")
+	fmt.Fprintln(tw, "\nPART_ID\tSTATUS\tWORKER\tOUTPUT_PART_ID\tREQUESTED_AT")
 	for _, part := range result.Parts {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", part.PartID, part.WorkerID, part.OutputPartID, part.RequestedAt)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", part.PartID, part.Status, part.WorkerID, part.OutputPartID, part.RequestedAt)
 	}
 	_ = tw.Flush()
 }

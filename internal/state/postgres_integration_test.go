@@ -562,19 +562,16 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 		if batch == nil || batch.Parts[0].PartID != test.want {
 			t.Fatalf("claim for %+v = %+v, want %s", opts, batch, test.want)
 		}
-		if err := s.RequestCompactFinalization(ctx, batch.Parts[0], now); err != nil {
-			t.Fatal(err)
-		}
 		if err := s.UpdateCompactProgress(ctx, *batch, "output", "test", PartStats{Count: 2}, PartStats{Count: 1}, CompactProgress{Stage: "merging"}, now); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.HeartbeatCompactBatch(ctx, *batch, "wrong", now); !IsConditionalCheckFailed(err) {
 			t.Fatalf("compact ownership error = %v", err)
 		}
-		if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "test", now); err != nil || !requested {
-			t.Fatalf("finalize request lost: %v %v", requested, err)
+		if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "test", now); err != nil || requested {
+			t.Fatalf("unexpected finalize request: %v %v", requested, err)
 		}
-		if err := s.ReleaseCompactBatch(ctx, *batch, "test", now); err != nil {
+		if _, err := s.ReleaseCompactBatch(ctx, *batch, "test", now, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -597,6 +594,159 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	}
 	if _, err := s.ListJobs(ctx); err == nil {
 		t.Fatal("accepted conflicting job names")
+	}
+}
+
+func TestPostgresManualCompactFinalization(t *testing.T) {
+	for _, action := range []string{"ready", "release", "complete", "stale-release", "finished"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			s := postgresTestStore(t)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			part := NewPart("job", "part", "bucket", "source", "finished", now)
+			part.Status = StatusCompactReady
+			part.CompactReadyAt = formatTime(now)
+			part.DestinationDatabase, part.DestinationTable, part.DestinationSchema = "db", "table", "schema"
+			part.DestinationActivePartCount = 2
+			part.DestinationActivePartitionCounts = map[string]uint64{"p": 2}
+			if action == "finished" {
+				part.Status = StatusFinished
+			}
+			seedPostgresParts(t, s, []Part{part})
+			var batch *CompactBatch
+			wantStatus := StatusFinished
+			if action == "release" || action == "complete" || action == "stale-release" {
+				var err error
+				batch, err = s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{})
+				if err != nil || batch == nil {
+					t.Fatalf("claim = %+v, %v", batch, err)
+				}
+				wantStatus = StatusCompacting
+			}
+			// Use the pre-claim snapshot: a worker may claim a ready artifact
+			// between CLI selection and the finalization transaction.
+			updated, err := s.RequestCompactFinalization(ctx, []Part{part}, now)
+			if action == "finished" {
+				if !IsConditionalCheckFailed(err) {
+					t.Fatalf("finished artifact error = %v", err)
+				}
+				return
+			}
+			if err != nil || len(updated) != 1 || updated[0].Status != wantStatus {
+				t.Fatalf("finalization = %+v, %v; want %s", updated, err, wantStatus)
+			}
+			if batch != nil {
+				if err := s.UpdateCompactProgress(ctx, *batch, "output", "worker", PartStats{Count: 2}, PartStats{Count: 1}, CompactProgress{Stage: "merging"}, now); err != nil {
+					t.Fatal(err)
+				}
+				if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "worker", now); err != nil || !requested {
+					t.Fatalf("finalize request lost: %v %v", requested, err)
+				}
+			}
+			wantID := part.PartID
+			switch action {
+			case "stale-release":
+				now = now.Add(5 * time.Minute)
+				if n, err := s.ReleaseStaleCompactingParts(ctx, now, 5*time.Minute); err != nil || n != 1 {
+					t.Fatalf("stale release = %d, %v", n, err)
+				}
+			case "release":
+				if _, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, nil); err != nil {
+					t.Fatal(err)
+				}
+			case "complete":
+				output := NewCompactPart(part.JobID, "output", part.Bucket, "output-key", "db", "table", "schema", []string{part.PartID}, 1, PartStats{Count: 1}, map[string]uint64{"p": 1}, now, now)
+				if err := s.CompleteCompaction(ctx, *batch, output, "worker", now); err != nil {
+					t.Fatal(err)
+				}
+				wantID = output.PartID
+			}
+			parts, err := s.ListJobParts(ctx, part.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, got := range parts {
+				if got.PartID == wantID {
+					found = true
+					if got.Status != StatusFinished || got.FinishedAt != formatTime(now) || got.WorkerID != "" || got.CompactFinalizeRequestedAt != "" {
+						t.Fatalf("finalized artifact = %+v", got)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("missing finalized artifact %s", wantID)
+			}
+			if batch, err := s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{}); err != nil || batch != nil {
+				t.Fatalf("finalized artifact reclaimed: %+v, %v", batch, err)
+			}
+		})
+	}
+}
+
+func TestPostgresNoReductionHonorsRequestAfterLastHeartbeat(t *testing.T) {
+	for _, request := range []bool{false, true} {
+		t.Run(fmt.Sprint(request), func(t *testing.T) {
+			ctx := context.Background()
+			s := postgresTestStore(t)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			part := NewPart("job", "part", "bucket", "source", "finished", now)
+			part.Status, part.CompactReadyAt = StatusCompactReady, formatTime(now)
+			part.DestinationDatabase, part.DestinationTable, part.DestinationSchema = "db", "table", "schema"
+			part.DestinationActivePartCount = 2
+			part.DestinationActivePartitionCounts = map[string]uint64{"p": 2}
+			seedPostgresParts(t, s, []Part{part})
+			batch, err := s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{})
+			if err != nil || batch == nil {
+				t.Fatalf("claim = %+v, %v", batch, err)
+			}
+			if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "worker", now); err != nil || requested {
+				t.Fatalf("last heartbeat = %t, %v", requested, err)
+			}
+			if request {
+				if _, err := s.RequestCompactFinalization(ctx, batch.Parts, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The worker has already stopped heartbeating and is about to
+			// classify this unchanged output as a failure.
+			failed, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, errors.New("no reduction"))
+			if err != nil || failed == request {
+				t.Fatalf("resolution = failed %t, %v; request %t", failed, err, request)
+			}
+			parts, err := s.ListJobParts(ctx, part.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := StatusFailed
+			if request {
+				want = StatusFinished
+			}
+			if len(parts) != 1 || parts[0].Status != want || parts[0].FinishedKey != part.FinishedKey {
+				t.Fatalf("resolved input = %+v, want %s with saved artifact intact", parts, want)
+			}
+		})
+	}
+}
+
+func TestPostgresCompactFinalizationIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	ready := NewPart("job", "a-ready", "bucket", "source", "finished", now)
+	ready.Status = StatusCompactReady
+	finished := ready
+	finished.PartID, finished.Status = "b-finished", StatusFinished
+	seedPostgresParts(t, s, []Part{ready, finished})
+	if _, err := s.RequestCompactFinalization(ctx, []Part{ready, finished}, now); !IsConditionalCheckFailed(err) {
+		t.Fatalf("invalid selection error = %v", err)
+	}
+	parts, err := s.ListJobParts(ctx, ready.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].Status != StatusCompactReady {
+		t.Fatalf("partial finalization committed: %+v", parts)
 	}
 }
 
@@ -740,7 +890,7 @@ func TestPostgresApplicationSchedulingColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)
-	if err := s.ReleaseCompactBatch(ctx, *batch, "worker", now.Add(2*time.Minute)); err != nil {
+	if _, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now.Add(2*time.Minute), nil); err != nil {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)

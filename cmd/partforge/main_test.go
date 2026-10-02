@@ -623,12 +623,32 @@ func TestSelectFinalizeCompactionPartsByOutputPartID(t *testing.T) {
 	}
 }
 
-func TestSelectFinalizeCompactionPartsRejectsNonCompactingPartID(t *testing.T) {
+func TestSelectFinalizeCompactionPartsIncludesCompactReady(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "ready", Status: state.StatusCompactReady},
+		{PartID: "active", Status: state.StatusCompacting},
+		{PartID: "finished", Status: state.StatusFinished},
+	}
+	for _, selection := range []finalizeCompactionSelection{
+		{All: true},
+		{PartIDs: []string{"ready", "active"}},
+	} {
+		selected, err := selectFinalizeCompactionParts(parts, selection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(selected) != 2 || selected[0].PartID != "ready" || selected[1].PartID != "active" {
+			t.Fatalf("selected = %+v, want ready and active artifacts", selected)
+		}
+	}
+}
+
+func TestSelectFinalizeCompactionPartsRejectsFinishedPartID(t *testing.T) {
 	_, err := selectFinalizeCompactionParts([]state.Part{
-		{PartID: "part-1", Status: state.StatusCompactReady},
+		{PartID: "part-1", Status: state.StatusFinished},
 	}, finalizeCompactionSelection{PartIDs: []string{"part-1"}})
 	if err == nil {
-		t.Fatal("expected non-compacting part error")
+		t.Fatal("expected finished part error")
 	}
 }
 
@@ -1168,9 +1188,6 @@ func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
 	staleAfter := compactLeaseStaleAfter(2 * time.Hour)
 	if staleAfter != 2*time.Hour {
 		t.Fatalf("compactLeaseStaleAfter = %s, want 2h", staleAfter)
-	}
-	if got := compactLeaseHeartbeatInterval(staleAfter); got != 5*time.Minute {
-		t.Fatalf("compactLeaseHeartbeatInterval = %s, want 5m cap", got)
 	}
 	if got := compactLeaseStaleAfter(time.Minute); got != 5*time.Minute {
 		t.Fatalf("compactLeaseStaleAfter short window = %s, want 5m floor", got)

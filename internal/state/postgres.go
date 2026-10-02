@@ -568,6 +568,18 @@ func (s *Store) updatePart(ctx context.Context, jobID, partID string, condition 
 	return part, nil
 }
 
+// Match the ordered locks used by administrative updates when touching a batch.
+func partsInLockOrder(parts []Part) []Part {
+	ordered := append([]Part(nil), parts...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].JobID != ordered[j].JobID {
+			return ordered[i].JobID < ordered[j].JobID
+		}
+		return ordered[i].PartID < ordered[j].PartID
+	})
+	return ordered
+}
+
 func setStatus(part *Part, status Status, now time.Time) {
 	part.Status = status
 	part.UpdatedAt = formatTime(now)
@@ -872,37 +884,54 @@ func (s *Store) mergeableSiblingSQL(p, sibling, maxBytes string) string {
 		sibling + ".status = 'COMPACT_READY' AND " + sibling + ".compact_normalized AND (" + maxBytes + "::numeric = 0 OR " + sibling + ".compact_bytes + " + p + ".compact_bytes <= " + maxBytes + "::numeric)"
 }
 
-func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
+// A no-reduction failure and a pending finalization request must be resolved
+// under the same input locks, including requests received after the last heartbeat.
+func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time, noReductionError error) (bool, error) {
 	if strings.TrimSpace(workerID) == "" {
-		return errors.New("worker id is required")
+		return false, errors.New("worker id is required")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback(ctx)
-	for _, part := range batch.Parts {
+	parts := make([]Part, 0, len(batch.Parts))
+	finalizeRequested := false
+	for _, part := range partsInLockOrder(batch.Parts) {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err == nil && !compactOwnedOrUnownedReady(current, workerID) {
 			err = &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s did not match expected state", part.JobID, part.PartID)}
 		}
-		if err == nil {
+		if err != nil {
+			return false, fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		finalizeRequested = finalizeRequested || current.CompactFinalizeRequestedAt != ""
+		parts = append(parts, current)
+	}
+	failed := noReductionError != nil && !finalizeRequested
+	for _, current := range parts {
+		if failed {
+			markCompactPartFailed(&current, noReductionError, now)
+		} else {
 			setStatus(&current, StatusCompactReady, now)
+			if current.CompactFinalizeRequestedAt != "" {
+				setStatus(&current, StatusFinished, now)
+				current.FinishedAt = formatTime(now)
+			}
 			if strings.TrimSpace(current.CompactReadyAt) == "" {
-				current.CompactReadyAt = compactReadyAtForRelease(part, now)
+				current.CompactReadyAt = compactReadyAtForRelease(current, now)
 			}
 			current.WorkerID = ""
 			current.CompactingAt = ""
 			current.Error = ""
 			current.CompactCooldownUntil = ""
 			clearCompactProgress(&current)
-			err = s.savePartTx(ctx, tx, current)
 		}
-		if err != nil {
-			return fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
+		if err := s.savePartTx(ctx, tx, current); err != nil {
+			return false, fmt.Errorf("release compacting part %s/%s: %w", current.JobID, current.PartID, err)
 		}
 	}
-	return tx.Commit(ctx)
+	return failed, tx.Commit(ctx)
 }
 
 func (s *Store) MarkCompactBatchFailed(ctx context.Context, batch CompactBatch, workerID string, cause error, now time.Time) error {
@@ -922,7 +951,7 @@ func (s *Store) MarkCompactBatchFailed(ctx context.Context, batch CompactBatch, 
 	}
 	defer tx.Rollback(ctx)
 
-	for _, part := range batch.Parts {
+	for _, part := range partsInLockOrder(batch.Parts) {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err != nil {
 			return fmt.Errorf("mark compact batch %s failed: %w", batch.JobID, err)
@@ -984,18 +1013,37 @@ func (s *Store) updateCompactProgress(ctx context.Context, part Part, workerID s
 	return requested, err
 }
 
-func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now time.Time) error {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusCompacting
-	}, func(current *Part) error {
-		current.CompactFinalizeRequestedAt = formatTime(now)
-		current.UpdatedAt = formatTime(now)
-		return nil
-	})
+func (s *Store) RequestCompactFinalization(ctx context.Context, parts []Part, now time.Time) ([]Part, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
+		return nil, err
 	}
-	return nil
+	defer tx.Rollback(ctx)
+	updated := make([]Part, 0, len(parts))
+	for _, part := range partsInLockOrder(parts) {
+		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
+		if err != nil {
+			return nil, fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		if current.Status != StatusCompacting && current.Status != StatusCompactReady {
+			return nil, &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s is %s, expected COMPACT_READY or COMPACTING", part.JobID, part.PartID, current.Status)}
+		}
+		if current.Status == StatusCompactReady {
+			setStatus(&current, StatusFinished, now)
+			current.FinishedAt = formatTime(now)
+			current.Error = ""
+			current.CompactCooldownUntil = ""
+			clearCompactProgress(&current)
+		} else {
+			current.CompactFinalizeRequestedAt = formatTime(now)
+			current.UpdatedAt = formatTime(now)
+		}
+		if err := s.savePartTx(ctx, tx, current); err != nil {
+			return nil, fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		updated = append(updated, current)
+	}
+	return updated, tx.Commit(ctx)
 }
 
 type CompactProgress struct {
@@ -1080,17 +1128,17 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	}
 	defer tx.Rollback(ctx)
 
-	if err := s.insertPartTx(ctx, tx, output); err != nil {
-		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
-	}
-
-	for _, part := range batch.Parts {
+	for _, part := range partsInLockOrder(batch.Parts) {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err != nil {
 			return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 		}
 		if !compactOwnedOrUnownedReady(current, workerID) {
 			return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, &conditionalCheckFailedError{})
+		}
+		if current.CompactFinalizeRequestedAt != "" {
+			setStatus(&output, StatusFinished, now)
+			output.FinishedAt = formatTime(now)
 		}
 		setStatus(&current, StatusSuperseded, now)
 		current.SupersededAt = formatTime(now)
@@ -1104,24 +1152,11 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 			return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.insertPartTx(ctx, tx, output); err != nil {
 		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 	}
-	return nil
-}
-
-func (s *Store) MarkCompactReadyFinished(ctx context.Context, part Part, now time.Time) error {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, func(current Part) bool {
-		return current.Status == StatusCompactReady
-	}, func(current *Part) error {
-		setStatus(current, StatusFinished, now)
-		current.FinishedAt = formatTime(now)
-		current.Error = ""
-		current.CompactCooldownUntil = ""
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("mark compact-ready part %s/%s finished: %w", part.JobID, part.PartID, err)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
 	}
 	return nil
 }
