@@ -10,6 +10,24 @@ Requirements, configuration, and how to run the four stages by hand. For the hig
 - **A Postgres database** for state and an **S3 bucket** for artifacts — see [postgres.md](postgres.md). Local compose provides both for local runs.
 - **ClickHouse** — a source to freeze from and a destination to import into. The worker bundles upstream `26.6.8.7` and PostHog `26.9.5.2-posthog-2dbc5ba2dd25`. Upload commands default to upstream `26.6` when no build is specified.
 
+## PostHog UDFs
+
+The worker installs all executable UDFs from PostHog's source and deployment
+manifests at the commit pinned in `clickhouse-util-udfs.yml`. Both bundled
+ClickHouse builds expose the same functions, including `JSONCleanPostHogEvent`,
+`JSONDropKeysPool`, `decompress`, the individual property cleaners, and the
+unversioned, `v11`, and `v12` funnel functions, including JSON and debug variants.
+Upstream commands, argument types, pool settings, and launch scripts are preserved.
+
+`JSONCleanPostHogEvent(properties, person_properties)` returns a named tuple with
+`properties`, `temporary_properties`, `person_properties`, and each document's
+`*_null_keys` array. Use one alias to read its fields in an insert-select:
+
+```sql
+SELECT cleaned.properties, cleaned.temporary_properties, cleaned.person_properties
+FROM (SELECT JSONCleanPostHogEvent(properties, person_properties) AS cleaned FROM src.events)
+```
+
 ## Choosing the worker ClickHouse build
 
 Pass `-clickhouse-build=26.6` or `-clickhouse-build=26.9-posthog` to `upload-freeze` or `upload-backup`. The default is `26.6`, including jobs with no stored build field. The choice is stored with each part and used automatically by rewrite and compaction workers, including compaction restarts. No worker flag is needed.

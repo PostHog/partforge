@@ -91,6 +91,15 @@ chmod -R a+rwx "$ROOT/.e2e"
 if [[ "${PARTFORGE_E2E_SKIP_BUILD:-}" != "1" ]]; then
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose build worker
 fi
+udf_binary=clickhouse
+udf_config=/etc/clickhouse-server/config.xml
+if [[ "$CLICKHOUSE_BUILD" == "26.9-posthog" ]]; then
+  udf_binary=clickhouse-26.9-posthog
+  udf_config=/etc/clickhouse-server-26.9-posthog/config.xml
+fi
+docker compose run --rm --no-deps --entrypoint "$udf_binary" \
+  --workdir /work -v "$ROOT:/work:ro" worker local \
+  --config-file="$udf_config" --queries-file=e2e/sql/udfs.sql
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose up -d localstack postgres clickhouse
 
 for _ in $(seq 1 60); do

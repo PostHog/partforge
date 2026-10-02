@@ -24,7 +24,7 @@ FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata python3 \
     && groupadd --system clickhouse \
     && useradd --system --gid clickhouse --home-dir /nonexistent --shell /bin/false clickhouse \
     && mkdir -p /etc/clickhouse-client /etc/clickhouse-server/config.d /etc/clickhouse-server/users.d \

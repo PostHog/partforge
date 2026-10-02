@@ -1,16 +1,6 @@
 repository: PostHog/posthog
-revision: 0ac0d7cddc3a4a812b38d815f2c623848cf968fd
-manifest_path: docker/clickhouse/user_defined_function.xml
+revision: 8c06f93e475605c7795e9b133f6f5b2af7de39a0
+manifest_paths:
+  - docker/clickhouse/user_defined_function.xml
+  - posthog/user_scripts/latest_user_defined_function.xml
 binary_path: posthog/user_scripts
-udfs:
-  - binary_name: json_clean_posthog_event_properties_udf
-    function_names:
-      - JSONCleanPostHogEventProperties
-      - JSONCleanPostHogPersonProperties
-      - JSONCleanPostHogTemporaryProperties
-  - binary_name: json_drop_keys_udf
-    function_names:
-      - JSONDropKeys
-  - binary_name: json_strip_empty_strings_and_nulls_udf
-    function_names:
-      - JSONStripEmptyStringsAndNulls
