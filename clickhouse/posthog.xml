@@ -4,6 +4,7 @@
             <!-- Worker SQL uses the same AWS identity as the worker process. -->
             <s3_allow_server_credentials_in_user_queries>1</s3_allow_server_credentials_in_user_queries>
             <input_format_json_max_string_column_growth_step>67108864</input_format_json_max_string_column_growth_step>
+            <allow_experimental_json_bloom_filter_index>1</allow_experimental_json_bloom_filter_index>
         </default>
     </profiles>
 </clickhouse>
