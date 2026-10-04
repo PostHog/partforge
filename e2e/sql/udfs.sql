@@ -1,4 +1,4 @@
--- PostHog master 8c06f93e475605c7795e9b133f6f5b2af7de39a0: all 45 executable UDFs.
+-- PostHog 542f8dc033d2850bfa2b3094be07716475f0516c (PostHog/posthog#111330): all 45 executable UDFs.
 -- Empty funnels return no conversions; debug functions echo valid JSON.
 WITH
     toUInt8(2) AS steps,
@@ -32,6 +32,7 @@ SELECT
     throwIf(isValidJSON(aggregate_funnel_array_trends_test(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)) = 0, 'aggregate_funnel_array_trends_test failed'),
     throwIf(JSONDropKeys(['a'])('{"a":1,"b":2}') != '{"b":2}', 'JSONDropKeys failed'),
     throwIf(JSONCleanPostHogEvent('{"$set":{"score":7},"plan":null,"custom":"kept"}', '{"email":null}') != ('{"custom":"kept"}', '{"$set":{"score":7}}', '{}', ['plan'], [], ['email']), 'JSONCleanPostHogEvent failed'),
+    throwIf(JSONCleanPostHogEvent('{"$sent_at":"2026-01-01","$sdk_debug_current_session_duration":5,"$sdk_debug_retry":1}', '{}') != ('{"$sent_at":"2026-01-01","$sdk_debug_current_session_duration":5}', '{"$sdk_debug_retry":1}', '{}', [], [], []), 'JSONCleanPostHogEvent permanent keys failed'),
     throwIf(JSONCleanPostHogEventProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogEventProperties failed'),
     throwIf(JSONCleanPostHogPersonProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogPersonProperties failed'),
     throwIf(JSONCleanPostHogTemporaryProperties('{"$set":{"a":1},"b":2}') != '{"$set":{"a":1}}', 'JSONCleanPostHogTemporaryProperties failed'),
