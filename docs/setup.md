@@ -8,7 +8,7 @@ Requirements, configuration, and how to run the four stages by hand. For the hig
 - **Docker + Docker Compose** — to build/run the worker image and the local stack.
 - **`s5cmd`** on `PATH` for any command that moves S3 data as a local binary (`-s5cmd-binary` to override). The worker image bundles it.
 - **A Postgres database** for state and an **S3 bucket** for artifacts — see [postgres.md](postgres.md). Local compose provides both for local runs.
-- **ClickHouse** — a source to freeze from and a destination to import into. The worker bundles upstream `26.6.8.7` and PostHog `26.9.5.2-posthog-2dbc5ba2dd25`. Upload commands default to upstream `26.6` when no build is specified.
+- **ClickHouse** — a source to freeze from and a destination to import into. The worker bundles upstream `26.6.8.7` and PostHog `26.9.5.2-posthog-1cf4d1611468`. Upload commands default to upstream `26.6` when no build is specified.
 
 ## PostHog UDFs
 
