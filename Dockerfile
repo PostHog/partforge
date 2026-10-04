@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     GOPROXY=off CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=readonly -o /out/partforge ./cmd/partforge
 
 FROM clickhouse/clickhouse-server:26.6.8.7 AS clickhouse
-FROM ghcr.io/posthog/clickhouse-posthog:26.9.5.2-posthog-2dbc5ba2dd25 AS clickhouse-posthog
+FROM ghcr.io/posthog/clickhouse-posthog:26.9.5.2-posthog-1cf4d1611468 AS clickhouse-posthog
 
 FROM ubuntu:24.04 AS clickhouse-runtime
 ARG DEBIAN_FRONTEND=noninteractive
