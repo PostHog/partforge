@@ -224,15 +224,18 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	}
 	if waitForMerges {
 		observerCtx, cancelObserver := context.WithCancel(phaseCtx)
+		waitCtx, cancelMergeWait := context.WithCancel(c.mergeWaitContext(phaseCtx))
+		defer cancelMergeWait()
 		observerErrCh := make(chan error, 1)
 		go func() {
 			err := c.observeCompactProgress(observerCtx, p, item, target, inputStats)
-			if err != nil {
+			if errors.Is(err, errCompactMergeMemoryExhausted) {
+				cancelMergeWait()
+			} else if err != nil {
 				cancelPhase()
 			}
 			observerErrCh <- err
 		}()
-		waitCtx := c.mergeWaitContext(phaseCtx)
 		cancelWait := func() {}
 		if deadlineActive {
 			waitCtx, cancelWait = context.WithDeadline(waitCtx, c.MergeDeadline)
@@ -249,10 +252,13 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}()
 		cancelObserver()
 		observerErr := <-observerErrCh
-		if observerErr != nil {
+		memoryExhausted := errors.Is(observerErr, errCompactMergeMemoryExhausted)
+		if observerErr != nil && !memoryExhausted {
 			return CompactResult{}, observerErr
 		}
-		if err != nil {
+		if memoryExhausted {
+			slog.Warn("compact merges exhausted memory headroom; measuring current output", "stage", "compact_memory_exhausted", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
+		} else if err != nil {
 			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {

@@ -35,7 +35,7 @@ const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 const maxCompactMergeFailures uint64 = 3
 const minRetryMaxBlockSize = 8192
-const minAdaptiveMergeMaxBlockSizeBytes uint64 = 1024 * 1024
+const minAdaptiveMaxPartsToMergeAtOnce = 2
 
 const (
 	targetMergePartBytes uint64 = 150 * 1024 * 1024 * 1024
