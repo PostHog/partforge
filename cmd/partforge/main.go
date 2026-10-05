@@ -1607,7 +1607,7 @@ func runWorker(ctx context.Context, args []string) error {
 		compactWindow            = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactMaxArtifacts      = fs.Int("compact-max-artifacts", defaultCompactMaxArtifacts, "maximum single-part artifacts from one destination partition merged in one compaction batch; 1 disables batching")
 		compactMaxBytes          = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
-		compactMaxPartsToMerge   = fs.Int("compact-max-parts-to-merge", rewrite.DefaultCompactMaxPartsToMergeAtOnce, "max_parts_to_merge_at_once for compaction merges; lower values reduce peak merge memory")
+		compactMaxPartsToMerge   = fs.Int("compact-max-parts-to-merge", rewrite.DefaultCompactMaxPartsToMergeAtOnce, "initial max_parts_to_merge_at_once for compaction merges; halved after each memory-limit merge failure down to 2, lower values reduce peak merge memory")
 		metricsAddr              = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
 		metricsPath              = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
 		clickHousePrometheusPort = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")

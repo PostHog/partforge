@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +30,7 @@ func TestObserveCompactProgressRecoversMemoryLimitedMerge(t *testing.T) {
 			strings.HasPrefix(query, "SYSTEM START MERGES "),
 			strings.HasPrefix(query, "ALTER TABLE "):
 		case strings.Contains(query, "FROM system.part_log"):
-			_, _ = io.WriteString(w, "1\t1\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
+			_, _ = io.WriteString(w, "3\t3\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
 		case strings.HasPrefix(query, "SELECT partition_id, count()"):
 			_, _ = io.WriteString(w, "202601\t2\t20\t200\n")
 		case strings.HasPrefix(query, "SELECT partition_id, result_part_name"):
@@ -41,26 +42,28 @@ func TestObserveCompactProgressRecoversMemoryLimitedMerge(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	err := (Compactor{
-		ProgressInterval: time.Nanosecond,
+		MaxPartsToMergeAtOnce: 32,
+		ProgressInterval:      time.Nanosecond,
 		ReportProgress: func(context.Context, CompactWorkItem, CompactProgressSnapshot) error {
 			cancel()
 			return nil
 		},
 	}).observeCompactProgress(ctx, Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-		MergeTreeSettings: MergeTreeSettings{
-			MergeMaxBlockSizeBytes: 8 * 1024 * 1024,
-		},
 	}, CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsQueryWith(queries, "MODIFY SETTING merge_max_block_size_bytes = 4194304") {
-		t.Fatalf("queries = %#v, want merge block bytes halved after memory failure", queries)
+	if !containsQueryWith(queries, "MODIFY SETTING max_parts_to_merge_at_once = 16") {
+		t.Fatalf("queries = %#v, want merge fan-in halved once after memory failures in one poll", queries)
+	}
+	if containsQueryWith(queries, "merge_max_block_size_bytes") {
+		t.Fatalf("queries = %#v, want merge block bytes left unchanged", queries)
 	}
 }
 
-func TestObserveCompactProgressFailsAtMinimumAfterMemoryLimitedMerge(t *testing.T) {
+func TestObserveCompactProgressStopsMergesAtMinimumFanIn(t *testing.T) {
+	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -68,8 +71,10 @@ func TestObserveCompactProgressFailsAtMinimumAfterMemoryLimitedMerge(t *testing.
 			return
 		}
 		query := string(body)
+		queries = append(queries, query)
 		switch {
-		case query == "SYSTEM FLUSH LOGS":
+		case query == "SYSTEM FLUSH LOGS",
+			strings.HasPrefix(query, "SYSTEM STOP MERGES "):
 		case strings.Contains(query, "FROM system.part_log"):
 			_, _ = io.WriteString(w, "1\t1\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
 		default:
@@ -78,14 +83,14 @@ func TestObserveCompactProgressFailsAtMinimumAfterMemoryLimitedMerge(t *testing.
 	}))
 	defer server.Close()
 
-	err := (Compactor{}).observeCompactProgress(context.Background(), Processor{
+	err := (Compactor{MaxPartsToMergeAtOnce: minAdaptiveMaxPartsToMergeAtOnce}).observeCompactProgress(context.Background(), Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-		MergeTreeSettings: MergeTreeSettings{
-			MergeMaxBlockSizeBytes: minAdaptiveMergeMaxBlockSizeBytes,
-		},
 	}, CompactWorkItem{JobID: "job-1", OutputPartID: "compact-1"}, mergeWaitTarget{Database: "db", Table: "events"}, metrics.PartStats{Count: 2})
-	if err == nil || !strings.Contains(err.Error(), "already at minimum") {
-		t.Fatalf("error = %v, want minimum merge block size failure", err)
+	if !errors.Is(err, errCompactMergeMemoryExhausted) {
+		t.Fatalf("error = %v, want memory exhausted at minimum fan-in", err)
+	}
+	if !containsQueryWith(queries, "SYSTEM STOP MERGES `db`.`events`") {
+		t.Fatalf("queries = %#v, want destination merges stopped", queries)
 	}
 }
 
@@ -131,13 +136,13 @@ func TestRecoverCompactMergeRestartsBackgroundMerges(t *testing.T) {
 		context.Background(),
 		Processor{ClickHouse: chhttp.Client{URL: server.URL}},
 		mergeWaitTarget{Database: "db", Table: "events"},
-		4*1024*1024,
+		16,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "SYSTEM STOP MERGES `db`.`events`\n" +
-		"ALTER TABLE `db`.`events` MODIFY SETTING merge_max_block_size_bytes = 4194304\n" +
+		"ALTER TABLE `db`.`events` MODIFY SETTING max_parts_to_merge_at_once = 16\n" +
 		"SYSTEM START MERGES `db`.`events`"
 	if got := strings.Join(queries, "\n"); got != want {
 		t.Fatalf("queries = %q, want %q", got, want)

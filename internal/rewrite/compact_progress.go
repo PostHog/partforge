@@ -3,6 +3,7 @@ package rewrite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,9 +30,13 @@ type clickHouseMerge struct {
 	TotalSizeBytesUncompressed uint64   `json:"total_size_bytes_uncompressed"`
 }
 
+// errCompactMergeMemoryExhausted reports that destination merges still exceed
+// the memory limit at the minimum merge fan-in. Compact keeps whatever merged.
+var errCompactMergeMemoryExhausted = errors.New("destination merges exceeded memory limit at minimum max_parts_to_merge_at_once")
+
 func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item CompactWorkItem, target mergeWaitTarget, inputStats metrics.PartStats) error {
 	lastStateReport := time.Time{}
-	mergeMaxBlockSizeBytes := p.MergeTreeSettings.MergeMaxBlockSizeBytes
+	maxPartsToMerge := c.MaxPartsToMergeAtOnce
 	var handledMemoryLimitFailures uint64
 	for {
 		failedMerges, err := p.destinationFailedMergeSummary(ctx, target)
@@ -48,28 +53,44 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 			return fmt.Errorf("observe compact merge failures: %w", err)
 		}
 		if failedMerges.MemoryLimitCount > handledMemoryLimitFailures {
-			failures := failedMerges.MemoryLimitCount - handledMemoryLimitFailures
-			next := mergeMaxBlockSizeBytes
-			for range failures {
-				next = max(next/2, minAdaptiveMergeMaxBlockSizeBytes)
-			}
-			if next >= mergeMaxBlockSizeBytes {
-				return fmt.Errorf("destination merge exceeded memory limit with merge_max_block_size_bytes already at minimum %d: %s", mergeMaxBlockSizeBytes, failedMerges.LatestException)
+			// Failures seen in one poll ran at the same fan-in, so step down once per poll.
+			next := max(maxPartsToMerge/2, minAdaptiveMaxPartsToMergeAtOnce)
+			if next >= maxPartsToMerge {
+				if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+target.tableSQL()); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					return fmt.Errorf("stop destination merges after memory-limit failure at minimum fan-in: %w", err)
+				}
+				slog.Warn(
+					"destination merges exceeded memory limit at minimum fan-in; keeping merged output",
+					"stage", "adjusting_merge_memory",
+					"job_id", item.JobID,
+					"part_id", item.OutputPartID,
+					"destination_table", target.tableSQL(),
+					"memory_limit_failures", failedMerges.MemoryLimitCount,
+					"max_parts_to_merge_at_once", maxPartsToMerge,
+					"latest_exception", failedMerges.LatestException,
+				)
+				return errCompactMergeMemoryExhausted
 			}
 			if err := recoverCompactMergeAfterMemoryFailure(ctx, p, target, next); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 			slog.Warn(
-				"reduced merge block byte limit after memory-limit merge failure",
+				"reduced merge fan-in after memory-limit merge failure",
 				"stage", "adjusting_merge_memory",
 				"job_id", item.JobID,
 				"part_id", item.OutputPartID,
 				"destination_table", target.tableSQL(),
 				"memory_limit_failures", failedMerges.MemoryLimitCount,
-				"previous_merge_max_block_size_bytes", mergeMaxBlockSizeBytes,
-				"merge_max_block_size_bytes", next,
+				"previous_max_parts_to_merge_at_once", maxPartsToMerge,
+				"max_parts_to_merge_at_once", next,
 			)
-			mergeMaxBlockSizeBytes = next
+			maxPartsToMerge = next
 			handledMemoryLimitFailures = failedMerges.MemoryLimitCount
 		}
 		nonMemoryFailures := failedMerges.Count - failedMerges.MemoryLimitCount
@@ -135,18 +156,18 @@ func (c Compactor) observeCompactProgress(ctx context.Context, p Processor, item
 	}
 }
 
-func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, target mergeWaitTarget, mergeMaxBlockSizeBytes uint64) error {
+func recoverCompactMergeAfterMemoryFailure(ctx context.Context, p Processor, target mergeWaitTarget, maxPartsToMerge int) error {
 	table := target.tableSQL()
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM STOP MERGES "+table); err != nil {
 		return fmt.Errorf("stop destination merges after memory-limit failure: %w", err)
 	}
-	query := "ALTER TABLE " + table + " MODIFY SETTING merge_max_block_size_bytes = " + strconv.FormatUint(mergeMaxBlockSizeBytes, 10)
+	query := "ALTER TABLE " + table + " MODIFY SETTING max_parts_to_merge_at_once = " + strconv.Itoa(maxPartsToMerge)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
 		startErr := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table)
 		if startErr != nil {
-			return fmt.Errorf("reduce merge_max_block_size_bytes after memory-limit merge failure: %w; additionally failed to restart merges: %v", err, startErr)
+			return fmt.Errorf("reduce max_parts_to_merge_at_once after memory-limit merge failure: %w; additionally failed to restart merges: %v", err, startErr)
 		}
-		return fmt.Errorf("reduce merge_max_block_size_bytes after memory-limit merge failure: %w", err)
+		return fmt.Errorf("reduce max_parts_to_merge_at_once after memory-limit merge failure: %w", err)
 	}
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM START MERGES "+table); err != nil {
 		return fmt.Errorf("restart destination merges after memory-limit failure: %w", err)

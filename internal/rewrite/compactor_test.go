@@ -29,6 +29,7 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 		wantWait             bool
 		checkWait            bool
 		observerError        bool
+		memoryExhausted      bool
 		stop                 string
 		wantError            string
 	}{
@@ -52,6 +53,19 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 			partsAfterFirstQuery: 2,
 			observerError:        true,
 			wantError:            "observe compact merge failures",
+		},
+		{
+			name:                 "memory exhaustion at minimum fan-in uploads useful output",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 1,
+			memoryExhausted:      true,
+			wantReduced:          true,
+		},
+		{
+			name:                 "memory exhaustion at minimum fan-in releases unchanged input",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 2,
+			memoryExhausted:      true,
 		},
 		{
 			name:                 "manual finalize without deadline releases unchanged input",
@@ -141,6 +155,8 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 				case strings.Contains(query, "FROM system.part_log"):
 					if tt.observerError {
 						http.Error(w, "merge observer broke", http.StatusInternalServerError)
+					} else if tt.memoryExhausted {
+						_, _ = io.WriteString(w, "1\t1\tCode: 241. MEMORY_LIMIT_EXCEEDED\n")
 					} else {
 						_, _ = io.WriteString(w, "0\t0\t<none>\n")
 					}
@@ -165,6 +181,10 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 			}))
 			defer server.Close()
 
+			maxPartsToMerge := DefaultCompactMaxPartsToMergeAtOnce
+			if tt.memoryExhausted {
+				maxPartsToMerge = minAdaptiveMaxPartsToMergeAtOnce
+			}
 			result, err := (Compactor{
 				S3Copy:                s3copy.Copier{Binary: binary},
 				ClickHouse:            chhttp.Client{URL: server.URL},
@@ -174,7 +194,7 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 				MergeDeadline:         tt.deadline(),
 				MergeStopContext:      manualCtx,
 				ShutdownContext:       shutdownCtx,
-				MaxPartsToMergeAtOnce: DefaultCompactMaxPartsToMergeAtOnce,
+				MaxPartsToMergeAtOnce: maxPartsToMerge,
 				MergeTreeSettings: MergeTreeSettings{
 					MergeMaxBlockSize:        32768,
 					MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
