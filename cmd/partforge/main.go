@@ -1607,6 +1607,7 @@ func runWorker(ctx context.Context, args []string) error {
 		compactWindow            = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactMaxArtifacts      = fs.Int("compact-max-artifacts", defaultCompactMaxArtifacts, "maximum single-part artifacts from one destination partition merged in one compaction batch; 1 disables batching")
 		compactMaxBytes          = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
+		compactMaxPartsToMerge   = fs.Int("compact-max-parts-to-merge", rewrite.DefaultCompactMaxPartsToMergeAtOnce, "max_parts_to_merge_at_once for compaction merges; lower values reduce peak merge memory")
 		metricsAddr              = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables PartForge metrics")
 		metricsPath              = fs.String("metrics-path", "/metrics", "HTTP path for PartForge Prometheus metrics")
 		clickHousePrometheusPort = fs.Int("clickhouse-prometheus-port", defaultClickHousePrometheusPort, "port where the local worker ClickHouse exposes native Prometheus metrics")
@@ -1646,6 +1647,9 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactMaxArtifacts < 1 || *compactMaxArtifacts > state.MaxCompactBatchParts {
 		return fmt.Errorf("compact-max-artifacts must be between 1 and %d, got %d", state.MaxCompactBatchParts, *compactMaxArtifacts)
+	}
+	if *compactMaxPartsToMerge < 2 {
+		return fmt.Errorf("compact-max-parts-to-merge must be at least 2, got %d", *compactMaxPartsToMerge)
 	}
 	if *clickHouseScrapeTimeout <= 0 {
 		return fmt.Errorf("clickhouse-prometheus-scrape-timeout must be greater than zero, got %s", *clickHouseScrapeTimeout)
@@ -1741,6 +1745,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_heartbeat_interval", compactHeartbeatInterval,
 		"compact_max_artifacts", *compactMaxArtifacts,
 		"compact_max_bytes", *compactMaxBytes,
+		"compact_max_parts_to_merge", *compactMaxPartsToMerge,
 		"clickhouse_prometheus_enabled", clickHousePrometheusConfig.Enabled,
 		"clickhouse_prometheus_target", clickHousePrometheusTarget,
 		"clickhouse_prometheus_scrape_timeout", *clickHouseScrapeTimeout,
@@ -1810,6 +1815,7 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactHeartbeatInterval:      compactHeartbeatInterval,
 					CompactProgressInterval:       *stateProgressInterval,
 					CompactBatching:               state.CompactBatching{MaxArtifacts: *compactMaxArtifacts, MaxBytes: *compactMaxBytes},
+					CompactMaxPartsToMerge:        *compactMaxPartsToMerge,
 					Metrics:                       recorder,
 					PrometheusMetrics:             prometheusMetrics,
 					ECSProtection:                 &ecsProtection,
@@ -2092,6 +2098,7 @@ type workerCompactionConfig struct {
 	CompactHeartbeatInterval      time.Duration
 	CompactProgressInterval       time.Duration
 	CompactBatching               state.CompactBatching
+	CompactMaxPartsToMerge        int
 	Metrics                       metrics.Recorder
 	PrometheusMetrics             *metrics.Prometheus
 	ECSProtection                 *ecsTaskProtection
@@ -2416,10 +2423,11 @@ func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cf
 			DefaultCompressionCodec:  cfg.DefaultCompressionCodec,
 			PoolFreeEntriesThreshold: cfg.MergePoolFreeEntriesThreshold,
 		},
-		ShutdownContext:  shutdownCtx,
-		MergeStopContext: manualFinalizeCtx,
-		ProgressInterval: cfg.CompactProgressInterval,
-		Metrics:          cfg.Metrics,
+		MaxPartsToMergeAtOnce: cfg.CompactMaxPartsToMerge,
+		ShutdownContext:       shutdownCtx,
+		MergeStopContext:      manualFinalizeCtx,
+		ProgressInterval:      cfg.CompactProgressInterval,
+		Metrics:               cfg.Metrics,
 	}
 	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
 		stateCtx, cancel := workerStateUpdateContext()

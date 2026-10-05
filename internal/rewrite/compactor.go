@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	compactMaxPartsToMergeAtOnce = 100
+	DefaultCompactMaxPartsToMergeAtOnce = 32
 )
 
 type Compactor struct {
@@ -37,12 +37,14 @@ type Compactor struct {
 	MergePollInterval   time.Duration
 	MergeDeadline       time.Time
 	MergeTreeSettings   MergeTreeSettings
-	RestartClickHouse   func(context.Context) error
-	ReportProgress      CompactProgressReporter
-	ProgressInterval    time.Duration
-	Metrics             metrics.Recorder
-	ShutdownContext     context.Context
-	MergeStopContext    context.Context
+	// MaxPartsToMergeAtOnce bounds ClickHouse merge fan-in; merge memory grows with source parts.
+	MaxPartsToMergeAtOnce int
+	RestartClickHouse     func(context.Context) error
+	ReportProgress        CompactProgressReporter
+	ProgressInterval      time.Duration
+	Metrics               metrics.Recorder
+	ShutdownContext       context.Context
+	MergeStopContext      context.Context
 }
 
 type CompactInput struct {
@@ -513,11 +515,14 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	if mergeTreeSettings.PoolFreeEntriesThreshold == 0 {
 		return fmt.Errorf("pool free entries threshold must be greater than zero")
 	}
+	if c.MaxPartsToMergeAtOnce < 2 {
+		return fmt.Errorf("max_parts_to_merge_at_once must be at least 2, got %d", c.MaxPartsToMergeAtOnce)
+	}
 	mergeBytes := targetMergePoolByteSettings()
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
-		", max_parts_to_merge_at_once = " + strconv.Itoa(compactMaxPartsToMergeAtOnce) +
+		", max_parts_to_merge_at_once = " + strconv.Itoa(c.MaxPartsToMergeAtOnce) +
 		", min_age_to_force_merge_seconds = 1" +
 		", min_age_to_force_merge_on_partition_only = 0" +
 		", enable_vertical_merge_algorithm = 1" +
@@ -542,7 +547,7 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		"destination_table", table,
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
-		"max_parts_to_merge_at_once", compactMaxPartsToMergeAtOnce,
+		"max_parts_to_merge_at_once", c.MaxPartsToMergeAtOnce,
 		"min_age_to_force_merge_seconds", 1,
 		"min_age_to_force_merge_on_partition_only", false,
 		"vertical_merges_enabled", true,
