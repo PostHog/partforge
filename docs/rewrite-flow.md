@@ -92,7 +92,7 @@ Compactor ClickHouse processes start with a single-threaded `round_robin` merge 
 
 The per-table `merge_max_block_size_bytes` starts at no more than ClickHouse's 10 MiB default. When the compaction observer finds a new background `MergeParts` failure with ClickHouse error code 241 (`MEMORY_LIMIT_EXCEEDED`), it stops merges for that table, halves the byte limit down to a 1 MiB floor, and restarts merges. Repeated memory failures repeat that cycle; another failure at the floor fails the compaction rather than looping without a lower setting.
 
-Compaction enables vertical merges with zero activation thresholds, caps ordinary merges at 100 source parts, and forces parts older than one second through ordinary selection. PartForge does not force merges. If ClickHouse has no active merge and makes no part-count progress for five minutes, PartForge checkpoints and uploads any reduction; an unchanged part count fails the task.
+Compaction enables vertical merges with zero activation thresholds, caps ordinary merges at `-compact-max-parts-to-merge` source parts (default 32; merge memory grows with the number of source parts), and forces parts older than one second through ordinary selection. PartForge does not force merges. If ClickHouse has no active merge and makes no part-count progress for five minutes, PartForge checkpoints and uploads any reduction; an unchanged part count fails the task.
 
 ## Merge Wait
 

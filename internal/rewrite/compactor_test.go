@@ -166,14 +166,15 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 			defer server.Close()
 
 			result, err := (Compactor{
-				S3Copy:             s3copy.Copier{Binary: binary},
-				ClickHouse:         chhttp.Client{URL: server.URL},
-				WorkDir:            filepath.Join(root, "work"),
-				MergeSettleMinWait: time.Second,
-				MergePollInterval:  time.Millisecond,
-				MergeDeadline:      tt.deadline(),
-				MergeStopContext:   manualCtx,
-				ShutdownContext:    shutdownCtx,
+				S3Copy:                s3copy.Copier{Binary: binary},
+				ClickHouse:            chhttp.Client{URL: server.URL},
+				WorkDir:               filepath.Join(root, "work"),
+				MergeSettleMinWait:    time.Second,
+				MergePollInterval:     time.Millisecond,
+				MergeDeadline:         tt.deadline(),
+				MergeStopContext:      manualCtx,
+				ShutdownContext:       shutdownCtx,
+				MaxPartsToMergeAtOnce: DefaultCompactMaxPartsToMergeAtOnce,
 				MergeTreeSettings: MergeTreeSettings{
 					MergeMaxBlockSize:        32768,
 					MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
@@ -278,7 +279,8 @@ func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.
 	defer server.Close()
 
 	err := (Compactor{
-		ClickHouse: chhttp.Client{URL: server.URL},
+		ClickHouse:            chhttp.Client{URL: server.URL},
+		MaxPartsToMergeAtOnce: 40,
 		MergeTreeSettings: MergeTreeSettings{
 			MergeMaxBlockSize:        32768,
 			MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
@@ -299,7 +301,7 @@ func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.
 	}
 	for _, setting := range []string{
 		"merge_max_block_size_bytes = 10485760",
-		"max_parts_to_merge_at_once = 100",
+		"max_parts_to_merge_at_once = 40",
 		"min_age_to_force_merge_seconds = 1",
 		"min_age_to_force_merge_on_partition_only = 0",
 		"enable_vertical_merge_algorithm = 1",
@@ -311,6 +313,24 @@ func TestConfigureCompactMergeSettingsAppliesMemorySafeMergeSettings(t *testing.
 		if !strings.Contains(queries[0], setting) {
 			t.Fatalf("query = %q, want %s", queries[0], setting)
 		}
+	}
+}
+
+func TestConfigureCompactMergeSettingsRejectsMaxPartsBelowTwo(t *testing.T) {
+	err := (Compactor{
+		MaxPartsToMergeAtOnce: 1,
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   10 * 1024 * 1024,
+			MergeSelectingSleepMS:    1000,
+			PoolFreeEntriesThreshold: 1,
+		},
+	}).configureCompactMergeSettings(context.Background(), CompactWorkItem{
+		DestinationDatabase: "db",
+		DestinationTable:    "events",
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "max_parts_to_merge_at_once must be at least 2") {
+		t.Fatalf("err = %v, want max_parts_to_merge_at_once validation error", err)
 	}
 }
 
