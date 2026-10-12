@@ -2770,3 +2770,75 @@ func TestSummarizeJobCompactWaitsForBatchableSiblings(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectChainSourceParts(t *testing.T) {
+	finished := func(id string, status state.Status) state.Part {
+		return state.Part{JobID: "job-1", PartID: id, Status: status, Bucket: "partforge", FinishedKey: "p/jobs/job-1/finished/" + id}
+	}
+	empty := finished("part-empty", state.StatusFinished)
+	empty.EmptyOutput = true
+	parts := []state.Part{
+		finished("part-b", state.StatusImported),
+		finished("part-a", state.StatusFinished),
+		finished("part-old", state.StatusSuperseded),
+		finished("compact-c", state.StatusImporting),
+		empty,
+	}
+	got, err := selectChainSourceParts("job-1", parts, "partforge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, part := range got {
+		ids = append(ids, part.PartID)
+	}
+	if strings.Join(ids, ",") != "compact-c,part-a,part-b" {
+		t.Fatalf("selected = %v", ids)
+	}
+
+	unfinished := append(parts, finished("part-r", state.StatusCompactReady), finished("part-f", state.StatusFailed))
+	if _, err := selectChainSourceParts("job-1", unfinished, "partforge"); err == nil || !strings.Contains(err.Error(), "COMPACT_READY=1") || !strings.Contains(err.Error(), "FAILED=1") {
+		t.Fatalf("expected unfinished error with counts, got %v", err)
+	}
+	if _, err := selectChainSourceParts("job-1", parts, "other"); err == nil {
+		t.Fatal("expected bucket mismatch error")
+	}
+	if _, err := selectChainSourceParts("job-1", []state.Part{empty}, "partforge"); err == nil {
+		t.Fatal("expected error when no artifacts have output")
+	}
+	if _, err := selectChainSourceParts("job-1", nil, "partforge"); err == nil {
+		t.Fatal("expected error for missing job")
+	}
+}
+
+func TestChainPartManifest(t *testing.T) {
+	parent := state.Part{JobID: "job-1", PartID: "compact-1", Bucket: "partforge", FinishedKey: "p/jobs/job-1/finished/compact-1"}
+	params := chainPartParams{
+		ClickHouseBuild:   "26.6",
+		JobID:             "job-2",
+		SourceJobID:       "job-1",
+		Source:            manifest.TableRef{Database: "dst", Table: "events_new"},
+		Dest:              manifest.TableRef{Database: "dst", Table: "events_v3"},
+		SourceSchema:      "CREATE TABLE dst.events_new (id UInt64) ENGINE = MergeTree ORDER BY id",
+		DestinationSchema: "CREATE TABLE dst.events_v3 (id UInt64) ENGINE = MergeTree ORDER BY id",
+		InsertSelect:      "INSERT INTO dst.events_v3 SELECT id FROM dst.events_new",
+		Bucket:            "partforge",
+		Prefix:            "p",
+	}
+	m := chainPartManifest(parent, params, time.Unix(0, 0).UTC())
+	if err := m.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if m.S3.SourceFinishedKey != parent.FinishedKey {
+		t.Fatalf("source finished key = %q", m.S3.SourceFinishedKey)
+	}
+	if m.S3.SourceKey != "p/jobs/job-2/source/"+m.PartID || m.S3.FinishedKey != "p/jobs/job-2/finished/"+m.PartID {
+		t.Fatalf("unexpected keys: %+v", m.S3)
+	}
+	if m.Source != params.Source || m.Dest != params.Dest {
+		t.Fatalf("unexpected tables: %+v -> %+v", m.Source, m.Dest)
+	}
+	if again := chainPartManifest(parent, params, time.Now()); again.PartID != m.PartID {
+		t.Fatal("chained part id is not stable")
+	}
+}

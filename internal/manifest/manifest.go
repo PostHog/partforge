@@ -52,6 +52,9 @@ type S3Refs struct {
 	SourceKey     string         `json:"source_key"`
 	FinishedKey   string         `json:"finished_key"`
 	SourceObjects []SourceObject `json:"source_objects,omitempty"`
+	// SourceFinishedKey points at another job's finished artifact prefix. The
+	// worker extracts its part tarballs and attaches every part as source.
+	SourceFinishedKey string `json:"source_finished_key,omitempty"`
 }
 
 type SourceObject struct {
@@ -78,6 +81,14 @@ func (m Manifest) Validate() error {
 	}
 	if m.S3.Bucket == "" || m.S3.SourceKey == "" || m.S3.FinishedKey == "" {
 		return Error("manifest is missing S3 references")
+	}
+	if m.S3.SourceFinishedKey != "" {
+		if len(m.S3.SourceObjects) > 0 {
+			return Error("manifest cannot set both source_objects and source_finished_key")
+		}
+		if strings.ContainsAny(m.S3.SourceFinishedKey, "\x00\r\n*?[]{}") {
+			return Error("manifest contains an unsafe source_finished_key")
+		}
 	}
 	for _, object := range m.S3.SourceObjects {
 		if object.Bucket == "" || object.Key == "" || object.Path == "" {

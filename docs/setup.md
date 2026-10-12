@@ -195,6 +195,23 @@ Add `-include-partitions=202401,202402` to include only those exact partition ID
 
 `-backup` must identify the exact prefix containing `.backup`, `metadata/`, and `data/`. For an incremental, the command follows `base_backup` recursively and validates each `base_backup_uuid`; S3 base locators must have the form `S3('s3://bucket/prefix')`. It resolves ClickHouse's checksum-based file reuse, including files made from a base prefix plus an incremental suffix, and registers `READY` rows. By default it materializes each logical part into PartForge's normal source layout. With `-zero-copy`, it stores ordered source pointers and workers download files directly from all referenced backup layers; finished and compacted artifacts still go to the PartForge bucket. Every referenced backup must remain available until the job finishes. Lightweight and encrypted backups are unsupported. `-copy-sql-from-job` is supported in place of the two SQL files.
 
+#### Chaining from a finished job
+
+To run another rewrite over the output of a previous job, use `upload-chain`. Each finished artifact of the source job becomes one `READY` source part of the new job:
+
+```sh
+partforge upload-chain \
+  -source-job-id=<finished-job-id> \
+  -destination-schema-file=dest_v3.sql \
+  -insert-select-file=insert_v3.sql \
+  -bucket=partforge \
+  -job-name="events migration 002"
+```
+
+The new job's source table is the source job's destination table, and its source schema is the source job's destination schema. So `insert_v3.sql` reads `FROM dst_db.events_new`, and the new destination table must have a different name. The command writes only manifests: workers download the source job's finished part tarballs directly, attach every part in the artifact, and run the new insert-select. An artifact with more than one physical part runs as one unchunked insert.
+
+The source job must be fully finished: every non-`SUPERSEDED` row must be `FINISHED`, `IMPORTING`, or `IMPORTED`. Finalize compaction first if needed. Artifacts with empty output are skipped. The source job must use the same bucket. `-clickhouse-build` defaults to the source job's build. Keep the source job's finished S3 artifacts (do not run `delete-job -delete-s3`, `reset-job`, or `reset-compaction` on it) until the chained job has finished rewriting; PartForge does not block those commands. `-copy-sql-from-job` is supported in place of the two SQL files.
+
 ### 4. worker
 
 The worker claims the largest `READY` source artifact first, starts a local ClickHouse, downloads and attaches the source part, runs your `INSERT ... SELECT`, freezes the produced destination parts, uploads one uncompressed tarball per part, and marks the row `COMPACT_READY`. When no rewrite work is left, workers opportunistically compact the eligible finished artifact with the most physical parts first before promoting artifacts to `FINISHED`.
