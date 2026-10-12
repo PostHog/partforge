@@ -128,6 +128,8 @@ The path must be the exact full or incremental backup prefix. Incrementals are r
 
 For multiple shards with the same destination schema and insert-select, run the first `upload-freeze` with the SQL files and later shards with `-copy-sql-from-job=<first-job-id>`. To test another destination schema against the same uploaded source parts, run `upload-freeze -copy-parts-from-job=<source-job-id>` with the new SQL files.
 
+To run a second rewrite over the output of a finished job, run `upload-chain -source-job-id=<finished-job-id>` with new SQL files. The new job reads the previous job's finished artifacts directly, and its insert-select reads `FROM` the previous job's destination table. See [docs/setup.md](docs/setup.md#chaining-from-a-finished-job).
+
 Part state lifecycle (tracked in Postgres, so a job is resumable):
 
 ```

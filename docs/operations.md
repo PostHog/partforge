@@ -125,7 +125,7 @@ Notes:
 - To finish only waiting artifacts manually, use `set-part-state -job-id=JOB_ID -status=COMPACT_READY -to-status=FINISHED -force`. Replace `-status=COMPACT_READY` with repeated `-part-id=PART_ID` to select individual artifacts.
 - `retry-failed` moves failed rewrite parts back to `READY` and failed import parts back to `FINISHED` (so `import-finished` retries the import stage without re-running the worker). Any move back to `READY` clears persisted rewrite progress and metrics.
 - `reset-job` and `reset-compaction` validate compaction lineage (`compact_input_part_ids` / `superseded_by`) and refuse to run if any part has started import.
-- `-delete-s3` variants derive the exact S3 target from the job's recorded rows and reject glob metacharacters before deleting. For jobs created with `upload-freeze -copy-parts-from-job`, borrowed source prefixes are not deleted; jobs that own referenced source parts are blocked from deletion while those references exist.
+- `-delete-s3` variants derive the exact S3 target from the job's recorded rows and reject glob metacharacters before deleting. For jobs created with `upload-freeze -copy-parts-from-job`, borrowed source prefixes are not deleted; jobs that own referenced source parts are blocked from deletion while those references exist. Jobs used as `upload-chain -source-job-id` are not protected: keep their finished artifacts until the chained job has finished rewriting.
 
 ## Shutdown behavior
 

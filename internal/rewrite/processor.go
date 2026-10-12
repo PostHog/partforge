@@ -185,6 +185,11 @@ type ProcessResult struct {
 	DestinationPartitions []PartPartitionStats
 }
 
+type sourcePartDir struct {
+	Name string
+	Path string
+}
+
 type frozenPartGlob struct {
 	Disk string
 	Glob string
@@ -396,7 +401,29 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 			return ProcessResult{}, fmt.Errorf("download zero-copy source objects: %w", err)
 		}
 	}
-	sourceStats, err := fileutil.StatDir(sourceRoot)
+	sourceParts := []sourcePartDir{{Name: m.Part.Name, Path: sourceRoot}}
+	sourceStatsRoot := sourceRoot
+	if m.S3.SourceFinishedKey != "" {
+		finishedRoot := filepath.Join(root, "source-finished")
+		extractRoot := filepath.Join(root, "source-parts")
+		slog.Info("downloading chained source artifact", "stage", "download_source", "job_id", item.JobID, "part_id", item.PartID, "bucket", m.S3.Bucket, "source_finished_key", m.S3.SourceFinishedKey)
+		if err := p.S3Copy.DownloadPrefix(ctx, m.S3.Bucket, m.S3.SourceFinishedKey, finishedRoot); err != nil {
+			return ProcessResult{}, fmt.Errorf("download chained source artifact %s: %w", m.S3.SourceFinishedKey, err)
+		}
+		sourceStatsRoot = finishedRoot
+		partNames, err := artifact.ExtractFinishedTarballsFromDirContext(ctx, finishedRoot, extractRoot)
+		if err != nil {
+			return ProcessResult{}, fmt.Errorf("extract chained source artifact %s: %w", m.S3.SourceFinishedKey, err)
+		}
+		if len(partNames) == 0 {
+			return ProcessResult{}, fmt.Errorf("chained source artifact %s contains no part tarballs", m.S3.SourceFinishedKey)
+		}
+		sourceParts = sourceParts[:0]
+		for _, partName := range partNames {
+			sourceParts = append(sourceParts, sourcePartDir{Name: partName, Path: filepath.Join(extractRoot, partName)})
+		}
+	}
+	sourceStats, err := fileutil.StatDir(sourceStatsRoot)
 	if err != nil {
 		return ProcessResult{}, fmt.Errorf("stat downloaded source artifact %s: %w", item.SourceKey, err)
 	}
@@ -431,7 +458,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 	}
 	slog.Info("rewriting source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID)
 	rewriteStartedAt := time.Now()
-	rewriteResult, err := p.rewritePart(ctx, m, sourceRoot, stageTracker)
+	rewriteResult, err := p.rewritePart(ctx, m, sourceParts, stageTracker)
 	if err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
@@ -513,7 +540,7 @@ func downloadManifestSourceObjects(ctx context.Context, copier s3copy.Copier, ob
 	return os.RemoveAll(segmentRoot)
 }
 
-func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot string, stageTracker *rewriteStageTracker) (result rewriteResult, err error) {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceParts []sourcePartDir, stageTracker *rewriteStageTracker) (result rewriteResult, err error) {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
 		return rewriteResult{}, fmt.Errorf("source and destination table names must differ inside the worker")
 	}
@@ -562,15 +589,19 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := os.MkdirAll(sourceDetached, 0o755); err != nil {
 		return rewriteResult{}, err
 	}
-	if err := fileutil.MoveDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
-		return rewriteResult{}, fmt.Errorf("move source part to detached: %w", err)
+	for _, sourcePart := range sourceParts {
+		if err := fileutil.MoveDir(sourcePart.Path, filepath.Join(sourceDetached, sourcePart.Name)); err != nil {
+			return rewriteResult{}, fmt.Errorf("move source part %s to detached: %w", sourcePart.Name, err)
+		}
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageAttachSourcePart); err != nil {
 		return rewriteResult{}, err
 	}
-	slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", m.Part.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
-	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
-		return rewriteResult{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
+	for _, sourcePart := range sourceParts {
+		slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", sourcePart.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
+		if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(sourcePart.Name)); err != nil {
+			return rewriteResult{}, fmt.Errorf("attach source part %s: %w", sourcePart.Name, err)
+		}
 	}
 	sourceStats, err := p.activePartStats(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
@@ -584,6 +615,12 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageInsertSelect); err != nil {
 		return rewriteResult{}, err
+	}
+	if sourceStats.Count > 1 && p.InsertChunkMinRows > 0 {
+		// Chunk ranges use _part_offset, which only partitions a single part.
+		// Chained sources can attach several parts from one finished artifact.
+		slog.Info("disabling insert chunks for multi-part source", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "source_parts", sourceStats.Count)
+		p.InsertChunkMinRows = 0
 	}
 	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
 	insertStartedAt := time.Now()

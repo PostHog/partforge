@@ -92,6 +92,16 @@ Required: -backup, -database, -table, -bucket, and either both -destination-sche
 Required: -bucket, either both -destination-schema-file and -insert-select-file or -copy-sql-from-job, and either -copy-parts-from-job or all of -database, -table, and -freeze.`,
 	},
 	{
+		Name:    "upload-chain",
+		Usage:   "[flags]",
+		Summary: "Start a new job whose source is the finished output of a previous job, then create READY work rows in Postgres.",
+		Details: `Every finished artifact of -source-job-id becomes one READY source part of the new job. Only manifests are written; workers download the previous job's finished part tarballs directly. The new job's source table is the previous job's destination table, so -insert-select-file must read FROM that table.
+
+The previous job must be fully finished: every non-superseded row must be FINISHED, IMPORTING, or IMPORTED. Keep its finished S3 artifacts until the new job has finished rewriting.
+
+Required: -source-job-id, -bucket, and either both -destination-schema-file and -insert-select-file or -copy-sql-from-job.`,
+	},
+	{
 		Name:    "worker",
 		Usage:   "[flags]",
 		Summary: "Claim work from Postgres, rewrite source parts in a local ClickHouse, upload finished artifacts, and optionally compact them.",
@@ -282,6 +292,8 @@ func run() error {
 		return runUploadBackup(ctx, os.Args[2:])
 	case "upload-freeze":
 		return runUploadFreeze(ctx, os.Args[2:])
+	case "upload-chain":
+		return runUploadChain(ctx, os.Args[2:])
 	case "worker":
 		return runWorker(ctx, os.Args[2:])
 	case "import-finished":
@@ -1282,6 +1294,245 @@ func registerSourcePartsFromJob(ctx context.Context, store *state.Store, copier 
 		}
 	}
 	return len(sourceParts), nil
+}
+
+func runUploadChain(ctx context.Context, args []string) error {
+	fs := newCommandFlagSet("upload-chain")
+	var (
+		configPath            = fs.String("config", defaultConfigPath, "JSON config file path; CLI flags override config values")
+		sourceJobID           = fs.String("source-job-id", "", "finished job whose output becomes the new job's source")
+		destinationSchemaFile = fs.String("destination-schema-file", "", "path to SQL file containing the full destination CREATE TABLE")
+		insertSelectFile      = fs.String("insert-select-file", "", "path to SQL file containing INSERT INTO destination SELECT ... FROM <source job destination>")
+		copySQLFromJob        = fs.String("copy-sql-from-job", "", "existing job id to copy destination schema and insert-select SQL from")
+		jobID                 = fs.String("job-id", "", "job id to store in manifests and Postgres; empty generates one")
+		jobName               = fs.String("job-name", "", "readable job name shown by list-jobs")
+		clickHouseBuild       = fs.String("clickhouse-build", "", "worker ClickHouse build for this job: 26.6 or 26.9-posthog; empty uses the source job's build")
+		bucket                = fs.String("bucket", "", "S3 bucket for source manifests and finished part artifacts; must match the source job's bucket")
+		prefix                = fs.String("prefix", "partforge", "S3 key prefix under the bucket")
+		stateTable            = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
+		region                = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
+		s3Endpoint            = fs.String("s3-endpoint", "", "custom S3 endpoint URL, for example LocalStack")
+		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "path to the s5cmd binary used for S3 transfers")
+		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source manifests to upload concurrently; <=0 uses detected CPU count")
+		postgresURL           = fs.String("postgres-url", "", "Postgres state store connection URL")
+		postgresIAMAuth       = fs.Bool("postgres-iam-auth", false, "use AWS IAM authentication for the Postgres state store")
+	)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "upload-chain"); err != nil {
+		return err
+	}
+	parentJobID := strings.TrimSpace(*sourceJobID)
+	if parentJobID == "" || *bucket == "" {
+		return errors.New("source-job-id and bucket are required")
+	}
+	if err := validateUploadFreezeSQLInputs(*destinationSchemaFile, *insertSelectFile, *copySQLFromJob); err != nil {
+		return err
+	}
+	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
+	if err != nil {
+		return err
+	}
+
+	startedAt := time.Now()
+	slog.Info("upload-chain started", "stage", "start", "source_job_id", parentJobID, "bucket", *bucket, "prefix", *prefix)
+	stateStore, err := state.New(ctx, state.Config{Region: *region, Endpoint: *postgresURL, IAMAuth: *postgresIAMAuth, Table: *stateTable})
+	if err != nil {
+		return err
+	}
+	getStateStore := func() (*state.Store, error) { return stateStore, nil }
+	copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
+
+	parentParts, err := stateStore.ListJobParts(ctx, parentJobID)
+	if err != nil {
+		return err
+	}
+	chainParts, err := selectChainSourceParts(parentJobID, parentParts, *bucket)
+	if err != nil {
+		return err
+	}
+	parentSQL, err := copySQLBundleFromJob(ctx, stateStore, copier, parentJobID)
+	if err != nil {
+		return fmt.Errorf("read source job SQL: %w", err)
+	}
+	sourceSchema := strings.TrimSpace(parentSQL.DestinationSchema)
+	source, err := destinationTableRefFromSchema(sourceSchema)
+	if err != nil {
+		return fmt.Errorf("source job destination schema: %w", err)
+	}
+	if _, err := ddl.NormalizeCreateTable(sourceSchema); err != nil {
+		return fmt.Errorf("source job destination schema is not supported by worker: %w", err)
+	}
+
+	destinationSchema, insertSelect, err := readUploadFreezeSQL(ctx, *destinationSchemaFile, *insertSelectFile, *copySQLFromJob, getStateStore, copier)
+	if err != nil {
+		return err
+	}
+	destination, err := destinationTableRefFromSchema(destinationSchema)
+	if err != nil {
+		return err
+	}
+	if destination.Database == source.Database && destination.Table == source.Table {
+		return errors.New("source and destination table names must differ inside the worker; the source is the source job's destination table")
+	}
+
+	buildValue := strings.TrimSpace(*clickHouseBuild)
+	if buildValue == "" {
+		buildValue = chainParts[0].ClickHouseBuild
+	}
+	resolvedBuild, err := manifest.ResolveClickHouseBuild(buildValue)
+	if err != nil {
+		return err
+	}
+
+	resolvedJobID := strings.TrimSpace(*jobID)
+	if resolvedJobID == "" {
+		resolvedJobID, err = manifest.NewJobID()
+		if err != nil {
+			return fmt.Errorf("generate job id: %w", err)
+		}
+	}
+	if resolvedJobID == parentJobID {
+		return errors.New("job-id must differ from source-job-id")
+	}
+	slog.Info("registering chained source parts", "stage", "register_chain_parts", "job_id", resolvedJobID, "source_job_id", parentJobID, "source_table", chhttp.TableSQL(source.Database, source.Table), "destination_table", chhttp.TableSQL(destination.Database, destination.Table), "parts", len(chainParts), "clickhouse_build", resolvedBuild)
+
+	params := chainPartParams{
+		ClickHouseBuild:   resolvedBuild,
+		JobID:             resolvedJobID,
+		JobName:           strings.TrimSpace(*jobName),
+		SourceJobID:       parentJobID,
+		Source:            source,
+		Dest:              destination,
+		SourceSchema:      sourceSchema,
+		DestinationSchema: destinationSchema,
+		InsertSelect:      insertSelect,
+		Bucket:            *bucket,
+		Prefix:            *prefix,
+		StateStore:        stateStore,
+		Copier:            copier,
+	}
+	completed := 0
+	err = processTasksInParallel(ctx, chainParts, min(resolvedUploadConcurrency, len(chainParts)), func(ctx context.Context, _ int, part state.Part) (string, error) {
+		return registerChainPart(ctx, part, params)
+	}, func(partID string) {
+		completed++
+		slog.Info("chained source part progress", "stage", "register_chain_parts", "job_id", resolvedJobID, "completed_parts", completed, "parts_total", len(chainParts), "part_id", partID)
+	}, "chain part registration")
+	if err != nil {
+		return err
+	}
+	slog.Info("upload-chain complete", "stage", "complete", "job_id", resolvedJobID, "source_job_id", parentJobID, "parts", completed, "elapsed", time.Since(startedAt))
+	fmt.Println(resolvedJobID)
+	return nil
+}
+
+// selectChainSourceParts returns the finished artifacts of a job that a chained
+// job can read. Partially finished jobs are rejected so no rows are dropped.
+func selectChainSourceParts(jobID string, parts []state.Part, bucket string) ([]state.Part, error) {
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("source job %s has no state rows", jobID)
+	}
+	unfinished := map[state.Status]int{}
+	var selected []state.Part
+	for _, part := range parts {
+		switch part.Status {
+		case state.StatusSuperseded:
+			continue
+		case state.StatusFinished, state.StatusImporting, state.StatusImported:
+		default:
+			unfinished[part.Status]++
+			continue
+		}
+		if part.EmptyOutput {
+			continue
+		}
+		if part.Bucket != bucket {
+			return nil, fmt.Errorf("source job part %s/%s is in bucket %q, expected %q", part.JobID, part.PartID, part.Bucket, bucket)
+		}
+		if strings.TrimSpace(part.FinishedKey) == "" {
+			return nil, fmt.Errorf("source job part %s/%s has no finished key", part.JobID, part.PartID)
+		}
+		selected = append(selected, part)
+	}
+	if len(unfinished) > 0 {
+		var counts []string
+		for _, status := range statusOrder() {
+			if count := unfinished[status]; count > 0 {
+				counts = append(counts, fmt.Sprintf("%s=%d", status, count))
+			}
+		}
+		return nil, fmt.Errorf("source job %s is not finished (%s); finish compaction and rewrites before chaining", jobID, strings.Join(counts, ", "))
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("source job %s has no finished artifacts with output", jobID)
+	}
+	sort.Slice(selected, func(i, j int) bool { return selected[i].PartID < selected[j].PartID })
+	return selected, nil
+}
+
+type chainPartParams struct {
+	ClickHouseBuild   string
+	JobID             string
+	JobName           string
+	SourceJobID       string
+	Source            manifest.TableRef
+	Dest              manifest.TableRef
+	SourceSchema      string
+	DestinationSchema string
+	InsertSelect      string
+	Bucket            string
+	Prefix            string
+	StateStore        *state.Store
+	Copier            s3copy.Copier
+}
+
+func chainPartManifest(parent state.Part, params chainPartParams, createdAt time.Time) manifest.Manifest {
+	partID := manifest.DerivePartID("chain", parent.FinishedKey, parent.PartID, params.SourceSchema, params.DestinationSchema, params.InsertSelect)
+	return manifest.Manifest{
+		ClickHouseBuild: params.ClickHouseBuild,
+
+		Version: manifest.Version,
+		JobID:   params.JobID,
+		PartID:  partID,
+		Freeze:  params.SourceJobID,
+		Source:  params.Source,
+		Dest:    params.Dest,
+		Part:    manifest.SourcePart{Disk: "chain", Name: parent.PartID, RelativePath: parent.FinishedKey},
+		SQL:     manifest.SQLBundle{SourceSchema: params.SourceSchema, DestinationSchema: params.DestinationSchema, InsertSelect: params.InsertSelect},
+		S3: manifest.S3Refs{
+			Bucket:            params.Bucket,
+			SourceKey:         manifest.SourcePartPrefix(params.Prefix, params.JobID, partID),
+			FinishedKey:       manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID),
+			SourceFinishedKey: parent.FinishedKey,
+		},
+		CreatedAt: createdAt,
+	}
+}
+
+func registerChainPart(ctx context.Context, parent state.Part, params chainPartParams) (string, error) {
+	createdAt := time.Now().UTC()
+	m := chainPartManifest(parent, params, createdAt)
+	dir, err := os.MkdirTemp("", "partforge-chain-part-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	if err := artifact.WriteManifest(dir, m); err != nil {
+		return "", err
+	}
+	if err := params.Copier.UploadDir(ctx, dir, m.S3.Bucket, m.S3.SourceKey); err != nil {
+		return "", fmt.Errorf("upload chained source manifest for %s/%s: %w", parent.JobID, parent.PartID, err)
+	}
+	part := state.NewPart(m.JobID, m.PartID, m.S3.Bucket, m.S3.SourceKey, m.S3.FinishedKey, createdAt)
+	part.JobName = params.JobName
+	part.ClickHouseBuild = params.ClickHouseBuild
+	part.SourceArtifactBytes = parent.DestinationActivePartBytes
+	if err := params.StateStore.CreatePart(ctx, part); err != nil {
+		return "", fmt.Errorf("create chained source part state for %s/%s from %s/%s: %w", part.JobID, part.PartID, parent.JobID, parent.PartID, err)
+	}
+	return part.PartID, nil
 }
 
 type uploadPartFunc func(context.Context, int, uploadPartTask) (uploadPartResult, error)

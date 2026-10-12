@@ -66,3 +66,36 @@ func TestManifestRejectsUnsafeSourceObjectPath(t *testing.T) {
 		t.Fatal("expected unsafe source object path error")
 	}
 }
+
+func TestManifestValidatesSourceFinishedKey(t *testing.T) {
+	m := Manifest{
+		Version: Version,
+		JobID:   "job-2",
+		PartID:  "part-2",
+		Source:  TableRef{Database: "dst", Table: "events"},
+		Dest:    TableRef{Database: "dst2", Table: "events"},
+		Part:    SourcePart{Disk: "chain", Name: "part-1", RelativePath: "jobs/job-1/finished/part-1"},
+		SQL:     SQLBundle{SourceSchema: "source", DestinationSchema: "destination", InsertSelect: "insert"},
+		S3: S3Refs{
+			Bucket:            "partforge",
+			SourceKey:         "jobs/job-2/source/part-2",
+			FinishedKey:       "jobs/job-2/finished/part-2",
+			SourceFinishedKey: "jobs/job-1/finished/part-1",
+		},
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("valid chained manifest: %v", err)
+	}
+
+	unsafe := m
+	unsafe.S3.SourceFinishedKey = "jobs/job-1/finished/*"
+	if err := unsafe.Validate(); err == nil {
+		t.Fatal("expected unsafe source_finished_key error")
+	}
+
+	both := m
+	both.S3.SourceObjects = []SourceObject{{Bucket: "b", Key: "k", Path: "data.bin"}}
+	if err := both.Validate(); err == nil {
+		t.Fatal("expected error when source_objects and source_finished_key are both set")
+	}
+}

@@ -10,6 +10,7 @@ JOB_ID="e2e-job"
 COPY_JOB_ID="e2e-copy-job"
 BACKUP_JOB_ID="e2e-backup-job"
 BACKUP_COPY_JOB_ID="e2e-backup-copy-job"
+CHAIN_JOB_ID="e2e-chain-job"
 JOB_NAME="E2E import"
 CLICKHOUSE_BUILD="${PARTFORGE_E2E_CLICKHOUSE_BUILD:-26.6}"
 
@@ -625,6 +626,73 @@ if [[ "$output_part_count" != "1" ]]; then
   echo "output ClickHouse parts=$output_part_count, expected 1 from $part_count uploaded parts" >&2
   exit 1
 fi
+
+# Chain a second rewrite from the imported job's finished artifacts.
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
+  --workdir /work \
+  -v "$ROOT:/work:ro" \
+  worker \
+  upload-chain \
+  -source-job-id="$JOB_ID" \
+  -destination-schema-file=e2e/sql/chain-destination.sql \
+  -insert-select-file=e2e/sql/chain-insert.sql \
+  -bucket=partforge \
+  -prefix=e2e \
+  -job-id="$CHAIN_JOB_ID" \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+
+chain_part_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = '$CHAIN_JOB_ID' AND status = 'READY'")"
+parent_artifact_count="$(docker compose exec -T postgres psql -U partforge -d partforge -Atc \
+  "SELECT count(*) FROM partforge_state WHERE job_id = '$JOB_ID' AND status = 'IMPORTED' AND COALESCE(data->>'empty_output', 'false') <> 'true'")"
+if [[ "$chain_part_count" == "0" || "$chain_part_count" != "$parent_artifact_count" ]]; then
+  echo "chain READY parts=$chain_part_count, expected $parent_artifact_count parent artifacts" >&2
+  exit 1
+fi
+if docker compose exec -T localstack awslocal s3 ls \
+  "s3://partforge/e2e/jobs/$CHAIN_JOB_ID/source/" --recursive |
+  grep -vE '/manifest\.json$' | grep -E '[^[:space:]]' >/dev/null; then
+  echo "upload-chain unexpectedly copied source part data" >&2
+  exit 1
+fi
+
+for i in $(seq 1 "$chain_part_count"); do
+  chain_worker_log="$ROOT/.e2e/chain-worker-${i}.log"
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    worker \
+    -role=inserter \
+    -insert-chunk-min-rows=1 \
+    -merge-max-runtime=1ns \
+    -s3-endpoint=http://localstack:4566 \
+    -postgres-url="$POSTGRES_URL" \
+    -once 2>&1 | tee "$chain_worker_log"
+  if ! grep -F "downloading chained source artifact" "$chain_worker_log" >/dev/null; then
+    echo "chain worker did not read the parent job's finished artifact" >&2
+    exit 1
+  fi
+done
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  finalize-compaction -job-id="$CHAIN_JOB_ID" -all -force -postgres-url="$POSTGRES_URL"
+
+docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/chain-destination.sql
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
+  -v "$DATA_DIR:/var/lib/clickhouse" worker import-finished \
+  -database=dst -table=events_v3 -job-id="$CHAIN_JOB_ID" \
+  -clickhouse-url="$CH_HTTP_DOCKER" -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
+docker compose exec -T clickhouse clickhouse-client --query \
+  "SELECT id, name, amount, event_date FROM dst.events_v3 ORDER BY id FORMAT TSV" \
+  > "$ROOT/.e2e/actual-chain.tsv"
+diff -u e2e/expected-chain.tsv "$ROOT/.e2e/actual-chain.tsv"
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$CHAIN_JOB_ID" \
+  -delete-s3 \
+  -s3-endpoint=http://localstack:4566 \
+  -postgres-url="$POSTGRES_URL"
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
   delete-job \
