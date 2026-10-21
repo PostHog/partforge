@@ -294,7 +294,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	if err := c.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable)+" FREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
 		return CompactResult{}, fmt.Errorf("freeze compact destination table %s: %w", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), err)
 	}
-	disks, err := freeze.LocalDisks(ctx, c.ClickHouse)
+	disks, err := freeze.LocalDisks(ctx, c.ClickHouse, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
 		return CompactResult{}, err
 	}

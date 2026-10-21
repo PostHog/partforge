@@ -996,7 +996,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	slog.Info("validated source schema and destination table", "stage", "validate_schemas", "destination_schema_table", chhttp.TableSQL(destinationTableRef.Database, destinationTableRef.Table))
 
 	slog.Info("discovering local ClickHouse disks", "stage", "discover_disks")
-	disks, err := freeze.LocalDisks(ctx, ch)
+	disks, err := freeze.LocalDisks(ctx, ch, *database, *table)
 	if err != nil {
 		return err
 	}
