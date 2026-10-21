@@ -26,10 +26,11 @@ type Disk struct {
 	Type string
 }
 
-func LocalDisks(ctx context.Context, ch chhttp.Client) ([]Disk, error) {
-	out, err := ch.QueryString(ctx, "SELECT name, path, type FROM system.disks ORDER BY name FORMAT TSV")
+// LocalDisks returns the disks in the storage policy of database.table; other disks on the server are ignored.
+func LocalDisks(ctx context.Context, ch chhttp.Client, database, table string) ([]Disk, error) {
+	out, err := ch.QueryString(ctx, "SELECT name, path, type FROM system.disks WHERE name IN (SELECT arrayJoin(disks) FROM system.storage_policies WHERE policy_name IN (SELECT storage_policy FROM system.tables WHERE database = "+chhttp.StringLiteral(database)+" AND name = "+chhttp.StringLiteral(table)+")) ORDER BY name FORMAT TSV")
 	if err != nil {
-		return nil, fmt.Errorf("query ClickHouse disks: %w", err)
+		return nil, fmt.Errorf("query ClickHouse disks for %s: %w", chhttp.TableSQL(database, table), err)
 	}
 	rows, err := chhttp.FormatTSVStrings(out, 3)
 	if err != nil {
@@ -44,7 +45,7 @@ func LocalDisks(ctx context.Context, ch chhttp.Client) ([]Disk, error) {
 		disks = append(disks, disk)
 	}
 	if len(disks) == 0 {
-		return nil, fmt.Errorf("ClickHouse reported no local disks")
+		return nil, fmt.Errorf("ClickHouse reported no disks for the storage policy of %s", chhttp.TableSQL(database, table))
 	}
 	return disks, nil
 }

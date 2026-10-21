@@ -691,7 +691,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
 		return rewriteResult{}, fmt.Errorf("freeze destination table %s: %w", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), err)
 	}
-	disks, err := freeze.LocalDisks(ctx, p.ClickHouse)
+	disks, err := freeze.LocalDisks(ctx, p.ClickHouse, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return rewriteResult{}, err
 	}
