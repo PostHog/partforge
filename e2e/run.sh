@@ -19,6 +19,22 @@ export CLICKHOUSE_UID="$(id -u)" CLICKHOUSE_GID="$(id -g)"
 
 cd "$ROOT"
 
+# Read the log driver's stream instead of Compose's attach stream, which can
+# close before the final worker logs arrive when a child process exits.
+run_worker_logged() (
+  local container="partforge-e2e-worker-${BASHPID}-${RANDOM}"
+  local exit_code
+  if [[ "${1:-}" == "--name" ]]; then
+    container="$2"
+    shift 2
+  fi
+  trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+  docker compose run --detach --name "$container" "$@" >/dev/null
+  docker logs --follow "$container"
+  exit_code="$(docker wait "$container")"
+  exit "$exit_code"
+)
+
 log_value() {
   local line="$1"
   local key="$2"
@@ -222,7 +238,7 @@ fi
 
 for i in $(seq 1 "$incremental_part_count"); do
   backup_worker_log="$ROOT/.e2e/backup-worker-${i}.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged worker \
     worker \
     -role=inserter \
     -insert-chunk-min-rows=1 \
@@ -357,7 +373,7 @@ fi
 
 for i in $(seq 1 "$part_count"); do
   worker_log="$ROOT/.e2e/worker-${i}.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged worker \
     worker \
     -role=inserter \
     -insert-chunk-min-rows=1 \
@@ -411,7 +427,7 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm \
   -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 
 for i in $(seq 1 "$part_count"); do
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker worker \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged worker worker \
     -role=inserter -insert-chunk-min-rows=1 -merge-max-runtime=1ns -once \
     -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL"
 done
@@ -452,7 +468,7 @@ exec /usr/local/bin/s5cmd "$@"
 SH
   chmod +x "$ROOT/.e2e/hold-compact-download"
   active_log="$ROOT/.e2e/finalize-active-worker.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --name "$compact_container" \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged --name "$compact_container" \
     -v "$ROOT/.e2e:/work/.e2e" worker worker -role=compactor -once \
     -s5cmd-binary=/work/.e2e/hold-compact-download \
     -s3-endpoint=http://localstack:4566 -postgres-url="$POSTGRES_URL" \
@@ -509,7 +525,7 @@ SH
 batched=0
 for i in 1 2; do
   compact_log="$ROOT/.e2e/compact-$i.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged worker \
     worker \
     -role=compactor \
     -s3-endpoint=http://localstack:4566 \
@@ -659,7 +675,7 @@ fi
 
 for i in $(seq 1 "$chain_part_count"); do
   chain_worker_log="$ROOT/.e2e/chain-worker-${i}.log"
-  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" run_worker_logged worker \
     worker \
     -role=inserter \
     -insert-chunk-min-rows=1 \
