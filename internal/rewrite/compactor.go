@@ -88,7 +88,7 @@ type CompactResult struct {
 	Inputs                []CompactInput
 }
 
-func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactResult, error) {
+func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (result CompactResult, err error) {
 	if item.JobID == "" || item.OutputPartID == "" || item.OutputFinishedKey == "" {
 		return CompactResult{}, fmt.Errorf("compact work item is missing job id, output part id, or output finished key")
 	}
@@ -271,6 +271,12 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}
 	}
 	cancelPhase()
+
+	resumeMerges, err := p.pauseDestinationMerges(ctx, target)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	defer func() { err = errors.Join(err, resumeMerges()) }()
 
 	destPartitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
