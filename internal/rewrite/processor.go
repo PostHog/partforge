@@ -643,6 +643,11 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_insert", false); err != nil {
 		return rewriteResult{}, err
 	}
+	resumeMerges, err := p.pauseDestinationMerges(ctx, mergeTarget)
+	if err != nil {
+		return rewriteResult{}, err
+	}
+	defer func() { err = errors.Join(err, resumeMerges()) }()
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
 		return rewriteResult{}, err
 	}

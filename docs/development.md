@@ -14,7 +14,7 @@ go test ./...
 
 `AGENTS.md` lists `go mod tidy && go test ./... && ./e2e/run.sh` as the required pre-commit check.
 
-The e2e script stands up LocalStack, Postgres, and a ClickHouse container, builds the worker image, and runs the full pipeline against `e2e/sql/`, diffing the result against `e2e/expected.tsv`. It builds the image each run; set `PARTFORGE_E2E_SKIP_BUILD=1` to reuse an existing `partforge-worker:latest`.
+The e2e script stands up LocalStack, Postgres, and a ClickHouse container, builds the worker image, and runs the full pipeline against `e2e/sql/`, diffing the result against `e2e/expected.tsv`. It builds the image each run; set `PARTFORGE_E2E_SKIP_BUILD=1` to reuse an existing `partforge-worker:latest`. Worker log assertions read Docker’s log-driver stream and retain each container until its exit status is collected, so a truncated Compose attach stream cannot hide the last worker messages.
 
 PostgreSQL integration checks exercise fresh and hand-created schemas, migration rollback and concurrent migration runs, concurrent work claims, ownership, maintenance, and 20,000-row query plans. With local compose Postgres running:
 

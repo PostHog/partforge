@@ -124,6 +124,9 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 
 			var partitionQueries atomic.Uint64
 			var mergeCountQueries atomic.Uint64
+			var mergesPaused atomic.Bool
+			var snapshotDrained atomic.Bool
+			var snapshotMeasured atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
@@ -135,12 +138,26 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 				case strings.HasPrefix(query, "SELECT arrayElement(data_paths"):
 					_, _ = io.WriteString(w, dataPath+"\n")
 				case strings.HasPrefix(query, "SELECT partition_id, count()"):
+					if snapshotDrained.Load() {
+						// The in-flight aggregate merge reduced rows before draining.
+						if !mergesPaused.Load() {
+							t.Error("measured final output with merges enabled")
+						}
+						snapshotMeasured.Store(true)
+						_, _ = io.WriteString(w, "202601\t"+strconv.FormatUint(tt.partsAfterFirstQuery, 10)+"\t12\t120\n")
+						return
+					}
 					parts := uint64(2)
 					if partitionQueries.Add(1) > 1 {
 						parts = tt.partsAfterFirstQuery
 					}
 					_, _ = io.WriteString(w, "202601\t"+strconv.FormatUint(parts, 10)+"\t20\t200\n")
 				case strings.HasPrefix(query, "SELECT count() FROM system.merges"):
+					if mergesPaused.Load() {
+						snapshotDrained.Store(true)
+						_, _ = io.WriteString(w, "0\n")
+						return
+					}
 					mergeCountQueries.Add(1)
 					if tt.stop != "" {
 						if tt.stop == "unexpected" {
@@ -164,16 +181,22 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 				case strings.HasPrefix(query, "SELECT name, path, type FROM system.disks"):
 					_, _ = io.WriteString(w, "default\t"+diskPath+"\tlocal\n")
 				case strings.Contains(query, " FREEZE WITH NAME '"):
+					if !mergesPaused.Load() || !snapshotDrained.Load() || !snapshotMeasured.Load() {
+						t.Error("froze output without stopping and draining destination merges")
+					}
 					marker := " FREEZE WITH NAME '"
 					freezeName := strings.TrimSuffix(query[strings.Index(query, marker)+len(marker):], "'")
 					if err := writeCompactTestPart(filepath.Join(diskPath, "shadow", freezeName, "store", "abc", "def", "202601_1_2_1")); err != nil {
 						http.Error(w, err.Error(), http.StatusInternalServerError)
 					}
+				case strings.HasPrefix(query, "SYSTEM STOP MERGES "):
+					mergesPaused.Store(true)
+					snapshotDrained.Store(false)
+				case strings.HasPrefix(query, "SYSTEM START MERGES "):
+					mergesPaused.Store(false)
 				case query == "SYSTEM FLUSH LOGS",
 					strings.HasPrefix(query, "CREATE DATABASE "),
 					strings.HasPrefix(query, "CREATE TABLE "),
-					strings.HasPrefix(query, "SYSTEM STOP MERGES "),
-					strings.HasPrefix(query, "SYSTEM START MERGES "),
 					strings.HasPrefix(query, "ALTER TABLE "):
 				default:
 					http.Error(w, "unexpected query: "+query, http.StatusInternalServerError)
@@ -230,6 +253,12 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 			}
 			if result.Reduced != tt.wantReduced {
 				t.Fatalf("reduced = %t, want %t", result.Reduced, tt.wantReduced)
+			}
+			if result.DestinationStats.Rows != 12 {
+				t.Fatalf("destination rows = %d, want post-drain count 12", result.DestinationStats.Rows)
+			}
+			if mergesPaused.Load() {
+				t.Fatal("destination merges remained stopped after compaction")
 			}
 			if (result.FinishedKey == "finished/compact-1") != tt.wantReduced {
 				t.Fatalf("finished key = %q, want uploaded %t", result.FinishedKey, tt.wantReduced)

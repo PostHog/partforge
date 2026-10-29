@@ -62,6 +62,8 @@ graph TD
 
 A rewrite producing zero destination parts skips artifact upload and transitions directly to `FINISHED`, with `empty_output` recorded in state. Importing it marks it imported without downloading or attaching parts. Nonempty artifacts still require matching frozen part directories.
 
+Before measuring final output and freezing it, both rewrite and compaction stop destination merge selection and wait for in-flight merges to finish. The drain has a separate five-minute limit (or the caller's shorter deadline) and fails the operation if it cannot establish a stable part set. Merges remain stopped through measurement and FREEZE, so recorded counts describe the archived snapshot, including for aggregate tables whose physical row counts shrink during merges. Merges are restored on success or failure; restoration errors also fail the operation. Ordinary merge settling can still time out and keep partially compacted output, but the final snapshot guard cannot be skipped. This applies to newly produced artifacts; existing mismatched metadata requires separate reconciliation.
+
 ## Local Insert Checkpoints
 
 Workers use up to 20 source-offset chunks per part. `-insert-chunk-min-rows` defaults to 10,000,000; the chunk count is `min(20, max(1, floor(source_rows / minimum)))`. Ranges divide the rows evenly (differing by at most one row), so no final tiny tail is created. Parts below 20 million rows use one insert, 20 million rows use two chunks, and 200 million or more use 20. Set the flag to `0` to disable chunking, or increase it for larger minimum chunks. This row-based default is a starting point, not a guarantee of chunk duration or memory usage.
