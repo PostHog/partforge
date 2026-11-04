@@ -2417,7 +2417,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if err := cfg.ECSProtection.Set(ctx, true); err != nil {
 		stateCtx, cancel := workerStateUpdateContext()
-		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), false)
 		cancel()
 		if releaseErr != nil {
 			return true, fmt.Errorf("enable ECS task scale-in protection: %w; additionally failed to release compact batch: %v", err, releaseErr)
@@ -2463,7 +2463,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if !compactDeadline.IsZero() && !time.Now().UTC().Before(compactDeadline) {
 		stateCtx, cancel := workerStateUpdateContext()
-		_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), false)
 		cancel()
 		if releaseErr != nil {
 			return true, releaseErr
@@ -2513,7 +2513,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	if err != nil {
 		if shutdownRequested {
 			stateCtx, cancel := workerStateUpdateContext()
-			_, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), nil)
+			releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), false)
 			cancel()
 			if releaseErr != nil {
 				cleanupCompactNow()
@@ -2530,25 +2530,17 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		return true, failErr
 	}
 	if !result.Reduced {
-		now := time.Now().UTC()
-		var noReductionError error
-		if compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested.Load(), cfg.CompactWindow, compactDeadline, now) {
-			noReductionError = fmt.Errorf("compact batch %s/%s did not reduce active part count: input_parts=%d output_parts=%d", batch.JobID, outputPartID, result.InputStats.Count, result.DestinationStats.Count)
-		}
+		// ClickHouse merged nothing, so the inputs are already as compact as they
+		// will get; finish them as-is unless another worker should retry after shutdown.
 		stateCtx, cancel := workerStateUpdateContext()
-		failed, releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, now, noReductionError)
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC(), !shutdownRequested)
 		cancel()
 		if releaseErr != nil {
 			cleanupCompactNow()
 			return true, releaseErr
 		}
 		cfg.Metrics.CompactionNoReduction(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
-		if failed {
-			cfg.Metrics.CompactionFailed(batch.JobID, outputPartID)
-			cleanupCompactNow()
-			return true, noReductionError
-		}
-		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
+		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "finished", !shutdownRequested)
 		if shutdownRequested {
 			slog.Info("worker shutdown requested; stopping after compact batch made no useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
 			cleanupCompactNow()
@@ -2738,10 +2730,6 @@ func compactBatchDeadline(parts []state.Part, compactWindow time.Duration, now t
 		return time.Time{}, errors.New(reason)
 	}
 	return deadline, nil
-}
-
-func compactNoReductionIsFailure(shutdownRequested, manualFinalizeRequested bool, compactWindow time.Duration, deadline, now time.Time) bool {
-	return !shutdownRequested && !manualFinalizeRequested && compactWindow > 0 && (deadline.IsZero() || now.Before(deadline))
 }
 
 func compactInputs(parts []state.Part) []rewrite.CompactInput {

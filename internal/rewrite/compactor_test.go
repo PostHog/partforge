@@ -68,6 +68,11 @@ func TestCompactHandlesFragmentedInputStops(t *testing.T) {
 			memoryExhausted:      true,
 		},
 		{
+			name:                 "quiet merges without deadline release unchanged input",
+			deadline:             func() time.Time { return time.Time{} },
+			partsAfterFirstQuery: 2,
+		},
+		{
 			name:                 "manual finalize without deadline releases unchanged input",
 			deadline:             func() time.Time { return time.Time{} },
 			partsAfterFirstQuery: 2,
@@ -502,7 +507,7 @@ func TestNormalizeCompactInputCheckpointsAfterProgressStops(t *testing.T) {
 	}
 }
 
-func TestNormalizeCompactInputFailsWithoutProgress(t *testing.T) {
+func TestNormalizeCompactInputReturnsWithoutProgress(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -533,8 +538,8 @@ func TestNormalizeCompactInputFailsWithoutProgress(t *testing.T) {
 		[]PartPartitionStats{{PartitionID: "202606", Parts: 129}},
 		metrics.PartStats{Count: 129},
 	)
-	if err == nil || !strings.Contains(err.Error(), "made no progress") {
-		t.Fatalf("error = %v, want no-progress failure", err)
+	if err != nil {
+		t.Fatalf("error = %v, want quiet merges to keep current output", err)
 	}
 }
 

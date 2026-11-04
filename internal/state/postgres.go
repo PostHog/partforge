@@ -886,52 +886,43 @@ func (s *Store) mergeableSiblingSQL(p, sibling, maxBytes string) string {
 
 // A no-reduction failure and a pending finalization request must be resolved
 // under the same input locks, including requests received after the last heartbeat.
-func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time, noReductionError error) (bool, error) {
+// ReleaseCompactBatch returns the batch to COMPACT_READY, or finishes it when
+// finalize is set or finalization was requested while it was compacting.
+func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time, finalize bool) error {
 	if strings.TrimSpace(workerID) == "" {
-		return false, errors.New("worker id is required")
+		return errors.New("worker id is required")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer tx.Rollback(ctx)
-	parts := make([]Part, 0, len(batch.Parts))
-	finalizeRequested := false
 	for _, part := range partsInLockOrder(batch.Parts) {
 		current, err := s.readPartTx(ctx, tx, part.JobID, part.PartID)
 		if err == nil && !compactOwnedOrUnownedReady(current, workerID) {
 			err = &conditionalCheckFailedError{message: fmt.Sprintf("part %s/%s did not match expected state", part.JobID, part.PartID)}
 		}
 		if err != nil {
-			return false, fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
+			return fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
 		}
-		finalizeRequested = finalizeRequested || current.CompactFinalizeRequestedAt != ""
-		parts = append(parts, current)
-	}
-	failed := noReductionError != nil && !finalizeRequested
-	for _, current := range parts {
-		if failed {
-			markCompactPartFailed(&current, noReductionError, now)
-		} else {
-			setStatus(&current, StatusCompactReady, now)
-			if current.CompactFinalizeRequestedAt != "" {
-				setStatus(&current, StatusFinished, now)
-				current.FinishedAt = formatTime(now)
-			}
-			if strings.TrimSpace(current.CompactReadyAt) == "" {
-				current.CompactReadyAt = compactReadyAtForRelease(current, now)
-			}
-			current.WorkerID = ""
-			current.CompactingAt = ""
-			current.Error = ""
-			current.CompactCooldownUntil = ""
-			clearCompactProgress(&current)
+		setStatus(&current, StatusCompactReady, now)
+		if finalize || current.CompactFinalizeRequestedAt != "" {
+			setStatus(&current, StatusFinished, now)
+			current.FinishedAt = formatTime(now)
 		}
+		if strings.TrimSpace(current.CompactReadyAt) == "" {
+			current.CompactReadyAt = compactReadyAtForRelease(current, now)
+		}
+		current.WorkerID = ""
+		current.CompactingAt = ""
+		current.Error = ""
+		current.CompactCooldownUntil = ""
+		clearCompactProgress(&current)
 		if err := s.savePartTx(ctx, tx, current); err != nil {
-			return false, fmt.Errorf("release compacting part %s/%s: %w", current.JobID, current.PartID, err)
+			return fmt.Errorf("release compacting part %s/%s: %w", current.JobID, current.PartID, err)
 		}
 	}
-	return failed, tx.Commit(ctx)
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MarkCompactBatchFailed(ctx context.Context, batch CompactBatch, workerID string, cause error, now time.Time) error {

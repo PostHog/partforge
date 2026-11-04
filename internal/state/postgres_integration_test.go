@@ -579,7 +579,7 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 		if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "test", now); err != nil || requested {
 			t.Fatalf("unexpected finalize request: %v %v", requested, err)
 		}
-		if _, err := s.ReleaseCompactBatch(ctx, *batch, "test", now, nil); err != nil {
+		if err := s.ReleaseCompactBatch(ctx, *batch, "test", now, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -659,7 +659,7 @@ func TestPostgresManualCompactFinalization(t *testing.T) {
 					t.Fatalf("stale release = %d, %v", n, err)
 				}
 			case "release":
-				if _, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, nil); err != nil {
+				if err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, false); err != nil {
 					t.Fatal(err)
 				}
 			case "complete":
@@ -692,9 +692,16 @@ func TestPostgresManualCompactFinalization(t *testing.T) {
 	}
 }
 
-func TestPostgresNoReductionHonorsRequestAfterLastHeartbeat(t *testing.T) {
-	for _, request := range []bool{false, true} {
-		t.Run(fmt.Sprint(request), func(t *testing.T) {
+func TestPostgresReleaseCompactBatchFinalization(t *testing.T) {
+	for _, tt := range []struct {
+		request, finalize bool
+		want              Status
+	}{
+		{want: StatusCompactReady},
+		{request: true, want: StatusFinished},
+		{finalize: true, want: StatusFinished},
+	} {
+		t.Run(fmt.Sprintf("request=%t/finalize=%t", tt.request, tt.finalize), func(t *testing.T) {
 			ctx := context.Background()
 			s := postgresTestStore(t)
 			now := time.Now().UTC().Truncate(time.Microsecond)
@@ -711,27 +718,21 @@ func TestPostgresNoReductionHonorsRequestAfterLastHeartbeat(t *testing.T) {
 			if requested, err := s.HeartbeatCompactBatch(ctx, *batch, "worker", now); err != nil || requested {
 				t.Fatalf("last heartbeat = %t, %v", requested, err)
 			}
-			if request {
+			// A request after the last heartbeat must still be honored on release.
+			if tt.request {
 				if _, err := s.RequestCompactFinalization(ctx, batch.Parts, now); err != nil {
 					t.Fatal(err)
 				}
 			}
-			// The worker has already stopped heartbeating and is about to
-			// classify this unchanged output as a failure.
-			failed, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, errors.New("no reduction"))
-			if err != nil || failed == request {
-				t.Fatalf("resolution = failed %t, %v; request %t", failed, err, request)
+			if err := s.ReleaseCompactBatch(ctx, *batch, "worker", now, tt.finalize); err != nil {
+				t.Fatal(err)
 			}
 			parts, err := s.ListJobParts(ctx, part.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := StatusFailed
-			if request {
-				want = StatusFinished
-			}
-			if len(parts) != 1 || parts[0].Status != want || parts[0].FinishedKey != part.FinishedKey {
-				t.Fatalf("resolved input = %+v, want %s with saved artifact intact", parts, want)
+			if len(parts) != 1 || parts[0].Status != tt.want || parts[0].FinishedKey != part.FinishedKey || parts[0].WorkerID != "" {
+				t.Fatalf("released input = %+v, want %s with saved artifact intact", parts, tt.want)
 			}
 		})
 	}
@@ -898,7 +899,7 @@ func TestPostgresApplicationSchedulingColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)
-	if _, err := s.ReleaseCompactBatch(ctx, *batch, "worker", now.Add(2*time.Minute), nil); err != nil {
+	if err := s.ReleaseCompactBatch(ctx, *batch, "worker", now.Add(2*time.Minute), false); err != nil {
 		t.Fatal(err)
 	}
 	assertSchedulingColumns(t, s)

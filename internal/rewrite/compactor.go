@@ -387,11 +387,9 @@ func (c Compactor) normalizeCompactInput(ctx context.Context, p Processor, item 
 			return nil
 		}
 		if activeMerges == 0 && now.Sub(lastProgressAt) >= noProgressTimeout {
-			if activeParts < inputParts {
-				slog.Info("checkpointing partially normalized compact input", "stage", "compact_checkpoint", "job_id", item.JobID, "part_id", item.OutputPartID, "input_parts", inputParts, "output_parts", activeParts, "quiet_for", noProgressTimeout)
-				return nil
-			}
-			return fmt.Errorf("fragmented compact input made no progress for %s with %d active parts", noProgressTimeout, activeParts)
+			// ClickHouse selected no further merges; keep whatever merged so far.
+			slog.Info("compact input merges went quiet; measuring current output", "stage", "compact_checkpoint", "job_id", item.JobID, "part_id", item.OutputPartID, "input_parts", inputParts, "output_parts", activeParts, "quiet_for", noProgressTimeout)
+			return nil
 		}
 		if err := sleepOrDone(ctx, pollInterval); err != nil {
 			return fmt.Errorf("verify normalized compact output: %w", err)
