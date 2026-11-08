@@ -590,7 +590,7 @@ func TestDestinationFailedMergeCount(t *testing.T) {
 	if count != 7 {
 		t.Fatalf("failed merge count = %d, want 7", count)
 	}
-	if len(queries) != 2 || queries[0] != "SYSTEM FLUSH LOGS" || !strings.Contains(queries[1], "system.part_log") || !strings.Contains(queries[1], "table_uuid = (SELECT uuid FROM system.tables") || !strings.Contains(queries[1], "error != 0") {
+	if len(queries) != 2 || queries[0] != "SYSTEM FLUSH LOGS" || !strings.Contains(queries[1], "system.part_log") || !strings.Contains(queries[1], "table_uuid = (SELECT uuid FROM system.tables") || !strings.Contains(queries[1], "error NOT IN (0, 236)") {
 		t.Fatalf("queries = %#v, want flush logs then failed merge count", queries)
 	}
 }
