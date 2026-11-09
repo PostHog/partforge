@@ -1606,7 +1606,8 @@ func (p Processor) destinationFailedMergeSummary(ctx context.Context, target mer
 		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
 		" AND table_uuid = (SELECT uuid FROM system.tables WHERE database = " + chhttp.StringLiteral(target.Database) +
 		" AND name = " + chhttp.StringLiteral(target.Table) + ")" +
-		" AND event_type = 'MergeParts' AND error != 0 FORMAT TSV"
+		// 236 ABORTED is a merge cancelled by SYSTEM STOP MERGES (e.g. our own fan-in step-down), not a failure.
+		" AND event_type = 'MergeParts' AND error NOT IN (0, 236) FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
 		return failedMergeSummary{}, fmt.Errorf("measure destination failed merges from system.part_log: %w", err)
