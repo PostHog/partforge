@@ -12,7 +12,7 @@ SELECT
     event_date,
     JSONCleanPostHogTemporaryProperties(
         concat('{"$set":{"id":', toString(id), '},"permanent":true}')
-    ) = concat('{"$set":{"id":', toString(id), '}}') AND s3_migrated AS migrated
+    ) = concat('{"$set":"{\\"id\\":', toString(id), '}"}') AND s3_migrated AS migrated
 FROM
 (
     SELECT * FROM src.events WHERE id % 3 = 0

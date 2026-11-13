@@ -16,7 +16,7 @@ The worker installs all executable UDFs from PostHog's source and deployment
 manifests at the commit pinned in `clickhouse-util-udfs.yml`. Both bundled
 ClickHouse builds expose the same functions, including `JSONCleanPostHogEvent`,
 `JSONDropKeysPool`, `decompress`, the individual property cleaners, and the
-unversioned, `v11`, and `v12` funnel functions, including JSON and debug variants.
+unversioned, `v11`, `v12`, and `v13` funnel functions, including JSON and debug variants.
 Upstream commands, argument types, pool settings, and launch scripts are preserved.
 
 `JSONCleanPostHogEvent(properties, person_properties)` returns a named tuple with
