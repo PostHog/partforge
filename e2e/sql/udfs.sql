@@ -1,4 +1,4 @@
--- PostHog 542f8dc033d2850bfa2b3094be07716475f0516c (PostHog/posthog#111330): all 45 executable UDFs.
+-- PostHog 2b4f41441705e283bc413090ce045bdee9ef39ec (PostHog/posthog#135224): all 60 executable UDFs.
 -- Empty funnels return no conversions; debug functions echo valid JSON.
 WITH
     toUInt8(2) AS steps,
@@ -31,11 +31,11 @@ SELECT
     throwIf(isValidJSON(aggregate_funnel_test(steps, window, 'first_touch', 'ordered', empty_6, empty_2, empty_3)) = 0, 'aggregate_funnel_test failed'),
     throwIf(isValidJSON(aggregate_funnel_array_trends_test(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)) = 0, 'aggregate_funnel_array_trends_test failed'),
     throwIf(JSONDropKeys(['a'])('{"a":1,"b":2}') != '{"b":2}', 'JSONDropKeys failed'),
-    throwIf(JSONCleanPostHogEvent('{"$set":{"score":7},"plan":null,"custom":"kept"}', '{"email":null}') != ('{"custom":"kept"}', '{"$set":{"score":7}}', '{}', ['plan'], [], ['email']), 'JSONCleanPostHogEvent failed'),
+    throwIf(JSONCleanPostHogEvent('{"$set":{"score":7},"plan":null,"custom":"kept"}', '{"email":null}') != ('{"custom":"kept"}', '{"$set":"{\\"score\\":7}"}', '{}', ['plan'], [], ['email']), 'JSONCleanPostHogEvent failed'),
     throwIf(JSONCleanPostHogEvent('{"$sent_at":"2026-01-01","$sdk_debug_current_session_duration":5,"$sdk_debug_retry":1}', '{}') != ('{"$sent_at":"2026-01-01","$sdk_debug_current_session_duration":5}', '{"$sdk_debug_retry":1}', '{}', [], [], []), 'JSONCleanPostHogEvent permanent keys failed'),
     throwIf(JSONCleanPostHogEventProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogEventProperties failed'),
     throwIf(JSONCleanPostHogPersonProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogPersonProperties failed'),
-    throwIf(JSONCleanPostHogTemporaryProperties('{"$set":{"a":1},"b":2}') != '{"$set":{"a":1}}', 'JSONCleanPostHogTemporaryProperties failed'),
+    throwIf(JSONCleanPostHogTemporaryProperties('{"$set":{"a":1},"b":2}') != '{"$set":"{\\"a\\":1}"}', 'JSONCleanPostHogTemporaryProperties failed'),
     throwIf(JSONStripEmptyStringsAndNulls('{"a":1,"b":null,"c":""}') != '{"a":1}', 'JSONStripEmptyStringsAndNulls failed'),
     throwIf(decompress(unhex('170000006068656c6c6f200600d06f2068656c6c6f2068656c6c6f'), 'LZ4SizePrefixed') != 'hello hello hello hello', 'decompress failed'),
     throwIf(JSONDropKeysPool('{"a":1,"b":2}', ['a']) != '{"b":2}', 'JSONDropKeysPool failed'),
@@ -61,7 +61,22 @@ SELECT
     throwIf(notEmpty(aggregate_funnel_cohort_trends_json_v12(from_step, steps, steps, window, 'first_touch', 'ordered', empty_4, empty_10)), 'aggregate_funnel_cohort_trends_json_v12 failed'),
     throwIf(isValidJSON(aggregate_funnel_test_v12(steps, window, 'first_touch', 'ordered', empty_6, empty_2, empty_3)) = 0, 'aggregate_funnel_test_v12 failed'),
     throwIf(isValidJSON(aggregate_funnel_array_trends_test_v12(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)) = 0, 'aggregate_funnel_array_trends_test_v12 failed'),
-    throwIf(JSONDropKeys_v12(['a'])('{"a":1,"b":2}') != '{"b":2}', 'JSONDropKeys_v12 failed');
+    throwIf(JSONDropKeys_v12(['a'])('{"a":1,"b":2}') != '{"b":2}', 'JSONDropKeys_v12 failed'),
+    throwIf(notEmpty(aggregate_funnel_v13(steps, window, 'first_touch', 'ordered', empty_1, empty_2, empty_3)), 'aggregate_funnel_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_cohort_v13(steps, window, 'first_touch', 'ordered', empty_4, empty_2, empty_5)), 'aggregate_funnel_cohort_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_array_v13(steps, window, 'first_touch', 'ordered', empty_6, empty_2, empty_7)), 'aggregate_funnel_array_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_trends_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_1, empty_8)), 'aggregate_funnel_trends_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_array_trends_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)), 'aggregate_funnel_array_trends_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_cohort_trends_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_4, empty_10)), 'aggregate_funnel_cohort_trends_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_json_v13(steps, window, 'first_touch', 'ordered', empty_1, empty_2, empty_3)), 'aggregate_funnel_json_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_cohort_json_v13(steps, window, 'first_touch', 'ordered', empty_4, empty_2, empty_5)), 'aggregate_funnel_cohort_json_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_array_json_v13(steps, window, 'first_touch', 'ordered', empty_6, empty_2, empty_7)), 'aggregate_funnel_array_json_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_trends_json_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_1, empty_8)), 'aggregate_funnel_trends_json_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_array_trends_json_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)), 'aggregate_funnel_array_trends_json_v13 failed'),
+    throwIf(notEmpty(aggregate_funnel_cohort_trends_json_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_4, empty_10)), 'aggregate_funnel_cohort_trends_json_v13 failed'),
+    throwIf(isValidJSON(aggregate_funnel_test_v13(steps, window, 'first_touch', 'ordered', empty_6, empty_2, empty_3)) = 0, 'aggregate_funnel_test_v13 failed'),
+    throwIf(isValidJSON(aggregate_funnel_array_trends_test_v13(from_step, steps, steps, window, 'first_touch', 'ordered', empty_6, empty_9)) = 0, 'aggregate_funnel_array_trends_test_v13 failed'),
+    throwIf(JSONDropKeys_v13(['a'])('{"a":1,"b":2}') != '{"b":2}', 'JSONDropKeys_v13 failed');
 
 -- Reuse the new pools across chunks, with keys and cleaned values changing per row.
 SELECT throwIf(countIf(
@@ -73,7 +88,7 @@ SETTINGS max_block_size = 2, max_threads = 1;
 
 SELECT throwIf(countIf(
     cleaned.properties != concat('{"id":', toString(number), '}')
-    OR cleaned.temporary_properties != concat('{"$set":{"id":', toString(number), '}}')
+    OR cleaned.temporary_properties != concat('{"$set":"{\\"id\\":', toString(number), '}"}')
     OR cleaned.person_properties != concat('{"id":', toString(number), '}')
     OR cleaned.properties_null_keys != ['missing']
     OR cleaned.temporary_properties_null_keys != []
