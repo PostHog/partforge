@@ -1,4 +1,4 @@
--- PostHog 2b4f41441705e283bc413090ce045bdee9ef39ec (PostHog/posthog#135224): all 60 executable UDFs.
+-- PostHog 7cbfd2508645378cc7d203654105624f377c8d05 (PostHog/posthog#135224): all 60 executable UDFs.
 -- Empty funnels return no conversions; debug functions echo valid JSON.
 WITH
     toUInt8(2) AS steps,
@@ -36,6 +36,7 @@ SELECT
     throwIf(JSONCleanPostHogEventProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogEventProperties failed'),
     throwIf(JSONCleanPostHogPersonProperties('{"a":1,"b":null}') != '{"a":1}', 'JSONCleanPostHogPersonProperties failed'),
     throwIf(JSONCleanPostHogTemporaryProperties('{"$set":{"a":1},"b":2}') != '{"$set":"{\\"a\\":1}"}', 'JSONCleanPostHogTemporaryProperties failed'),
+    throwIf(JSONCleanPostHogTemporaryProperties('{"$set":{ "b":"x/y", "a":2.0 }}') != '{"$set":"{\\"a\\":2.0,\\"b\\":\\"x/y\\"}"}', 'JSONCleanPostHogTemporaryProperties sorted compact failed'),
     throwIf(JSONStripEmptyStringsAndNulls('{"a":1,"b":null,"c":""}') != '{"a":1}', 'JSONStripEmptyStringsAndNulls failed'),
     throwIf(decompress(unhex('170000006068656c6c6f200600d06f2068656c6c6f2068656c6c6f'), 'LZ4SizePrefixed') != 'hello hello hello hello', 'decompress failed'),
     throwIf(JSONDropKeysPool('{"a":1,"b":2}', ['a']) != '{"b":2}', 'JSONDropKeysPool failed'),
