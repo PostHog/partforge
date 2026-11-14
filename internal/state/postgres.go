@@ -1940,25 +1940,6 @@ func (s *Store) RetryStaleInProgressPart(ctx context.Context, part Part, now tim
 	return StatusReady, nil
 }
 
-func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (Status, error) {
-	_, err := s.updatePart(ctx, part.JobID, part.PartID, nil, func(current *Part) error {
-		setStatus(current, StatusReady, now)
-		current.Error = ""
-		current.FailedAt = ""
-		current.StartedAt = ""
-		current.FinishedAt = ""
-		current.ImportingAt = ""
-		current.ImportedAt = ""
-		current.WorkerID = ""
-		clearRewriteProgress(current)
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("force retry state item for %s/%s: %w", part.JobID, part.PartID, err)
-	}
-	return StatusReady, nil
-}
-
 func (s *Store) ForceSetPartStatus(ctx context.Context, part Part, to Status, now time.Time) error {
 	if err := validatePart(part); err != nil {
 		return err
