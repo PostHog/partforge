@@ -109,7 +109,7 @@ All take `-job-id`. Most use conditional updates and take `-force` where a guard
 
 | Command | What it does |
 | --- | --- |
-| `retry-failed` | Move failed parts back to their retryable state. `-part-id` / `-all`; `-include-in-progress` also resets stuck workers; `-stale` (with `-stale-after`, default `5m`) resets only in-progress parts with no recent progress; `-force` re-runs even completed parts. |
+| `retry-failed` | Move failed parts back to their retryable state. `-part-id` / `-all`; `-include-in-progress` also resets stuck workers; `-stale` (with `-stale-after`, default `5m`) resets only in-progress parts with no recent progress. It never touches parts in other states: use `set-part-state` to re-run one part and `reset-job` to re-run a whole job. |
 | `set-part-state` | Force selected rows to a stable state (`READY`, `COMPACT_READY`, or `FINISHED`) and clear stale ownership. Select by repeated `-part-id` or by `-status`. |
 | `finalize-compaction` | Finish selected `COMPACT_READY` artifacts immediately and ask compacting workers to save current useful output and finish. Select by `-all`, repeated `-part-id`, or active `-output-part-id`; requires `-force`. |
 | `reset-compact-timer` | Restart the job's compact-window timer (sets `compact_ready_at` to now on every row). |

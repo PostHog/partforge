@@ -141,7 +141,7 @@ The destination table must be empty by default. Set -require-empty=false only wh
 		Summary: "Move failed or stale parts back to the state where they can be retried.",
 		Details: `Failed rewrite parts go back to READY. Failed import parts go back to FINISHED so import-finished retries only the attach step.
 
-Select exactly one of -all, -part-id, or -stale. -include-in-progress resets stuck IN_PROGRESS rows; -force retries selected rows regardless of current state.`,
+Select exactly one of -all, -part-id, or -stale. -include-in-progress resets stuck IN_PROGRESS rows. To re-run a part that has not failed, use set-part-state; to re-run a whole job, use reset-job.`,
 	},
 	{
 		Name:    "set-part-state",
@@ -3716,7 +3716,6 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		stale             = fs.Bool("stale", false, "retry IN_PROGRESS parts with stale persisted progress")
 		staleAfter        = fs.Duration("stale-after", defaultRetryStaleAfter, "minimum age of progress_updated_at for -stale")
 		includeInProgress = fs.Bool("include-in-progress", false, "with -all or -part-id, also return selected IN_PROGRESS parts to READY")
-		force             = fs.Bool("force", false, "retry selected parts regardless of current state")
 		stateTable        = fs.String("state-table", defaultStateTable, "Postgres table used for PartForge state")
 		region            = fs.String("aws-region", "", "AWS region for Postgres IAM auth; empty resolves from AWS config, then us-east-1")
 		postgresURL       = fs.String("postgres-url", "", "Postgres state store connection URL")
@@ -3748,9 +3747,6 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	if *stale && *staleAfter <= 0 {
 		return errors.New("stale-after must be greater than zero")
 	}
-	if *force && (*includeInProgress || *stale) {
-		return errors.New("force cannot be combined with include-in-progress or stale")
-	}
 	if *stale && *includeInProgress {
 		return errors.New("stale cannot be combined with include-in-progress")
 	}
@@ -3770,7 +3766,6 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	}
 	retryParts, err := selectRetryParts(jobParts, retryPartSelection{
 		All:               *all,
-		Force:             *force,
 		IncludeInProgress: *includeInProgress,
 		Stale:             *stale,
 		StaleAfter:        *staleAfter,
@@ -3784,9 +3779,7 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	var results []retryResult
 	for _, part := range retryParts {
 		var target state.Status
-		if *force {
-			target, err = stateStore.ForceRetryPart(ctx, part, time.Now().UTC())
-		} else if *stale {
+		if *stale {
 			target, err = stateStore.RetryStaleInProgressPart(ctx, part, time.Now().UTC())
 		} else if part.Status == state.StatusInProgress {
 			target, err = stateStore.RetryInProgressPart(ctx, part, time.Now().UTC())
@@ -3805,7 +3798,6 @@ func runRetryFailed(ctx context.Context, args []string) error {
 
 	out := retryFailedOutput{
 		JobID:      *jobID,
-		Forced:     *force,
 		Stale:      *stale,
 		StaleAfter: staleAfterString(*stale, *staleAfter),
 		Retried:    len(results),
@@ -5039,7 +5031,6 @@ type overviewAttention struct {
 
 type retryFailedOutput struct {
 	JobID      string        `json:"job_id"`
-	Forced     bool          `json:"forced"`
 	Stale      bool          `json:"stale,omitempty"`
 	StaleAfter string        `json:"stale_after,omitempty"`
 	Retried    int           `json:"retried"`
@@ -5815,7 +5806,6 @@ func formatDurationMs(ms int64) string {
 
 type retryPartSelection struct {
 	All               bool
-	Force             bool
 	IncludeInProgress bool
 	Stale             bool
 	StaleAfter        time.Duration
@@ -5994,9 +5984,6 @@ func selectRetryParts(parts []state.Part, selection retryPartSelection) ([]state
 		return selectStaleRetryParts(parts, selection.Now, selection.StaleAfter)
 	}
 	if selection.All {
-		if selection.Force {
-			return append([]state.Part(nil), parts...), nil
-		}
 		var selected []state.Part
 		for _, part := range parts {
 			if part.Status == state.StatusFailed || (selection.IncludeInProgress && part.Status == state.StatusInProgress) {
@@ -6007,9 +5994,6 @@ func selectRetryParts(parts []state.Part, selection retryPartSelection) ([]state
 	}
 	for _, part := range parts {
 		if part.PartID == selection.PartID {
-			if selection.Force {
-				return []state.Part{part}, nil
-			}
 			if part.Status == state.StatusFailed || (selection.IncludeInProgress && part.Status == state.StatusInProgress) {
 				return []state.Part{part}, nil
 			}
@@ -6324,7 +6308,6 @@ func jobPrefixFromKey(jobID, key string) (string, error) {
 
 func printRetryResults(out *os.File, result retryFailedOutput) {
 	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
-	fmt.Fprintf(out, "forced: %t\n", result.Forced)
 	if result.Stale {
 		fmt.Fprintf(out, "stale_after: %s\n", result.StaleAfter)
 	}

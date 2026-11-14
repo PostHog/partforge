@@ -508,22 +508,6 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("all with in-progress = %+v", allWithInProgress)
 	}
 
-	forced, err := selectRetryParts(parts, retryPartSelection{All: true, Force: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(forced) != 5 {
-		t.Fatalf("forced len = %d", len(forced))
-	}
-
-	forcedOne, err := selectRetryParts(parts, retryPartSelection{Force: true, PartID: "part-2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(forcedOne) != 1 || forcedOne[0].PartID != "part-2" {
-		t.Fatalf("forced one = %+v", forcedOne)
-	}
-
 	one, err := selectRetryParts(parts, retryPartSelection{PartID: "part-1"})
 	if err != nil {
 		t.Fatal(err)
