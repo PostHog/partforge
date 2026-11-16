@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,11 +33,14 @@ type FinishedArtifact struct {
 }
 
 type ImportJob struct {
-	Artifacts        []FinishedArtifact
-	JobID            string
-	Database         string
-	Table            string
-	RequireEmpty     bool
+	Artifacts    []FinishedArtifact
+	JobID        string
+	Database     string
+	Table        string
+	RequireEmpty bool
+	// Parallelism is how many artifacts are claimed and downloaded at once.
+	// Attaches are serialized regardless.
+	Parallelism      int
 	MarkImporting    func(context.Context, FinishedArtifact) error
 	MarkImported     func(context.Context, FinishedArtifact) error
 	ReleaseImport    func(context.Context, FinishedArtifact) error
@@ -46,6 +50,9 @@ type ImportJob struct {
 func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	if len(job.Artifacts) == 0 {
 		return fmt.Errorf("no finished artifacts found for job %s", job.JobID)
+	}
+	if job.Parallelism < 1 {
+		return fmt.Errorf("import parallelism must be at least 1, got %d", job.Parallelism)
 	}
 	startedAt := time.Now()
 	artifacts := append([]FinishedArtifact(nil), job.Artifacts...)
@@ -58,7 +65,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 		}
 	}
 
-	slog.Info("import job started", "stage", "start_import", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table), "artifacts", len(artifacts), "require_empty", job.RequireEmpty)
+	slog.Info("import job started", "stage", "start_import", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table), "artifacts", len(artifacts), "require_empty", job.RequireEmpty, "parallelism", job.Parallelism)
 	slog.Info("locating destination table data path", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
 	dataPath, err := i.tableDataPath(ctx, job.Database, job.Table)
 	if err != nil {
@@ -105,74 +112,178 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	if err := ensureSameFilesystem(root, detachedPath); err != nil {
 		return err
 	}
-	slog.Info("prepared import work directory", "stage", "prepare_destination", "job_id", job.JobID, "work_dir", root, "detached_path", detachedPath)
+	workers := min(job.Parallelism, len(artifacts))
+	slog.Info("prepared import work directory", "stage", "prepare_destination", "job_id", job.JobID, "work_dir", root, "detached_path", detachedPath, "parallelism", workers)
 
-	for idx, artifact := range artifacts {
-		artifactWorkDir := filepath.Join(root, fmt.Sprintf("%06d", idx))
-		artifactStartedAt := time.Now()
-		slog.Info(
-			"importing artifact",
-			"stage", "import_artifact",
-			"job_id", job.JobID,
-			"artifact_index", idx+1,
-			"artifacts_total", len(artifacts),
-			"part_id", artifact.PartID,
-			"bucket", artifact.Bucket,
-			"key", artifact.Key,
-		)
-		if job.MarkImporting != nil {
-			if err := job.MarkImporting(ctx, artifact); err != nil {
-				return err
-			}
-		}
-		if err := i.importArtifact(ctx, job, artifact, detachedPath, artifactWorkDir, owner); err != nil {
-			if ctx.Err() != nil && job.ReleaseImport != nil {
-				cleanupErr := os.RemoveAll(root)
-				releaseCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				releaseErr := job.ReleaseImport(releaseCtx, artifact)
-				cancel()
-				if cleanupErr != nil || releaseErr != nil {
-					return fmt.Errorf("cancel import artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, errors.Join(err, cleanupErr, releaseErr))
-				}
-				return err
-			}
-			if job.MarkImportFailed != nil {
-				if markErr := job.MarkImportFailed(ctx, artifact, err); markErr != nil {
-					return fmt.Errorf("import artifact s3://%s/%s: %w; additionally failed to mark import failed: %v", artifact.Bucket, artifact.Key, err, markErr)
+	// runCtx stops downloads in sibling workers once one artifact fails. ATTACH
+	// runs under ctx so a sibling failure never interrupts a partial attach.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	run := importRun{
+		attachMu:     &sync.Mutex{},
+		importer:     i,
+		job:          job,
+		total:        len(artifacts),
+		root:         root,
+		detachedPath: detachedPath,
+		owner:        owner,
+	}
+	var (
+		errMu sync.Mutex
+		errs  []error
+		wg    sync.WaitGroup
+	)
+	indexes := make(chan int)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range indexes {
+				if err := run.importOne(ctx, runCtx, idx, artifacts[idx]); err != nil {
+					errMu.Lock()
+					errs = append(errs, err)
+					errMu.Unlock()
+					cancelRun()
 				}
 			}
-			return err
+		}()
+	}
+feed:
+	for idx := range artifacts {
+		select {
+		case indexes <- idx:
+		case <-runCtx.Done():
+			break feed
 		}
-		if job.MarkImported != nil {
-			if err := job.MarkImported(ctx, artifact); err != nil {
-				return err
-			}
-		}
-		if err := os.RemoveAll(artifactWorkDir); err != nil {
-			return fmt.Errorf("remove imported artifact work directory %s: %w", artifactWorkDir, err)
-		}
-		slog.Info(
-			"imported artifact",
-			"stage", "import_artifact",
-			"job_id", job.JobID,
-			"artifact_index", idx+1,
-			"artifacts_total", len(artifacts),
-			"part_id", artifact.PartID,
-			"key", artifact.Key,
-			"elapsed", time.Since(artifactStartedAt),
-		)
+	}
+	close(indexes)
+	wg.Wait()
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	elapsed := time.Since(startedAt)
 	slog.Info("import complete", "stage", "complete", "job_id", job.JobID, "artifacts", len(artifacts), "elapsed", elapsed, "artifacts_per_second", countRatePerSecond(len(artifacts), elapsed))
 	return nil
 }
 
-func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, workDir string, owner pathOwner) error {
+type importRun struct {
+	importer     Importer
+	job          ImportJob
+	total        int
+	root         string
+	detachedPath string
+	owner        pathOwner
+	attachMu     *sync.Mutex
+}
+
+// importOne claims, downloads, and attaches one artifact. A nil error with a
+// cancelled runCtx means the artifact was released back to FINISHED or never
+// claimed.
+func (r importRun) importOne(ctx, runCtx context.Context, idx int, artifact FinishedArtifact) error {
+	if runCtx.Err() != nil {
+		return nil
+	}
+	job := r.job
+	workDir := filepath.Join(r.root, fmt.Sprintf("%06d", idx))
+	startedAt := time.Now()
+	slog.Info(
+		"importing artifact",
+		"stage", "import_artifact",
+		"job_id", job.JobID,
+		"artifact_index", idx+1,
+		"artifacts_total", r.total,
+		"part_id", artifact.PartID,
+		"bucket", artifact.Bucket,
+		"key", artifact.Key,
+	)
+	if job.MarkImporting != nil {
+		if err := job.MarkImporting(ctx, artifact); err != nil {
+			return err
+		}
+	}
+	extractRoot, partNames, err := r.importer.downloadArtifact(runCtx, job, artifact, workDir, r.owner)
+	if err != nil {
+		if runCtx.Err() != nil {
+			return r.release(artifact, workDir, err)
+		}
+		return r.markFailed(ctx, artifact, err)
+	}
+	if err := r.attach(ctx, runCtx, artifact, extractRoot, partNames); err != nil {
+		if ctx.Err() != nil || errors.Is(err, errAttachSkipped) {
+			return r.release(artifact, workDir, err)
+		}
+		return r.markFailed(ctx, artifact, err)
+	}
+	if job.MarkImported != nil {
+		if err := job.MarkImported(ctx, artifact); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(workDir); err != nil {
+		return fmt.Errorf("remove imported artifact work directory %s: %w", workDir, err)
+	}
+	slog.Info(
+		"imported artifact",
+		"stage", "import_artifact",
+		"job_id", job.JobID,
+		"artifact_index", idx+1,
+		"artifacts_total", r.total,
+		"part_id", artifact.PartID,
+		"key", artifact.Key,
+		"elapsed", time.Since(startedAt),
+	)
+	return nil
+}
+
+var errAttachSkipped = errors.New("import stopped before attach")
+
+// attach moves extracted parts into detached/ and attaches them. Attaches are
+// serialized across workers; once the lock is held and runCtx is still live,
+// the attach runs under ctx so only an external cancellation interrupts it.
+func (r importRun) attach(ctx, runCtx context.Context, artifact FinishedArtifact, extractRoot string, partNames []string) error {
+	r.attachMu.Lock()
+	defer r.attachMu.Unlock()
+	if runCtx.Err() != nil {
+		return errAttachSkipped
+	}
+	return r.importer.attachParts(ctx, r.job, artifact, r.detachedPath, extractRoot, partNames)
+}
+
+func (r importRun) release(artifact FinishedArtifact, workDir string, cause error) error {
+	cleanupErr := os.RemoveAll(workDir)
+	var releaseErr error
+	if r.job.ReleaseImport != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		releaseErr = r.job.ReleaseImport(releaseCtx, artifact)
+		cancel()
+	}
+	if cleanupErr != nil || releaseErr != nil {
+		return fmt.Errorf("cancel import artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, errors.Join(cause, cleanupErr, releaseErr))
+	}
+	slog.Info("released import artifact", "stage", "import_artifact", "job_id", r.job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "cause", cause)
+	return nil
+}
+
+func (r importRun) markFailed(ctx context.Context, artifact FinishedArtifact, cause error) error {
+	if r.job.MarkImportFailed != nil {
+		if markErr := r.job.MarkImportFailed(ctx, artifact, cause); markErr != nil {
+			return fmt.Errorf("import artifact s3://%s/%s: %w; additionally failed to mark import failed: %v", artifact.Bucket, artifact.Key, cause, markErr)
+		}
+	}
+	return cause
+}
+
+// downloadArtifact downloads and extracts one artifact into workDir and sets
+// the destination owner on the extracted parts. Empty outputs return no parts.
+func (i Importer) downloadArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, workDir string, owner pathOwner) (string, []string, error) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return err
+		return "", nil, err
 	}
 	if artifact.EmptyOutput {
-		return nil
+		return "", nil, nil
 	}
 	downloadRoot := filepath.Join(workDir, "data")
 	extractRoot := filepath.Join(workDir, "extracted")
@@ -180,22 +291,30 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	slog.Info("downloading finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", sourceKey)
 	downloadStartedAt := time.Now()
 	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, sourceKey, downloadRoot); err != nil {
-		return fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
+		return "", nil, fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
 	downloadStats, err := fileutil.StatDir(downloadRoot)
 	if err != nil {
-		return fmt.Errorf("stat finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
+		return "", nil, fmt.Errorf("stat finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
 	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
 	partNames, err := artifactpkg.ExtractFinishedTarballsFromDirContext(ctx, downloadRoot, extractRoot)
 	if err != nil {
-		return fmt.Errorf("extract downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
+		return "", nil, fmt.Errorf("extract downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
 	if len(partNames) == 0 {
-		return fmt.Errorf("finished artifact s3://%s/%s contains no part tarballs", artifact.Bucket, sourceKey)
+		return "", nil, fmt.Errorf("finished artifact s3://%s/%s contains no part tarballs", artifact.Bucket, sourceKey)
 	}
+	for _, partName := range partNames {
+		if err := chownTree(filepath.Join(extractRoot, partName), owner); err != nil {
+			return "", nil, fmt.Errorf("set ownership on finished part %s to %d:%d: %w", partName, owner.uid, owner.gid, err)
+		}
+	}
+	return extractRoot, partNames, nil
+}
 
+func (i Importer) attachParts(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, extractRoot string, partNames []string) error {
 	for _, partName := range partNames {
 		src := filepath.Join(extractRoot, partName)
 		dst := filepath.Join(detachedPath, partName)
@@ -207,9 +326,6 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 		if err := fileutil.MoveDir(src, dst); err != nil {
 			return fmt.Errorf("move finished part %s into detached directory: %w", partName, err)
 		}
-		if err := chownTree(dst, owner); err != nil {
-			return fmt.Errorf("set ownership on finished part %s to %d:%d: %w", partName, owner.uid, owner.gid, err)
-		}
 		partStats, err := fileutil.StatDir(dst)
 		if err != nil {
 			return fmt.Errorf("stat finished part %s: %w", partName, err)
@@ -219,7 +335,9 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 			return fmt.Errorf("attach finished part %s: %w", partName, err)
 		}
 	}
-	slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(partNames))
+	if len(partNames) > 0 {
+		slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(partNames))
+	}
 	return nil
 }
 

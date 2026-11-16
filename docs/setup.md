@@ -246,6 +246,7 @@ Notes:
 
 - **The destination table must be empty by default** (`-require-empty=true`). Attaching the same artifacts twice duplicates data, and there is no transaction spanning S3 and ClickHouse. Use `-require-empty=false` only after verifying the target manually.
 - `import-finished -part-id=<part-id>` imports a single finished part, for controlling import load. After the first attach the table is no longer empty, so subsequent single-part imports need `-require-empty=false`.
+- `-parallelism=N` (default 1) claims and downloads up to N artifacts at once. Attaches stay serialized. If one artifact fails, in-flight downloads stop and their parts go back to `FINISHED`; only the failing artifact is marked `FAILED`. The work-dir needs room for N extracted artifacts.
 - The import work-dir must be on the **same filesystem** as the destination table's `detached` directory (parts are moved, not copied). Unset, it defaults to a directory on the destination ClickHouse disk; if `-work-dir` is set and fails that check, the command errors before downloading anything.
 
 Track campaign progress with `partforge overview`, scan individual jobs with `partforge list-jobs`, and inspect one job with `partforge job-status -job-id=<id>` (see [operations.md](operations.md)).
