@@ -51,14 +51,14 @@ The original primary key `(job_id, part_id)`, state columns, and full `data` JSO
 | `compact_bytes` | Persisted compact data size used for claim metadata and diagnostics |
 | `compact_normalized` | Identify artifacts containing one physical part |
 | `compact_partition_id` | Generated from `data` for normalized artifacts; groups sibling artifacts for batch claims |
-| `compact_stale_at` | Indexed stale-compaction lookup, preserving the existing earlier-of-heartbeat-and-claim timeout |
+| `compact_stale_at` | Indexed stale-compaction lookup: the last heartbeat of a `COMPACTING` row |
 | `original_compact_ready_at` | Indexed job compact deadline lookup |
 
 Application writes update these projections in the same SQL statement as the JSON or status change. No triggers are installed. Use PartForge commands for state changes; direct SQL must maintain the corresponding derived columns too. The full Part record remains in `data`; no job metadata or progress table is required.
 
 Compactors claim the most-fragmented eligible unlocked artifact, using its physical ClickHouse part count. Job, destination, and explicit partition filters still apply; partitions with an active compactor are no longer deprioritized.
 
-A single `<state-table>_maintenance` record reserves compaction maintenance once every ten seconds across the worker fleet. `worker -once` requests an immediate pass but still skips a pass already in progress. Only the reservation holder scans job summaries and expires stale work. The reservation commits with the work, and active maintenance is skipped by other workers without waiting. Workers sharing a state table should use the same compact-window and stale-timeout settings. New finalizable output can wait up to the next maintenance pass; a long maintenance run or database contention can extend that delay.
+A single `<state-table>_maintenance` record reserves compaction maintenance once every ten seconds across the worker fleet. `worker -once` requests an immediate pass but still skips a pass already in progress. Only the reservation holder scans job summaries and expires stale work. The reservation commits with the work, and active maintenance is skipped by other workers without waiting. Workers sharing a state table should use the same compact-window setting. New finalizable output can wait up to the next maintenance pass; a long maintenance run or database contention can extend that delay.
 
 Rewrite progress combines live query counters and stage timing in one periodic heartbeat. Rewrite and compact progress updates use conditional SQL patches that check worker ownership. A failed rewrite heartbeat cancels processing and surfaces the error.
 

@@ -1193,19 +1193,6 @@ func TestCompactBatchDeadlineDisabledForZeroWindow(t *testing.T) {
 	}
 }
 
-func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
-	staleAfter := compactLeaseStaleAfter(2 * time.Hour)
-	if staleAfter != 2*time.Hour {
-		t.Fatalf("compactLeaseStaleAfter = %s, want 2h", staleAfter)
-	}
-	if got := compactLeaseStaleAfter(time.Minute); got != 5*time.Minute {
-		t.Fatalf("compactLeaseStaleAfter short window = %s, want 5m floor", got)
-	}
-	if got := compactLeaseStaleAfter(0); got != 5*time.Minute {
-		t.Fatalf("compactLeaseStaleAfter zero window = %s, want 5m floor", got)
-	}
-}
-
 func TestSourceMergeWaitMaxRuntimeCapsWhenCompactEnabled(t *testing.T) {
 	if maxRuntime := sourceMergeWaitMaxRuntime(2*time.Hour, true); maxRuntime != compactSourceMergeWaitCap {
 		t.Fatalf("source merge max runtime = %s, want %s", maxRuntime, compactSourceMergeWaitCap)

@@ -605,6 +605,33 @@ func TestPostgresCompactOptionsAndSummaries(t *testing.T) {
 	}
 }
 
+func TestPostgresCompactLeaseFollowsHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	s := postgresTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	part := NewPart("job", "part", "bucket", "source", "finished", now)
+	part.Status = StatusCompactReady
+	part.CompactReadyAt = formatTime(now)
+	part.DestinationDatabase, part.DestinationTable, part.DestinationSchema = "db", "table", "schema"
+	part.DestinationActivePartCount = 2
+	part.DestinationActivePartitionCounts = map[string]uint64{"p": 2}
+	seedPostgresParts(t, s, []Part{part})
+	batch, err := s.ClaimNextCompactBatch(ctx, "worker", now, CompactClaimOptions{})
+	if err != nil || batch == nil {
+		t.Fatalf("claim = %+v, %v", batch, err)
+	}
+	heartbeat := now.Add(time.Hour)
+	if _, err := s.HeartbeatCompactBatch(ctx, *batch, "worker", heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.ReleaseStaleCompactingParts(ctx, heartbeat.Add(4*time.Minute), 5*time.Minute); err != nil || n != 0 {
+		t.Fatalf("released a claim with a recent heartbeat: %d %v", n, err)
+	}
+	if n, err := s.ReleaseStaleCompactingParts(ctx, heartbeat.Add(5*time.Minute), 5*time.Minute); err != nil || n != 1 {
+		t.Fatalf("stale release after missed heartbeats = %d, %v", n, err)
+	}
+}
+
 func TestPostgresManualCompactFinalization(t *testing.T) {
 	for _, action := range []string{"ready", "release", "complete", "stale-release", "finished"} {
 		t.Run(action, func(t *testing.T) {
@@ -835,7 +862,7 @@ func assertSchedulingColumns(t testing.TB, s *Store) {
  COALESCE((data->>'destination_active_part_count')::numeric, 0) = 1 AND
  (SELECT count(*) = 1 AND COALESCE(bool_and(p.value::numeric = 1), false)
  FROM jsonb_each_text(COALESCE(NULLIF(data->'destination_active_partition_counts', 'null'::jsonb), '{}'::jsonb)) p WHERE btrim(p.key) <> '' AND p.value::numeric > 0)) OR
- compact_stale_at IS DISTINCT FROM (CASE WHEN status = 'COMPACTING' THEN LEAST(NULLIF(updated_at, '')::timestamptz, NULLIF(data->>'compacting_at', '')::timestamptz) END) OR
+ compact_stale_at IS DISTINCT FROM (CASE WHEN status = 'COMPACTING' THEN COALESCE(NULLIF(updated_at, '')::timestamptz, NULLIF(data->>'compacting_at', '')::timestamptz) END) OR
  original_compact_ready_at IS DISTINCT FROM (CASE WHEN COALESCE((data->>'compact_generation')::int, 0) <= 0 AND jsonb_array_length(COALESCE(NULLIF(data->'compact_input_part_ids', 'null'::jsonb), '[]'::jsonb)) = 0 THEN NULLIF(data->>'compact_ready_at', '')::timestamptz END)`).Scan(&mismatches)
 	if err != nil {
 		t.Fatal(err)

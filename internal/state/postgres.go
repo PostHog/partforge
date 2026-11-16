@@ -480,9 +480,8 @@ func partWriteValues(part Part) ([]any, error) {
 			if err != nil {
 				return nil, fmt.Errorf("compact time for %s/%s: %w", part.JobID, part.PartID, err)
 			}
-			if staleAt == nil || parsed.Before(*staleAt) {
-				staleAt = &parsed
-			}
+			staleAt = &parsed
+			break
 		}
 		if staleAt == nil {
 			return nil, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
@@ -991,7 +990,7 @@ func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, w
 func (s *Store) updateCompactProgress(ctx context.Context, part Part, workerID string, patch []byte, now time.Time) (bool, error) {
 	var requested bool
 	err := s.pool.QueryRow(ctx, `UPDATE `+s.tableSQL+` SET status = 'COMPACTING', worker_id = $1, updated_at = $2,
- compact_stale_at = LEAST($2::text::timestamptz, COALESCE(NULLIF(btrim(data->>'compacting_at'), '')::timestamptz, $2::text::timestamptz)),
+ compact_stale_at = $2::text::timestamptz,
  data = (data - 'error' - 'compact_cooldown_until') || $3::jsonb ||
  jsonb_build_object('status', 'COMPACTING', 'worker_id', $1::text, 'updated_at', $2::text,
  'compacting_at', COALESCE(NULLIF(btrim(data->>'compacting_at'), ''), $2::text))
