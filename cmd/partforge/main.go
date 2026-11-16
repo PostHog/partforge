@@ -2969,6 +2969,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		clickHousePassword = fs.String("clickhouse-password", "", "destination ClickHouse HTTP password")
 		workDir            = fs.String("work-dir", "", "import scratch directory; empty uses a directory on the destination ClickHouse disk")
 		requireEmpty       = fs.Bool("require-empty", true, "fail if the destination table already has active parts, preventing accidental duplicate attaches")
+		parallelism        = fs.Int("parallelism", 1, "number of finished artifacts to claim and download concurrently; attaches are serialized")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -2982,6 +2983,9 @@ func runImportFinished(ctx context.Context, args []string) error {
 	if *database == "" || *table == "" || *jobID == "" {
 		return errors.New("database, table, and job-id are required")
 	}
+	if *parallelism < 1 {
+		return fmt.Errorf("parallelism must be at least 1, got %d", *parallelism)
+	}
 
 	slog.Info(
 		"import-finished started",
@@ -2991,6 +2995,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		"destination_table", chhttp.TableSQL(*database, *table),
 		"work_dir", *workDir,
 		"require_empty", *requireEmpty,
+		"parallelism", *parallelism,
 	)
 	slog.Info("initializing Postgres state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -3037,6 +3042,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		Database:     *database,
 		Table:        *table,
 		RequireEmpty: *requireEmpty,
+		Parallelism:  *parallelism,
 		MarkImporting: func(ctx context.Context, artifact parts.FinishedArtifact) error {
 			part, ok := partsByID[artifact.PartID]
 			if !ok {

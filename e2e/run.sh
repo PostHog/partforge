@@ -628,7 +628,8 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -job-id="$JOB_ID" \
   -clickhouse-url="$CH_HTTP_DOCKER" \
   -s3-endpoint=http://localstack:4566 \
-  -postgres-url="$POSTGRES_URL"
+  -postgres-url="$POSTGRES_URL" \
+  -parallelism=4
 
 docker compose exec -T clickhouse clickhouse-client --query \
   "SELECT id, name, amount_text, event_date, migrated FROM dst.events_new ORDER BY id FORMAT TSV" \
