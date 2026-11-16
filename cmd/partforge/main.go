@@ -54,6 +54,10 @@ const defaultCompactWindow = 24 * time.Hour
 const defaultCompactMaxArtifacts = 20
 const defaultCompactMaxBytes uint64 = 150 * 1024 * 1024 * 1024
 const compactSourceMergeWaitCap = 5 * time.Minute
+const compactHeartbeatInterval = 5 * time.Second
+
+// A COMPACTING row whose last heartbeat is older than this belongs to a dead worker.
+const compactLeaseTimeout = 5 * time.Minute
 const compactMergeBackgroundPoolSize = 1
 const compactMergeConcurrencyRatio = 1.0
 const maxBackupChainDepth = 100
@@ -1964,8 +1968,6 @@ func runWorker(ctx context.Context, args []string) error {
 		return fmt.Errorf("derive clickhouse merge settings: %w", err)
 	}
 	sourceMergeMaxRuntime := sourceMergeWaitMaxRuntime(*mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
-	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
-	compactHeartbeatInterval := 5 * time.Second
 	slog.Info(
 		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
@@ -1992,7 +1994,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_merge_timeout", rewrite.DefaultCompactMergeTimeout,
 		"compact_merge_max_timeout", *compactWindow,
 		"compact_merge_settle_min_wait", rewrite.DefaultCompactMergeSettleMinWait,
-		"compact_lease_stale_after", compactStaleAfter,
+		"compact_lease_timeout", compactLeaseTimeout,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
 		"compact_max_artifacts", *compactMaxArtifacts,
 		"compact_max_bytes", *compactMaxBytes,
@@ -2062,7 +2064,7 @@ func runWorker(ctx context.Context, args []string) error {
 					MergeSelectingSleepMS:         mergeTreeSettings.MergeSelectingSleepMS,
 					MergePoolFreeEntriesThreshold: mergeTreeSettings.PoolFreeEntriesThreshold,
 					CompactWindow:                 *compactWindow,
-					CompactLeaseStaleAfter:        compactStaleAfter,
+					CompactLeaseStaleAfter:        compactLeaseTimeout,
 					CompactHeartbeatInterval:      compactHeartbeatInterval,
 					CompactProgressInterval:       *stateProgressInterval,
 					CompactBatching:               state.CompactBatching{MaxArtifacts: *compactMaxArtifacts, MaxBytes: *compactMaxBytes},
@@ -2815,16 +2817,6 @@ func sourceMergeWaitMaxRuntime(maxRuntime time.Duration, compactEnabled bool) ti
 		}
 	}
 	return maxRuntime
-}
-
-func compactLeaseStaleAfter(compactWindow time.Duration) time.Duration {
-	if compactWindow <= 0 {
-		return 5 * time.Minute
-	}
-	if compactWindow < 5*time.Minute {
-		return 5 * time.Minute
-	}
-	return compactWindow
 }
 
 func compactClaimSplay(compactWindow time.Duration) time.Duration {

@@ -129,4 +129,4 @@ Notes:
 
 ## Shutdown behavior
 
-On `SIGINT`/`SIGTERM` a worker stops claiming new work immediately. An active insert is canceled and its part returned to `READY`. Active compaction stops waiting for more merge progress, then uploads its output only if it reduced the physical part count, otherwise releases the batch back to `COMPACT_READY`. If a worker process dies outside handled code, the part stays visible as `IN_PROGRESS` or `COMPACTING` for manual inspection or reset (`set-part-state` / `retry-failed -include-in-progress`).
+On `SIGINT`/`SIGTERM` a worker stops claiming new work immediately. An active insert is canceled and its part returned to `READY`. Active compaction stops waiting for more merge progress, then uploads its output only if it reduced the physical part count, otherwise releases the batch back to `COMPACT_READY`. If a worker process dies outside handled code, an `IN_PROGRESS` part stays visible for manual inspection or reset (`set-part-state` / `retry-failed -include-in-progress`). A `COMPACTING` batch returns to `COMPACT_READY` once its last heartbeat is more than 5 minutes old.
